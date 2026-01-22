@@ -22,7 +22,8 @@ import rasterio
 from rasterio.transform import Affine
 from scipy.ndimage import distance_transform_edt
 import numpy as np
-from tqdm import tqdm
+import datetime as dt
+import pandas as pd
 
 # Constants
 BASE_JSON = "https://datacloud.icgc.cat/datacloud/lidar-territorial/json/lidar-territorial-tall.json"
@@ -273,6 +274,18 @@ def _filter_tiles(
 
 # ---------------- GDAL utilities ----------------
 
+# Configure GDAL to use exceptions for better error handling
+def _init_gdal():
+    """Initialize GDAL with exception handling."""
+    try:
+        gdal.UseExceptions()
+        return True
+    except Exception:
+        return False
+
+# Try to initialize GDAL - store result for later use
+_gdal_initialized = _init_gdal()
+
 def _ensure_dir(p):
     """Ensure directory exists."""
     os.makedirs(p, exist_ok=True)
@@ -308,6 +321,12 @@ def _fill_nodata(tile_path: str, nodata: float, max_dist_px: int = 10) -> bool:
     except Exception:
         return False
 
+def _nearest_fill(mask: np.ndarray, arr: np.ndarray) -> np.ndarray:
+    """Fill masked values in arr by nearest valid neighbor (fast EDT indices)."""
+    _, (iy, ix) = ndi.distance_transform_edt(mask, return_indices=True)
+    out = arr.copy()
+    out[mask] = arr[iy[mask], ix[mask]]
+    return out
 
 def _build_raster_profile(
     width: int,
@@ -757,8 +776,23 @@ def _date_range_local_to_utc(
         tz_name: str,
         granularity: dt.timedelta,
         only_daylight: bool = True,
+        lat: float = None,
+        lon: float = None,
 ) -> pd.DatetimeIndex:
-    """Generate datetime range in local timezone and convert to UTC."""
+    """Generate datetime range in local timezone and convert to UTC.
+    
+    Args:
+        date_start: Start date
+        date_end: End date
+        tz_name: Timezone name (e.g., "Europe/Madrid")
+        granularity: Time step as timedelta
+        only_daylight: If True, filter to only include times when sun is above horizon
+        lat: Latitude in degrees (required for solar elevation filtering)
+        lon: Longitude in degrees (required for solar elevation filtering)
+        
+    Returns:
+        DatetimeIndex of UTC times, filtered for daylight if requested
+    """
     import pytz
 
     tz = pytz.timezone(tz_name)
@@ -782,9 +816,27 @@ def _date_range_local_to_utc(
     # Convert to UTC
     times_utc = [t.astimezone(pytz.UTC) for t in times_local]
 
-    if only_daylight:
-        # Filter to daylight hours (this is a simplified filter)
-        # In a real implementation, you'd use solar position calculations
+    if only_daylight and lat is not None and lon is not None:
+        # Filter based on actual solar elevation > 0
+        import pvlib
+        
+        filtered_times = []
+        for t_utc in times_utc:
+            # Calculate solar position for this time and location
+            solar_pos = pvlib.solarposition.get_solarposition(
+                time=pd.DatetimeIndex([t_utc]), 
+                latitude=lat, 
+                longitude=lon
+            )
+            elevation = solar_pos['elevation'].iloc[0]
+            
+            # Only include times when sun is above horizon
+            if elevation > 0:
+                filtered_times.append(t_utc)
+        
+        times_utc = filtered_times
+    elif only_daylight:
+        # Fallback to simple hour filter if lat/lon not provided
         filtered_times = []
         for t_local, t_utc in zip(times_local, times_utc):
             hour = t_local.hour

@@ -8,33 +8,154 @@ from typing import List, Union, Dict, Optional, Tuple, Any
 import pandas as pd
 import rasterio
 from rasterio.enums import Resampling
+from rasterio.warp import reproject
 from pathlib import Path
-from scipy import ndimage as ndi
-import numpy as np
+from scipy.ndimage import interpolation as nvi
 from osgeo import gdal
 import datetime as dt
-from typing import Optional, Union
+import concurrent.futures
+import multiprocessing as mp
+from .utils import _parse_iso8601_duration, _date_range_local_to_utc
+import numpy as np
+import rasterio
+import scipy.ndimage as ndi
+import numba as nb
 
-# Configure GDAL to use exceptions for better error handling
-gdal.UseExceptions()
+@nb.njit(parallel=True, fastmath=True)
+def _shadow_scan(z_rot, nodata_rot, dz_per_px):
+    H, W = z_rot.shape
+    lit = np.zeros((H, W), dtype=np.uint8)
 
-def _ensure_dir(p):
-    """Ensure directory exists."""
-    os.makedirs(p, exist_ok=True)
+    for i in nb.prange(H):
+        horizon = -1e30
+        for j in range(W):
+            if nodata_rot[i, j]:
+                lit[i, j] = 1
+                continue
 
+            h = z_rot[i, j]
+            if h >= horizon:
+                lit[i, j] = 1
+                horizon = h
 
-def _gdal_exists():
-    """Check if GDAL is available."""
-    return gdal is not None
+            horizon -= dz_per_px
 
+    return lit
 
-def _nearest_fill(mask: np.ndarray, arr: np.ndarray) -> np.ndarray:
-    """Fill masked values in arr by nearest valid neighbor (fast EDT indices)."""
-    _, (iy, ix) = ndi.distance_transform_edt(mask, return_indices=True)
-    out = arr.copy()
-    out[mask] = arr[iy[mask], ix[mask]]
-    return out
+def _cast_shadow_mask(
+    dsm: np.ndarray,
+    pixel_size: float,
+    azimuth_deg: float,
+    altitude_deg: float,
+    *,
+    nodata_mask: np.ndarray | None = None,
+    z_factor: float = 1.0,
+) -> tuple[np.ndarray, np.ndarray]:
 
+    if altitude_deg <= 0:
+        return np.zeros_like(dsm, dtype=bool), ~nodata_mask
+
+    z = dsm * z_factor
+
+    # Rotate so sun comes from the left
+    theta = azimuth_deg + 90.0
+
+    # Rotate DSM (nearest neighbor is sufficient for shadows)
+    z_rot = ndi.rotate(
+        z,
+        theta,
+        reshape=False,
+        order=0,
+        mode="nearest",
+        prefilter=False,
+    )
+
+    # Rotate nodata mask
+    if nodata_mask is not None:
+        nodata_rot = ndi.rotate(
+            nodata_mask.astype(np.uint8),
+            theta,
+            reshape=False,
+            order=0,
+            prefilter=False,
+        ) > 0
+    else:
+        nodata_rot = np.zeros_like(z_rot, dtype=bool)
+
+    valid_rot = ~nodata_rot
+
+    # Vertical change per pixel along ray
+    dz_per_px = np.tan(np.deg2rad(altitude_deg)) * pixel_size
+
+    # Numba-accelerated horizon scan
+    lit_rot = _shadow_scan(z_rot, nodata_rot, dz_per_px).astype(bool)
+
+    # Rotate results back
+    lit = ndi.rotate(
+        lit_rot.astype(np.uint8),
+        -theta,
+        reshape=False,
+        order=0,
+        prefilter=False,
+    ) > 0
+
+    valid = ndi.rotate(
+        valid_rot.astype(np.uint8),
+        -theta,
+        reshape=False,
+        order=0,
+        prefilter=False,
+    ) > 0
+
+    return lit, valid
+
+def _apply_dsm_shadow_to_hillshade(
+    hillshade_path: str,
+    dsm_path: str,
+    out_path: str,
+    azimuth: float,
+    altitude: float,
+    *,
+    shadow_value: float = 1.0,
+):
+    with rasterio.open(dsm_path) as dsrc, rasterio.open(hillshade_path) as hsrc:
+
+        dsm = dsrc.read(1).astype(np.float32)
+        hs = hsrc.read(1).astype(np.float32)
+
+        pixel_size = abs(dsrc.transform.a)
+
+        nodata_mask = (
+            (dsm == dsrc.nodata)
+            | ~np.isfinite(dsm)
+        )
+
+        # Fill DSM nodata once (ray continuity)
+        if nodata_mask.any():
+            _, (iy, ix) = ndi.distance_transform_edt(
+                nodata_mask,
+                return_indices=True,
+            )
+            dsm[nodata_mask] = dsm[iy[nodata_mask], ix[nodata_mask]]
+
+        # Cast shadows
+        lit, valid = _cast_shadow_mask(
+            dsm,
+            pixel_size,
+            azimuth,
+            altitude,
+            nodata_mask=nodata_mask,
+        )
+
+        # Apply shadows
+        hs[~lit & valid] = shadow_value
+        hs[~valid] = hsrc.nodata
+
+        profile = hsrc.profile.copy()
+
+        with rasterio.open(out_path, "w", **profile) as dst:
+            dst.write(hs.astype(profile["dtype"]), 1)
+            dst.update_tags(**hsrc.tags())
 
 def _generate_hillshade_gdal(
     results_dir: str,
@@ -93,119 +214,148 @@ def _generate_hillshade_gdal(
     return out_path
 
 
-def _cast_shadow_mask(
-    dsm: np.ndarray,
-    pixel_size: float,
-    azimuth_deg: float,
-    altitude_deg: float,
-    *,
-    nodata_mask: np.ndarray | None = None,
-    z_factor: float = 1.0,
-) -> tuple[np.ndarray, np.ndarray]:
-    """
-    Returns:
-      lit: True where illuminated
-      valid: True where inside original footprint (not padding from rotation)
-    """
-
-    if altitude_deg <= 0:
-        return np.zeros_like(dsm, dtype=bool), ~nodata_mask
-
-    z = dsm * z_factor
-
-    # Rotate so sun comes from the left
-    theta = azimuth_deg + 90
-
-    # Rotate DSM
-    z_rot = ndi.rotate(z, theta, reshape=False, order=1, mode="nearest")
-
-    # Rotate nodata mask (this tracks what is real vs padding)
-    if nodata_mask is not None:
-        nodata_rot = ndi.rotate(nodata_mask.astype(np.uint8), theta,
-                                reshape=False, order=0) > 0
-        valid_rot = ~nodata_rot
-    else:
-        nodata_rot = np.zeros_like(z_rot, dtype=bool)
-        valid_rot = np.ones_like(z_rot, dtype=bool)
-
-    H, W = z_rot.shape
-    lit_rot = np.zeros_like(z_rot, dtype=bool)
-
-    # Vertical change per pixel along ray
-    dz_per_px = np.tan(np.deg2rad(altitude_deg)) * pixel_size
-
-    for i in range(H):
-        horizon = -np.inf
-        for j in range(W):
-            h = z_rot[i, j]
-
-            if nodata_rot[i, j]:
-                lit_rot[i, j] = True
-                continue
-
-            if h >= horizon:
-                lit_rot[i, j] = True
-                horizon = h
-            else:
-                lit_rot[i, j] = False
-
-            horizon -= dz_per_px
-
-    # Rotate lit mask back
-    lit = ndi.rotate(lit_rot.astype(np.uint8), -theta,
-                     reshape=False, order=0) > 0
-
-    # Rotate validity mask back (CRUCIAL PART)
-    valid = ndi.rotate(valid_rot.astype(np.uint8), -theta,
-                       reshape=False, order=0) > 0
-
-    return lit, valid
-
-
-def _apply_dsm_shadow_to_hillshade(
-    hillshade_path: str,
+# Public wrapper for the private function
+def generate_hillshade_gdal(
+    results_dir: str,
     dsm_path: str,
-    out_path: str,
     azimuth: float,
     altitude: float,
+    zFactor: float = 1.0,
     *,
-    shadow_value: float = 1.0,
-):
-    with rasterio.open(dsm_path) as dsrc, rasterio.open(hillshade_path) as hsrc:
-        dsm = dsrc.read(1).astype(np.float32)
-        hs = hsrc.read(1).astype(np.float32)
+    include_datetime_info: bool = False,
+    when: dt.datetime = None,
+    compute_edges: bool = False,
+    creation_options: Optional[Dict[str, str]] = None,
+) -> str:
+    """
+    Create a GDAL hillshade. Returns the path to the generated hillshade file.
+    """
+    return _generate_hillshade_gdal(
+        results_dir=results_dir,
+        dsm_path=dsm_path,
+        azimuth=azimuth,
+        altitude=altitude,
+        zFactor=zFactor,
+        include_datetime_info=include_datetime_info,
+        when=when,
+        compute_edges=compute_edges,
+        creation_options=creation_options
+    )
 
-        pixel_size = abs(dsrc.transform.a)
-        nodata_mask = (dsm == dsrc.nodata) | ~np.isfinite(dsm)
 
-        # Fill DSM nodata so rays are continuous
-        if nodata_mask.any():
-            _, (iy, ix) = ndi.distance_transform_edt(nodata_mask, return_indices=True)
-            dsm[nodata_mask] = dsm[iy[nodata_mask], ix[nodata_mask]]
-
-        # Compute cast shadows + validity footprint
-        lit, valid = _cast_shadow_mask_fast(
-            dsm,
-            pixel_size,
-            azimuth,
-            altitude,
-            nodata_mask=nodata_mask
-        )
-
-        # Apply shadows only where valid
-        hs[~lit & valid] = shadow_value
-
-        # Outside original footprint → preserve nodata
-        hs[~valid] = hsrc.nodata
-
-        # Copy full profile + metadata
-        profile = hsrc.profile.copy()
-
-        with rasterio.open(out_path, "w", **profile) as dst:
-            dst.write(hs.astype(profile["dtype"]), 1)
-
-            # Inherit all metadata (CRUCIAL PART)
-            dst.update_tags(**hsrc.tags())
+# def _cast_shadow_mask(
+#     dsm: np.ndarray,
+#     pixel_size: float,
+#     azimuth_deg: float,
+#     altitude_deg: float,
+#     *,
+#     nodata_mask: np.ndarray | None = None,
+#     z_factor: float = 1.0,
+# ) -> tuple[np.ndarray, np.ndarray]:
+#     """
+#     Returns:
+#       lit: True where illuminated
+#       valid: True where inside original footprint (not padding from rotation)
+#     """
+#
+#     if altitude_deg <= 0:
+#         return np.zeros_like(dsm, dtype=bool), ~nodata_mask
+#
+#     z = dsm * z_factor
+#
+#     # Rotate so sun comes from the left
+#     theta = azimuth_deg + 90
+#
+#     # Rotate DSM
+#     z_rot = ndi.rotate(z, theta, reshape=False, order=1, mode="nearest")
+#
+#     # Rotate nodata mask (this tracks what is real vs padding)
+#     if nodata_mask is not None:
+#         nodata_rot = ndi.rotate(nodata_mask.astype(np.uint8), theta,
+#                                 reshape=False, order=0) > 0
+#         valid_rot = ~nodata_rot
+#     else:
+#         nodata_rot = np.zeros_like(z_rot, dtype=bool)
+#         valid_rot = np.ones_like(z_rot, dtype=bool)
+#
+#     H, W = z_rot.shape
+#     lit_rot = np.zeros_like(z_rot, dtype=bool)
+#
+#     # Vertical change per pixel along ray
+#     dz_per_px = np.tan(np.deg2rad(altitude_deg)) * pixel_size
+#
+#     for i in range(H):
+#         horizon = -np.inf
+#         for j in range(W):
+#             h = z_rot[i, j]
+#
+#             if nodata_rot[i, j]:
+#                 lit_rot[i, j] = True
+#                 continue
+#
+#             if h >= horizon:
+#                 lit_rot[i, j] = True
+#                 horizon = h
+#             else:
+#                 lit_rot[i, j] = False
+#
+#             horizon -= dz_per_px
+#
+#     # Rotate lit mask back
+#     lit = ndi.rotate(lit_rot.astype(np.uint8), -theta,
+#                      reshape=False, order=0) > 0
+#
+#     # Rotate validity mask back (CRUCIAL PART)
+#     valid = ndi.rotate(valid_rot.astype(np.uint8), -theta,
+#                        reshape=False, order=0) > 0
+#
+#     return lit, valid
+#
+#
+# def _apply_dsm_shadow_to_hillshade(
+#     hillshade_path: str,
+#     dsm_path: str,
+#     out_path: str,
+#     azimuth: float,
+#     altitude: float,
+#     *,
+#     shadow_value: float = 1.0,
+# ):
+#     with rasterio.open(dsm_path) as dsrc, rasterio.open(hillshade_path) as hsrc:
+#         dsm = dsrc.read(1).astype(np.float32)
+#         hs = hsrc.read(1).astype(np.float32)
+#
+#         pixel_size = abs(dsrc.transform.a)
+#         nodata_mask = (dsm == dsrc.nodata) | ~np.isfinite(dsm)
+#
+#         # Fill DSM nodata so rays are continuous
+#         if nodata_mask.any():
+#             _, (iy, ix) = ndi.distance_transform_edt(nodata_mask, return_indices=True)
+#             dsm[nodata_mask] = dsm[iy[nodata_mask], ix[nodata_mask]]
+#
+#         # Compute cast shadows + validity footprint
+#         lit, valid = _cast_shadow_mask(
+#             dsm,
+#             pixel_size,
+#             azimuth,
+#             altitude,
+#             nodata_mask=nodata_mask
+#         )
+#
+#         # Apply shadows only where valid
+#         hs[~lit & valid] = shadow_value
+#
+#         # Outside original footprint → preserve nodata
+#         hs[~valid] = hsrc.nodata
+#
+#         # Copy full profile + metadata
+#         profile = hsrc.profile.copy()
+#
+#         with rasterio.open(out_path, "w", **profile) as dst:
+#             dst.write(hs.astype(profile["dtype"]), 1)
+#
+#             # Inherit all metadata (CRUCIAL PART)
+#             dst.update_tags(**hsrc.tags())
 
 
 def _apply_height_shadow_to_hillshade(
@@ -347,7 +497,6 @@ def generate_multiple_hillshades_gdal(
     azimuth_altitude: List[Tuple[float, float]],
     *,
     related_datetimes: Optional[List[Union[dt.datetime, str]]] = None,
-    shadow_floor: float = 0.0,
     zFactor: float = 1.0,
     compute_edges: bool = False,
     creation_options: Optional[Dict[str, str]] = None,
@@ -378,8 +527,6 @@ def generate_multiple_hillshades_gdal(
     Returns:
         List of paths to generated hillshade files
     """
-    import concurrent.futures
-    import multiprocessing as mp
     
     os.makedirs(raster_dir, exist_ok=True)
     
@@ -582,14 +729,15 @@ def _floor_to_step(x: np.ndarray, step: float, low: float, high: float) -> np.nd
 
 
 def generate_azimuth_altitude_pairs_by_date(
-    date: dt.date = dt.date.today(),
+    date: dt.date,
+    lat: float,            # Madrid by default
+    lon: float,
     *,
-    lat: float = 40.4168,            # Madrid by default
-    lon: float = -3.7038,
     tz_name: str = "Europe/Madrid",
     granularity: str = "PT1H",       # ISO 8601 duration
     solar_degrees_discretization: float = 1.0,
     only_daylight: bool = True,
+    weather_df: Optional[Any] = None,
 ) -> Dict[str, Any]:
     """
     Generate azimuth/altitude pairs for solar positions on a given date.
@@ -602,6 +750,7 @@ def generate_azimuth_altitude_pairs_by_date(
         granularity: Time step as ISO 8601 duration string (e.g., "PT15M", "PT1H")
         solar_degrees_discretization: Round positions to this many degrees
         only_daylight: Only include positions above horizon
+        weather_df: Optional weather Pandas dataframe
     
     Returns:
         Dictionary with 'df' containing DataFrame of positions and metadata
@@ -610,7 +759,7 @@ def generate_azimuth_altitude_pairs_by_date(
     granularity_delta = _parse_iso8601_duration(granularity)
     
     # Generate UTC time range
-    times_utc = _date_range_local_to_utc(date, date, tz_name, granularity_delta, only_daylight)
+    times_utc = _date_range_local_to_utc(date, date, tz_name, granularity_delta, only_daylight, lat, lon)
     
     if len(times_utc) == 0:
         return {
@@ -660,6 +809,52 @@ def generate_azimuth_altitude_pairs_by_date(
         'azimuth_altitude': azimuth_altitude
     })
     
+    # Integrate weather data if provided
+    if weather_df is not None:
+        try:
+            # Convert weather_df to pandas if it's a polars DataFrame
+            if hasattr(weather_df, 'to_pandas'):
+                weather_pd = weather_df.to_pandas()
+            else:
+                weather_pd = weather_df
+            
+            # Ensure time columns are datetime
+            result_df['datetime_local'] = pd.to_datetime(result_df['datetime_local'])
+            weather_pd['time'] = pd.to_datetime(weather_pd['time'])
+            
+            # Convert weather UTC time to local timezone for proper joining
+            import pytz
+            tz = pytz.timezone(tz_name)
+            weather_pd['time_local'] = weather_pd['time'].dt.tz_convert(tz)
+            
+            # Set local time as index for resampling/interpolation
+            weather_indexed = weather_pd.set_index('time_local').sort_index()
+            
+            # Select weather columns to join (exclude time and spatial columns)
+            weather_cols = [col for col in weather_indexed.columns 
+                          if col not in ['time', 'latitude', 'longitude', 'weatherStation', 'sunPosition', 
+                                       'sunAzimuthDiscrete', 'sunElevationDiscrete']]
+            weather_subset = weather_indexed[weather_cols]
+            
+            # Resample weather data to match our granularity and interpolate
+            granularity_pandas = granularity.replace('PT', '').replace('M', 'min').replace('H', 'H')
+            weather_resampled = weather_subset.resample(granularity_pandas).interpolate(method='linear')
+            
+            # Create a temporary DataFrame with local times for joining
+            temp_df = result_df[['datetime_local']].copy()
+            temp_df = temp_df.set_index('datetime_local')
+            
+            # Left join with weather data using local time
+            joined = temp_df.join(weather_resampled, how='left')
+            
+            # Add weather columns to result DataFrame
+            for col in joined.columns:
+                result_df[col] = joined[col].values
+                
+        except Exception as e:
+            print(f"Warning: Failed to integrate weather data: {e}")
+            # Continue without weather data
+    
     return {
         'df': result_df,
         'azimuth_altitude_pairs': azimuth_altitude,
@@ -696,7 +891,7 @@ def generate_azimuth_altitude_pairs_by_year(
     granularity_delta = _parse_iso8601_duration(granularity)
     
     # Generate UTC time range
-    times_utc = _date_range_local_to_utc(start_date, end_date, tz_name, granularity_delta, only_daylight)
+    times_utc = _date_range_local_to_utc(start_date, end_date, tz_name, granularity_delta, only_daylight, lat, lon)
     
     if len(times_utc) == 0:
         return {
@@ -1112,7 +1307,7 @@ def average_hillshades(
     return out_path
 
 
-def _calculate_sky_view_factor(
+def calculate_sky_view_factor(
         dsm_path: str,
         out_path: str,
         search_radius: float = 100.0,

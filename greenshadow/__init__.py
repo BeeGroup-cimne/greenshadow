@@ -45,12 +45,41 @@ from .shader import (
 )
 
 
-# Import weather module if it exists
+# Import weather module if it exists and dependencies are available
 try:
     from . import weather
+    from .weather import (
+        load_ERA5Land,
+        download_ERA5Land,
+        ERA5Land_variables
+    )
     _has_weather = True
-except ImportError:
+except ImportError as e:
     _has_weather = False
+    # Optionally show which dependency is missing for debugging
+    # print(f"Weather module unavailable: {e}")
+
+# Create stub functions if weather is not available
+if not _has_weather:
+    def load_ERA5Land(*args, **kwargs):
+        raise ImportError("Weather functionality requires additional dependencies: pip install pvlib polars cdsapi cfgrib xarray netCDF4"
+                          "Then, to be able to download data from COPERNICUS Climate Data Store open and login in "
+                          "https://cds.climate.copernicus.eu/profile?tab=profile, copy the API url and key,"
+                          "and paste it in ~/.cdsapirc file")
+    
+    def download_ERA5Land(*args, **kwargs):
+        raise ImportError("Weather functionality requires additional dependencies: pip install pvlib polars cdsapi cfgrib xarray netCDF4"
+                          "Then, to be able to download data from COPERNICUS Climate Data Store open and login in "
+                          "https://cds.climate.copernicus.eu/profile?tab=profile, copy the API url and key,"
+                          "and paste it in ~/.cdsapirc file"
+                          )
+    
+    def ERA5Land_variables(*args, **kwargs):
+        raise ImportError("Weather functionality requires additional dependencies: pip install pvlib polars cdsapi cfgrib xarray netCDF4"
+                          "Then, to be able to download data from COPERNICUS Climate Data Store open and login in "
+                          "https://cds.climate.copernicus.eu/profile?tab=profile, copy the API url and key,"
+                          "and paste it in ~/.cdsapirc file"
+                          )
 
 # Define what gets imported with "from greenshadow import *"
 __all__ = [
@@ -83,6 +112,13 @@ __all__ = [
     'delete_matching_files'
 ]
 
-# Add weather if available
+# Always add weather functions (either real or stub)
+__all__.extend([
+    'load_ERA5Land',
+    'download_ERA5Land', 
+    'ERA5Land_variables'
+])
+
+# Add weather module if available
 if _has_weather:
     __all__.append('weather')

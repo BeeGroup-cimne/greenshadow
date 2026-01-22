@@ -18,13 +18,12 @@ from matplotlib.patches import Patch
 import geopandas as gpd
 import pandas as pd
 import contextily as ctx
-from typing import List, Union, Dict, Optional, Tuple, Any
+from typing import List, Union, Dict, Optional, Tuple
 from shapely.geometry.base import BaseGeometry
 
 # Import utilities from the new modules
 from .utils import (
-    _session, _reproject_geom, _to_shapely, _extract_epsg, shapely_ops_transform,
-    _candidate_urls, _resolve_existing_url, _download_one, _target_paths_for_url,
+    _session, _reproject_geom, _to_shapely, _resolve_existing_url,
     _download_many, _load_featurecollection, _filter_tiles
 )
 
