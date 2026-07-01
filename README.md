@@ -395,9 +395,9 @@ If you use greenshadow in your research, please cite:
 }
 ```
 
-## License
+## 📄 License
 
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+This project is licensed under the **EUPL v1.2**. See the [license](https://joinup.ec.europa.eu/collection/eupl/eupl-text-eupl-12) for details.
 
 ## Authors
 
