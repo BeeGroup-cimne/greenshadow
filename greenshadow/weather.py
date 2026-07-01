@@ -168,7 +168,6 @@ def transformation_pipe(df, mode="averaged"):
 
 
 def load_ERA5Land(data_dir, lat_range, lon_range, ym_range, tz_local, update = True, use_point_location=True, mode="averaged"):
-    sys.stderr.write(f"Loading weather data from ERA5Land dataset\n")
     os.makedirs(data_dir, exist_ok=True)
     
     # Always use Catalan region for parquet file (same as download)
@@ -337,10 +336,6 @@ def load_ERA5Land(data_dir, lat_range, lon_range, ym_range, tz_local, update = T
     requested_lon_min = round(min(lon_range), 1)
     requested_lon_max = round(max(lon_range), 1)
     
-    sys.stderr.write(f"\tFiltering weather data for requested area: "
-                    f"lat {requested_lat_min}-{requested_lat_max}, "
-                    f"lon {requested_lon_min}-{requested_lon_max} and time range {min(ym_range)} to {max(ym_range)}\n")
-    
     df = df.filter(
         (pl.col("latitude").round(1) >= requested_lat_min) &
         (pl.col("latitude").round(1) <= requested_lat_max) &
@@ -349,8 +344,6 @@ def load_ERA5Land(data_dir, lat_range, lon_range, ym_range, tz_local, update = T
         (pl.col("time") >= pl.lit(min(ym_range)).dt.replace_time_zone("UTC")) &
         (pl.col("time") <= pl.lit(max(ym_range)).dt.replace_time_zone("UTC").dt.offset_by("23h"))
     )
-    
-    sys.stderr.write(f"\tFiltered to {len(df)} records for requested area and time range\n")
 
     # Discretise sun position
     df = df.with_columns(

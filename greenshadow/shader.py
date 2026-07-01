@@ -1,32 +1,67 @@
 # -*- coding: utf-8 -*-
-import os
 import fnmatch
 import math
-from tqdm import tqdm
-import warnings
-from typing import List, Union, Dict, Optional, Tuple, Any
+from typing import List, Dict, Optional, Tuple, Any, Sequence
 import pandas as pd
-import rasterio
 from rasterio.enums import Resampling
 from rasterio.warp import reproject
-from pathlib import Path
-from scipy.ndimage import interpolation as nvi
 from osgeo import gdal
 import datetime as dt
-import concurrent.futures
-import multiprocessing as mp
-from .utils import _parse_iso8601_duration, _date_range_local_to_utc
-import numpy as np
-import rasterio
+from .utils import _parse_iso8601_duration, _date_range_local_to_utc, has_cuda, rasterize_polygon_mask
+from .logging_utils import info
+from numba import njit, prange, cuda
 import scipy.ndimage as ndi
-import numba as nb
+import sys
+import os
+import rasterio
+import multiprocessing as mp
+import concurrent.futures
+from tqdm import tqdm
+from shapely.ops import transform
+import pyproj
+from concurrent.futures import ThreadPoolExecutor
+import warnings
+import pytz
+import re
+import numpy as np
+from pathlib import Path
+import imageio.v2 as imageio
+from scipy.ndimage import binary_dilation, zoom
+from skimage.transform import resize
+import imageio
+import geopandas as gpd
+from rasterio.features import geometry_mask, rasterize
+import cv2
 
-@nb.njit(parallel=True, fastmath=True)
+def rasterize_aoi_mask(aoi, reference_path: str) -> np.ndarray:
+    """
+    Rasterize a shapely AOI to a boolean mask aligned with reference raster.
+    True  = inside AOI
+    False = outside AOI
+    """
+
+    with rasterio.open(reference_path) as src:
+        shape = (src.height, src.width)
+        transform = src.transform
+
+    mask = rasterize(
+        [(aoi, 1)],
+        out_shape=shape,
+        transform=transform,
+        fill=0,
+        all_touched=True,
+        dtype="uint8",
+    )
+
+    return mask.astype(bool)
+
+
+@njit(parallel=True, fastmath=True)
 def _shadow_scan(z_rot, nodata_rot, dz_per_px):
     H, W = z_rot.shape
     lit = np.zeros((H, W), dtype=np.uint8)
 
-    for i in nb.prange(H):
+    for i in prange(H):
         horizon = -1e30
         for j in range(W):
             if nodata_rot[i, j]:
@@ -156,6 +191,8 @@ def _apply_dsm_shadow_to_hillshade(
         with rasterio.open(out_path, "w", **profile) as dst:
             dst.write(hs.astype(profile["dtype"]), 1)
             dst.update_tags(**hsrc.tags())
+
+    return out_path
 
 def _generate_hillshade_gdal(
     results_dir: str,
@@ -490,138 +527,118 @@ def _apply_height_shadow_to_hillshade(
 
     return out_paths
 
-
 def generate_multiple_hillshades_gdal(
     raster_dir: str,
     dsm_path: str,
-    azimuth_altitude: List[Tuple[float, float]],
+    azimuth_altitude: list[tuple[float, float]],
     *,
-    related_datetimes: Optional[List[Union[dt.datetime, str]]] = None,
+    related_datetimes=None,
     zFactor: float = 1.0,
     compute_edges: bool = False,
-    creation_options: Optional[Dict[str, str]] = None,
-    include_datetime_info: bool = True,
-    qgis_temporal: bool = True,
-    max_workers: int = 2,  # Default to 2 workers to avoid I/O contention
-    overwrite: bool = False
-) -> List[str]:
+    creation_options=None,
+    include_datetime_info: bool = False,
+    qgis_temporal: bool = False,
+    max_workers: int = 2,
+    overwrite: bool = False,
+    aoi=None,
+    aoi_crs: str = "EPSG:4326",
+    nodata_value: float = -9999.0,
+) -> list[str]:
     """
-    Generate multiple hillshades with cast shadows from azimuth/altitude pairs.
-    
-    Args:
-        raster_dir: Output directory for hillshades
-        dsm_path: Path to DSM raster
-        azimuth_altitude: List of (azimuth, altitude) tuples
-        related_datetimes: Optional list of datetime objects corresponding to each az/alt pair
-        shadow_floor: Minimum shadow value (0.0 = full shadow, 1.0 = no shadow effect)
-        zFactor: Vertical exaggeration factor
-        compute_edges: Compute hillshade at edges
-        creation_options: GDAL creation options
-        include_datetime_info: Include datetime metadata in output files
-        qgis_temporal: Rename files with ISO timestamps for QGIS temporal
-        max_workers: Number of parallel workers
-        overwrite: Whether to overwrite existing files
-        max_shadow_distance: Maximum shadow distance in meters for shadow casting
-        strip_height: Height of processing strips in pixels for memory efficiency
-    
-    Returns:
-        List of paths to generated hillshade files
+    Generate hillshades normalized to [0,1], AOI-masked.
     """
-    
+
     os.makedirs(raster_dir, exist_ok=True)
-    
-    if related_datetimes and len(related_datetimes) != len(azimuth_altitude):
-        raise ValueError("related_datetimes must have same length as azimuth_altitude")
-    
-    # Filter out below-horizon positions first
+
     valid_positions = []
-    for i, (azimuth, altitude) in enumerate(azimuth_altitude):
-        if altitude > 0:
+    for i, (az, alt) in enumerate(azimuth_altitude):
+        if alt > 0:
             when = related_datetimes[i] if related_datetimes else None
-            valid_positions.append((i, azimuth, altitude, when))
-    
+            valid_positions.append((i, az, alt, when))
+
     if not valid_positions:
         return []
-    
-    # Optimize number of workers
+
     max_workers = min(max_workers, len(valid_positions), mp.cpu_count())
-    
-    def process_single_hillshade(args):
-        # args=valid_positions[6]
-        """Process a single hillshade (for parallel execution)."""
-        i, azimuth, altitude, when = args
-        
-        # Check if final file already exists (skip if not overwriting)
-        if not overwrite:
-            test_final_path = f"{raster_dir}/{int(azimuth):03}_{int(altitude):02}.tif"
-            if when and qgis_temporal:
-                iso_str = when.strftime('%Y%m%dT%H%M%S') if isinstance(when, dt.datetime) else str(when)
-                test_final_path = f"{raster_dir}/{int(azimuth):03}_{int(altitude):02}_{iso_str}.tif"
-            if os.path.exists(test_final_path):
-                return test_final_path
-        
+
+    def process_single(args):
+        i, az, alt, when = args
+
+        base = f"{int(az):03}_{int(alt):02}"
+        if when and qgis_temporal:
+            base += "_" + (when.strftime("%Y-%m-%dT%H:%M:%S") if hasattr(when, "strftime") else str(when))
+        out_path = os.path.join(raster_dir, f"{base}.tif")
+
+        if os.path.exists(out_path) and not overwrite:
+            return out_path
+
         try:
-            # Generate raw hillshade
             hs_raw = _generate_hillshade_gdal(
                 results_dir=raster_dir,
-                include_datetime_info=include_datetime_info,
                 when=when,
                 dsm_path=dsm_path,
-                azimuth=azimuth,
-                altitude=altitude,
+                azimuth=az,
+                altitude=alt,
                 zFactor=zFactor,
                 compute_edges=compute_edges,
-                creation_options=creation_options
+                creation_options=creation_options,
+                include_datetime_info=include_datetime_info,
             )
-            
-            # Apply shadow mask
+
             final_path = _apply_dsm_shadow_to_hillshade(
                 hillshade_path=hs_raw,
                 dsm_path=dsm_path,
-                out_path=hs_raw.replace("_raw",""),
-                azimuth=azimuth,
-                altitude=altitude
+                out_path=hs_raw.replace("_raw", ""),
+                azimuth=az,
+                altitude=alt,
             )
-            
-            # Clean up raw file if different from final
+
+            with rasterio.open(final_path) as src:
+                hs = src.read(1).astype(np.float32)
+                profile = src.profile.copy()
+                raster_crs = src.crs
+
+            # Normalize 0–255 → 0–1
+            hs /= 255.0
+            np.clip(hs, 0.0, 1.0, out=hs)
+
+            if aoi is not None:
+                transformer = pyproj.Transformer.from_crs(
+                    aoi_crs,
+                    raster_crs,
+                    always_xy=True,
+                ).transform
+                aoi_mask = rasterize_aoi_mask(transform(transformer, aoi), final_path)
+                hs[~aoi_mask] = nodata_value
+
+            profile.update(
+                dtype="float32",
+                nodata=nodata_value,
+                compress="deflate",
+                predictor=3,
+            )
+
+            with rasterio.open(out_path, "w", **profile) as dst:
+                dst.write(hs, 1)
+
             if hs_raw != final_path and os.path.exists(hs_raw):
-                try:
-                    os.remove(hs_raw)
-                except Exception:
-                    pass
-                    
-            return final_path
+                os.remove(hs_raw)
+
+            return out_path
+
         except Exception as e:
-            print(f"Error processing hillshade for az={azimuth}, alt={altitude}: {e}")
+            print(f"Error az={az} alt={alt}: {e}")
             return None
-    
-    final_paths = []
-    
-    if max_workers == 1:
-        # Single-threaded execution
-        for args in tqdm(valid_positions, desc="Generating hillshades"):
-            result = process_single_hillshade(args)
-            if result:
-                final_paths.append(result)
-    else:
-        # Multi-threaded execution
-        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-            # Submit all tasks
-            future_to_args = {executor.submit(process_single_hillshade, args): args 
-                             for args in valid_positions}
-            
-            # Collect results with progress bar
-            for future in tqdm(concurrent.futures.as_completed(future_to_args), 
-                             total=len(future_to_args), desc="Generating hillshades"):
-                try:
-                    result = future.result()
-                    if result:
-                        final_paths.append(result)
-                except Exception as e:
-                    args = future_to_args[future]
-                    print(f"Error in future for args {args}: {e}")
-    
-    return final_paths
+
+    results = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as ex:
+        for r in tqdm(ex.map(process_single, valid_positions),
+                      total=len(valid_positions),
+                      desc="Generating hillshades"):
+            if r:
+                results.append(r)
+
+    return results
 
 
 def _solar_position_az_el(
@@ -772,7 +789,6 @@ def generate_azimuth_altitude_pairs_by_date(
     solar_df = _solar_position_az_el(times_utc, lat, lon)
     
     # Convert back to local time for reference
-    import pytz
     tz = pytz.timezone(tz_name)
     times_local = [t.astimezone(tz) for t in times_utc]
     
@@ -823,7 +839,6 @@ def generate_azimuth_altitude_pairs_by_date(
             weather_pd['time'] = pd.to_datetime(weather_pd['time'])
             
             # Convert weather UTC time to local timezone for proper joining
-            import pytz
             tz = pytz.timezone(tz_name)
             weather_pd['time_local'] = weather_pd['time'].dt.tz_convert(tz)
             
@@ -837,7 +852,7 @@ def generate_azimuth_altitude_pairs_by_date(
             weather_subset = weather_indexed[weather_cols]
             
             # Resample weather data to match our granularity and interpolate
-            granularity_pandas = granularity.replace('PT', '').replace('M', 'min').replace('H', 'H')
+            granularity_pandas = granularity.replace('PT', '').replace('M', 'min').replace('H', 'h')
             weather_resampled = weather_subset.resample(granularity_pandas).interpolate(method='linear')
             
             # Create a temporary DataFrame with local times for joining
@@ -878,61 +893,182 @@ def generate_azimuth_altitude_pairs_by_year(
     granularity: str = "PT1H",
     solar_degrees_discretization: float = 1.0,
     only_daylight: bool = True,
+    weather_df: Optional[Any] = None,
 ) -> Dict[str, Any]:
     """
     Generate azimuth/altitude pairs for solar positions across a full year.
-    
-    Similar to generate_azimuth_altitude_pairs_by_date but for entire year.
+
+    Includes optional weather integration (same semantics as daily function).
     """
+
     start_date = dt.date(year, 1, 1)
     end_date = dt.date(year, 12, 31)
-    
+
+    # --------------------------------------------------
     # Parse granularity
+    # --------------------------------------------------
     granularity_delta = _parse_iso8601_duration(granularity)
-    
-    # Generate UTC time range
-    times_utc = _date_range_local_to_utc(start_date, end_date, tz_name, granularity_delta, only_daylight, lat, lon)
-    
+
+    # --------------------------------------------------
+    # Generate UTC timestamps
+    # --------------------------------------------------
+    times_utc = _date_range_local_to_utc(
+        start_date,
+        end_date,
+        tz_name,
+        granularity_delta,
+        only_daylight,
+        lat,
+        lon,
+    )
+
     if len(times_utc) == 0:
         return {
-            'azimuth_altitude_pairs': [],
-            'metadata': {'year': year, 'lat': lat, 'lon': lon, 'tz_name': tz_name}
+            "df": pd.DataFrame(
+                columns=[
+                    "datetime_local",
+                    "datetime_utc",
+                    "azimuth",
+                    "elevation",
+                    "azimuth_altitude",
+                ]
+            ),
+            "azimuth_altitude_pairs": [],
+            "metadata": {
+                "year": year,
+                "lat": lat,
+                "lon": lon,
+                "tz_name": tz_name,
+            },
         }
-    
-    # Calculate solar positions
+
+    # --------------------------------------------------
+    # Solar positions
+    # --------------------------------------------------
     solar_df = _solar_position_az_el(times_utc, lat, lon)
-    
-    # Apply discretization
+
+    # --------------------------------------------------
+    # Local timestamps
+    # --------------------------------------------------
+    tz = pytz.timezone(tz_name)
+    times_local = [t.astimezone(tz) for t in times_utc]
+
+    # --------------------------------------------------
+    # Discretization
+    # --------------------------------------------------
     if solar_degrees_discretization > 0:
-        azimuth = _floor_to_step(solar_df['azimuth'].values, 
-                                solar_degrees_discretization, 0, 360)
-        elevation = _floor_to_step(solar_df['elevation'].values,
-                                  solar_degrees_discretization, -90, 90)
+        azimuth = _floor_to_step(
+            solar_df["azimuth"].values,
+            solar_degrees_discretization,
+            0,
+            360,
+        )
+        elevation = _floor_to_step(
+            solar_df["elevation"].values,
+            solar_degrees_discretization,
+            -90,
+            90,
+        )
     else:
-        azimuth = solar_df['azimuth'].values
-        elevation = solar_df['elevation'].values
-    
-    # Filter daylight hours if requested
+        azimuth = solar_df["azimuth"].values
+        elevation = solar_df["elevation"].values
+
+    # --------------------------------------------------
+    # Daylight filter
+    # --------------------------------------------------
     if only_daylight:
-        daylight_mask = elevation > 0
-        azimuth = azimuth[daylight_mask]
-        elevation = elevation[daylight_mask]
-    
-    # Create combined tuples and remove duplicates
-    azimuth_altitude = list(set(zip(azimuth, elevation)))
-    azimuth_altitude.sort()  # Sort for consistency
-    
-    return {
-        'azimuth_altitude_pairs': azimuth_altitude,
-        'metadata': {
-            'year': year,
-            'lat': lat,
-            'lon': lon, 
-            'tz_name': tz_name,
-            'granularity': granularity,
-            'discretization': solar_degrees_discretization,
-            'unique_positions': len(azimuth_altitude)
+        mask = elevation > 0
+        azimuth = azimuth[mask]
+        elevation = elevation[mask]
+        times_utc = [t for i, t in enumerate(times_utc) if mask[i]]
+        times_local = [t for i, t in enumerate(times_local) if mask[i]]
+
+    azimuth_altitude = list(zip(azimuth, elevation))
+
+    # --------------------------------------------------
+    # Result DataFrame
+    # --------------------------------------------------
+    result_df = pd.DataFrame(
+        {
+            "datetime_local": times_local,
+            "datetime_utc": times_utc,
+            "azimuth": azimuth,
+            "elevation": elevation,
+            "azimuth_altitude": azimuth_altitude,
         }
+    )
+
+    # ==================================================
+    # WEATHER INTEGRATION (IDENTICAL TO DAILY FUNCTION)
+    # ==================================================
+    if weather_df is not None:
+        try:
+            if hasattr(weather_df, "to_pandas"):
+                weather_pd = weather_df.to_pandas()
+            else:
+                weather_pd = weather_df
+
+            result_df["datetime_local"] = pd.to_datetime(result_df["datetime_local"])
+            weather_pd["time"] = pd.to_datetime(weather_pd["time"])
+
+            tz = pytz.timezone(tz_name)
+            weather_pd["time_local"] = weather_pd["time"].dt.tz_convert(tz)
+
+            weather_indexed = weather_pd.set_index("time_local").sort_index()
+
+            weather_cols = [
+                c
+                for c in weather_indexed.columns
+                if c
+                not in [
+                    "time",
+                    "latitude",
+                    "longitude",
+                    "weatherStation",
+                    "sunPosition",
+                    "sunAzimuthDiscrete",
+                    "sunElevationDiscrete",
+                ]
+            ]
+
+            weather_subset = weather_indexed[weather_cols]
+
+            granularity_pandas = (
+                granularity.replace("PT", "")
+                .replace("M", "min")
+                .replace("H", "h")
+            )
+
+            weather_resampled = weather_subset.resample(
+                granularity_pandas
+            ).interpolate(method="linear")
+
+            tmp = result_df[["datetime_local"]].set_index("datetime_local")
+            joined = tmp.join(weather_resampled, how="left")
+
+            for col in joined.columns:
+                result_df[col] = joined[col].values
+
+        except Exception as e:
+            print(f"Warning: Failed to integrate weather data: {e}")
+
+    # --------------------------------------------------
+    # Unique azimuth-altitude pairs
+    # --------------------------------------------------
+    unique_pairs = sorted(set(azimuth_altitude))
+
+    return {
+        "df": result_df,
+        "azimuth_altitude_pairs": unique_pairs,
+        "metadata": {
+            "year": year,
+            "lat": lat,
+            "lon": lon,
+            "tz_name": tz_name,
+            "granularity": granularity,
+            "discretization": solar_degrees_discretization,
+            "unique_positions": len(unique_pairs),
+        },
     }
 
 
@@ -959,8 +1095,6 @@ def delete_matching_files(
     Returns:
         Tuple of (deleted_files, error_files)
     """
-    import re
-    from pathlib import Path
     
     deleted_files = []
     error_files = []
@@ -1021,574 +1155,1536 @@ def apply_height_shadow_to_hillshades(
     pattern: str = "*.tif",
     recursive: bool = True,
     overwrite: bool = False,
-    mask_value: float = 1,
     parallel: bool = False,
     max_workers: int = 4,
-) -> List[str]:
+    aoi=None,
+    aoi_crs: str = "EPSG:4326",
+    nodata_value: float = -9999.0,
+) -> list[str]:
     """
-    Apply height-based shadow masking to existing hillshades.
-    
-    This function takes existing hillshade files and applies additional shadowing
-    based on the height difference between DSM and DEM at a specified height.
-    
-    Args:
-        hillshade_dir: Directory containing input hillshades
-        dem_path: Path to DEM raster
-        dsm_path: Path to DSM raster  
-        out_dir: Output directory for modified hillshades
-        height_m: Height above ground for shadow calculation
-        pattern: File pattern to match hillshades
-        recursive: Search subdirectories
-        overwrite: Overwrite existing output files
-        mask_value: Value to set for shadowed areas
-        parallel: Use parallel processing
-        max_workers: Number of parallel workers
-    
-    Returns:
-        List of output file paths
+    Apply height-based shadowing using AOI as spatial authority.
     """
-    import glob
-    from pathlib import Path
-    
-    os.makedirs(out_dir, exist_ok=True)
-    
-    # Find hillshade files
-    if recursive:
-        hillshade_files = list(Path(hillshade_dir).rglob(pattern))
-    else:
-        hillshade_files = list(Path(hillshade_dir).glob(pattern))
-    
-    hillshade_files = [str(f) for f in hillshade_files if f.is_file()]
-    
-    if not hillshade_files:
-        warnings.warn(f"No hillshade files found matching {pattern} in {hillshade_dir}")
+
+    hillshade_dir = Path(hillshade_dir)
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    files = list(hillshade_dir.rglob(pattern) if recursive else hillshade_dir.glob(pattern))
+    files = [f for f in files if f.is_file()]
+
+    if not files:
         return []
-    
-    # Read DEM and DSM
-    try:
-        with rasterio.open(dem_path) as dem_src:
-            dem = dem_src.read(1).astype(np.float32)
-            dem_profile = dem_src.profile
-            dem_transform = dem_src.transform
-            dem_crs = dem_src.crs
-        
-        with rasterio.open(dsm_path) as dsm_src:
-            dsm = dsm_src.read(1).astype(np.float32)
-            dsm_profile = dsm_src.profile
-    except Exception as e:
-        raise RuntimeError(f"Error reading DEM/DSM: {e}")
-    
-    # Check that DEM and DSM are compatible
-    if dem.shape != dsm.shape:
-        raise ValueError(f"DEM shape {dem.shape} != DSM shape {dsm.shape}")
-    
-    # Calculate height difference mask
-    height_diff = dsm - dem
-    obstacle_mask = height_diff > height_m
-    
-    output_files = []
-    
-    def process_hillshade(hs_path: str) -> str:
-        """Process a single hillshade file."""
+
+    with rasterio.open(dem_path) as dem_src:
+        dem = dem_src.read(1).astype(np.float32)
+
+    with rasterio.open(dsm_path) as dsm_src:
+        dsm = dsm_src.read(1).astype(np.float32)
+        raster_crs = dsm_src.crs
+
+    if aoi is not None:
+        transformer = pyproj.Transformer.from_crs(
+            aoi_crs,
+            raster_crs,
+            always_xy=True,
+        ).transform
+        aoi_mask = rasterize_aoi_mask(transform(transformer, aoi), dsm_path)
+    else:
+        aoi_mask = np.ones_like(dsm, bool)
+
+    obstacle_mask = aoi_mask & ((dsm - dem) > height_m)
+
+    def process(path: Path):
         try:
-            # Determine output path
-            rel_path = os.path.relpath(hs_path, hillshade_dir)
-            out_path = os.path.join(out_dir, rel_path)
-            os.makedirs(os.path.dirname(out_path), exist_ok=True)
-            
+            out_path = out_dir / path.relative_to(hillshade_dir)
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+
             if os.path.exists(out_path) and not overwrite:
-                return out_path
-            
-            # Read hillshade
-            with rasterio.open(hs_path) as hs_src:
-                hs = hs_src.read(1).astype(np.float32)
-                hs_profile = hs_src.profile.copy()
-            
-            # Check compatibility
+                return str(out_path)
+
+            with rasterio.open(path) as src:
+                hs = src.read(1).astype(np.float32)
+                profile = src.profile.copy()
+
             if hs.shape != obstacle_mask.shape:
-                warnings.warn(f"Hillshade {hs_path} shape {hs.shape} != mask shape {obstacle_mask.shape}")
-                return ""
-            
-            # Apply height-based shadow
-            hs_modified = hs.copy()
-            hs_modified[obstacle_mask] = mask_value
-            
-            # Write output
-            with rasterio.open(out_path, 'w', **hs_profile) as dst:
-                dst.write(hs_modified.astype(hs_profile['dtype']), 1)
-            
-            return out_path
-            
+                warnings.warn(f"Shape mismatch: {path}")
+                return None
+
+            hs[obstacle_mask] = 0.0
+            hs[~aoi_mask] = nodata_value
+            np.clip(hs, 0.0, 1.0, out=hs, where=aoi_mask)
+
+            profile.update(
+                dtype="float32",
+                nodata=nodata_value,
+                compress="deflate",
+                predictor=3,
+            )
+
+            with rasterio.open(out_path, "w", **profile) as dst:
+                dst.write(hs, 1)
+
+            return str(out_path)
+
         except Exception as e:
-            warnings.warn(f"Error processing {hs_path}: {e}")
-            return ""
-    
-    # Process files
-    if parallel and max_workers > 1:
-        from concurrent.futures import ThreadPoolExecutor
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            results = list(tqdm(
-                executor.map(process_hillshade, hillshade_files),
-                total=len(hillshade_files),
-                desc="Applying height shadows"
-            ))
+            warnings.warn(str(e))
+            return None
+
+    if parallel:
+        with ThreadPoolExecutor(max_workers=max_workers) as ex:
+            res = list(tqdm(ex.map(process, files), total=len(files)))
     else:
-        results = []
-        for hs_path in tqdm(hillshade_files, desc="Applying height shadows"):
-            results.append(process_hillshade(hs_path))
-    
-    # Filter successful results
-    output_files = [r for r in results if r]
-    
-    return output_files
+        res = [process(f) for f in tqdm(files)]
+
+    return [r for r in res if r]
 
 
-def average_hillshades(
-    hillshade_dir: str,
-    out_path: str,
+def discretize_solar_position(
+    azimuth_deg: float,
+    altitude_deg: float,
     *,
-    pattern: str = "*.tif",
-    recursive: bool = True,
-    exclude_patterns: Optional[List[str]] = None,
-    aggregation: str = "mean",  # "mean" | "median" | "max" | "min"
-    dtype: str = "float32",
-    nodata: Optional[float] = None,
-    chunk_size: int = 10,  # Process files in chunks to manage memory
-) -> str:
+    azimuth_step: int = 3,
+    altitude_step: int = 3,
+) -> tuple[int, int]:
+    az_bin = int(round(azimuth_deg / azimuth_step) * azimuth_step) % 360
+    alt_bin = int(round(altitude_deg / altitude_step) * altitude_step)
+    return az_bin, alt_bin
+
+
+def load_hillshade(
+    hillshade_dir: Path,
+    azimuth: float,
+    altitude: float,
+) -> np.ndarray:
     """
-    Average multiple hillshade rasters into a single output.
-    
-    Args:
-        hillshade_dir: Directory containing hillshade files
-        out_path: Path for output averaged hillshade
-        pattern: File pattern to match
-        recursive: Search recursively
-        exclude_patterns: Patterns to exclude
-        aggregation: Aggregation method ("mean", "median", "max", "min")
-        dtype: Output data type
-        nodata: NoData value for output
-        chunk_size: Number of files to process at once (memory management)
-    
-    Returns:
-        Path to output file
-    """
-    from pathlib import Path
-    
-    # Find hillshade files
-    if recursive:
-        hillshade_files = list(Path(hillshade_dir).rglob(pattern))
-    else:
-        hillshade_files = list(Path(hillshade_dir).glob(pattern))
-    
-    hillshade_files = [str(f) for f in hillshade_files if f.is_file()]
-    
-    # Apply exclude patterns
-    if exclude_patterns:
-        filtered_files = []
-        for f in hillshade_files:
-            fname = os.path.basename(f)
-            should_exclude = any(fnmatch.fnmatch(fname, pat) for pat in exclude_patterns)
-            if not should_exclude:
-                filtered_files.append(f)
-        hillshade_files = filtered_files
-    
-    if not hillshade_files:
-        raise ValueError(f"No hillshade files found in {hillshade_dir}")
-    
-    print(f"Found {len(hillshade_files)} hillshade files to average")
-    
-    # Read first file to get dimensions and profile
-    with rasterio.open(hillshade_files[0]) as src:
-        profile = src.profile.copy()
-        shape = src.shape
-        first_data = src.read(1).astype(np.float64)
-    
-    # Update profile
-    profile.update(dtype=dtype, nodata=nodata, compress='deflate', tiled=True,
-                   blockxsize=256, blockysize=256)
-    
-    os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
-    
-    # Initialize accumulator
-    if aggregation == "mean":
-        accumulator = np.zeros(shape, dtype=np.float64)
-        count = np.zeros(shape, dtype=np.int32)
-    elif aggregation == "median":
-        all_data = []
-    elif aggregation == "max":
-        accumulator = np.full(shape, -np.inf, dtype=np.float64)
-    elif aggregation == "min":
-        accumulator = np.full(shape, np.inf, dtype=np.float64)
-    else:
-        raise ValueError(f"Unknown aggregation method: {aggregation}")
-    
-    # Process files in chunks
-    for i in tqdm(range(0, len(hillshade_files), chunk_size), desc=f"Averaging with {aggregation}"):
-        chunk_files = hillshade_files[i:i+chunk_size]
-        
-        if aggregation == "median":
-            # For median, collect all data first
-            chunk_data = []
-            for hs_path in chunk_files:
-                try:
-                    with rasterio.open(hs_path) as src:
-                        data = src.read(1).astype(np.float64)
-                        if data.shape != shape:
-                            warnings.warn(f"Shape mismatch in {hs_path}: {data.shape} != {shape}")
-                            continue
-                        chunk_data.append(data)
-                except Exception as e:
-                    warnings.warn(f"Error reading {hs_path}: {e}")
-                    continue
-            
-            if chunk_data:
-                all_data.extend(chunk_data)
-        
-        else:
-            # For other methods, process incrementally
-            for hs_path in chunk_files:
-                try:
-                    with rasterio.open(hs_path) as src:
-                        data = src.read(1).astype(np.float64)
-                        
-                        if data.shape != shape:
-                            warnings.warn(f"Shape mismatch in {hs_path}: {data.shape} != {shape}")
-                            continue
-                        
-                        # Handle nodata
-                        valid_mask = np.isfinite(data)
-                        if src.nodata is not None:
-                            valid_mask &= (data != src.nodata)
-                        
-                        if aggregation == "mean":
-                            accumulator[valid_mask] += data[valid_mask]
-                            count[valid_mask] += 1
-                        elif aggregation == "max":
-                            accumulator = np.maximum(accumulator, data)
-                        elif aggregation == "min":
-                            accumulator = np.minimum(accumulator, data)
-                            
-                except Exception as e:
-                    warnings.warn(f"Error processing {hs_path}: {e}")
-                    continue
-    
-    # Finalize result
-    if aggregation == "mean":
-        result = np.divide(accumulator, count, out=np.zeros_like(accumulator), where=(count > 0))
-        if nodata is not None:
-            result[count == 0] = nodata
-    elif aggregation == "median":
-        if all_data:
-            print(f"Computing median from {len(all_data)} arrays...")
-            all_array = np.stack(all_data, axis=0)
-            result = np.median(all_array, axis=0)
-        else:
-            result = np.full(shape, nodata if nodata is not None else 0, dtype=np.float64)
-    elif aggregation in ["max", "min"]:
-        result = accumulator
-        if aggregation == "max":
-            result[result == -np.inf] = nodata if nodata is not None else 0
-        else:  # min
-            result[result == np.inf] = nodata if nodata is not None else 0
-    
-    # Convert to output dtype
-    if dtype == "uint8":
-        result = np.clip(result, 0, 255).astype(np.uint8)
-    elif dtype == "float32":
-        result = result.astype(np.float32)
-    else:
-        result = result.astype(dtype)
-    
-    # Write output
-    with rasterio.open(out_path, 'w', **profile) as dst:
-        dst.write(result, 1)
-    
-    print(f"Averaged hillshade saved to {out_path}")
-    return out_path
+    Load hillshade generated by generate_multiple_hillshades_gdal.
 
-
-def calculate_sky_view_factor(
-        dsm_path: str,
-        out_path: str,
-        search_radius: float = 100.0,
-        angular_resolution: float = 5.0,
-        max_height_angle: float = 90.0,
-        nodata_fill: float = 1.0,
-        creation_options: Optional[Dict[str, str]] = None
-) -> str:
-    """
-    Calculate Sky View Factor (SVF) from a Digital Surface Model.
-
-    Sky View Factor measures the fraction of the sky hemisphere that is visible 
-    from each point, ranging from 0 (completely obstructed) to 1 (completely open).
-
-    Parameters:
-    -----------
-    dsm_path : str
-        Path to input Digital Surface Model (DSM) raster
-    out_path : str
-        Path for output Sky View Factor raster
-    search_radius : float, default 100.0
-        Maximum radius (in meters) to search for obstructing features
-    angular_resolution : float, default 5.0
-        Angular resolution (in degrees) for horizon calculation
-        Lower values = more accurate but slower
-    max_height_angle : float, default 90.0
-        Maximum height angle (in degrees) to consider for SVF calculation
-    nodata_fill : float, default 1.0
-        Value to assign to nodata areas (1.0 = completely open sky)
-    creation_options : Optional[Dict[str, str]]
-        GDAL creation options for output raster
-
-    Returns:
-    --------
-    str : Path to the created Sky View Factor raster
-
-    Notes:
-    ------
-    - SVF values range from 0 to 1
-    - Urban canyons have low SVF (~0.1-0.4)
-    - Open areas have high SVF (~0.8-1.0)
-    - Useful for urban climate, solar potential, and thermal comfort analysis
+    Output:
+      float32 array with values clipped to [0, 1]
     """
 
-    print(f"Calculating Sky View Factor from {dsm_path}", flush=True)
-    print(f"Search radius: {search_radius}m, Angular resolution: {angular_resolution}°", flush=True)
+    az_i = int(azimuth)
+    alt_i = int(altitude)
+    prefix = f"{az_i:03d}_{alt_i:02d}"
 
-    # Read DSM
-    with rasterio.open(dsm_path) as src:
-        dsm = src.read(1, masked=True)
-        transform = src.transform
-        profile = src.profile.copy()
-        nodata = src.nodata
-
-        # Get pixel size (assuming square pixels)
-        pixel_size = abs(transform[0])
-        height, width = dsm.shape
-
-    print(f"DSM dimensions: {width}x{height}, pixel size: {pixel_size:.2f}m", flush=True)
-
-    # Calculate search radius in pixels
-    search_radius_pixels = int(search_radius / pixel_size)
-
-    # Generate azimuth angles for horizon calculation
-    azimuth_angles = np.arange(0, 360, angular_resolution)
-    n_azimuths = len(azimuth_angles)
-
-    print(f"Computing SVF for {n_azimuths} azimuth directions...", flush=True)
-
-    # Initialize Sky View Factor array
-    svf = np.full_like(dsm.data, nodata_fill, dtype=np.float32)
-
-    # Handle masked/nodata areas
-    if hasattr(dsm, 'mask'):
-        valid_mask = ~dsm.mask
-        dsm_data = dsm.data
-    else:
-        if nodata is not None:
-            valid_mask = (dsm != nodata) & np.isfinite(dsm)
-        else:
-            valid_mask = np.isfinite(dsm)
-        dsm_data = dsm
-
-    # Create coordinate grids
-    rows, cols = np.mgrid[0:height, 0:width]
-
-    # Process each pixel that has valid data
-    valid_rows, valid_cols = np.where(valid_mask)
-    total_pixels = len(valid_rows)
-
-    print(f"Processing {total_pixels} valid pixels...", flush=True)
-
-    # Improved processing strategy for better interpolation
-    print("Creating optimized processing grid...", flush=True)
-
-    # Use moderate downsampling with better spatial distribution
-    if total_pixels > 10000:  # Only downsample for large datasets
-        step_size = max(2, min(4, int(np.sqrt(total_pixels / 5000))))  # More conservative
-        # Create more evenly distributed sample points
-        process_rows = valid_rows[::step_size]
-        process_cols = valid_cols[::step_size]
-        print(f"Using moderate downsampling with step size {step_size}", flush=True)
-    else:
-        # For small datasets, process all pixels for best quality
-        process_rows = valid_rows
-        process_cols = valid_cols
-        step_size = 1
-        print("Processing all pixels (small dataset)", flush=True)
-
-    print(f"Processing {len(process_rows)} sample points (from {total_pixels} total)", flush=True)
-
-    # Pre-calculate direction vectors for all azimuths
-    azimuth_rad = np.deg2rad(azimuth_angles)
-    dx_all = np.sin(azimuth_rad) / pixel_size
-    dy_all = np.cos(azimuth_rad) / pixel_size
-
-    # Fully vectorized processing using batch approach
-    # Use larger batches for better performance and clearer progress reporting
-    if len(process_rows) > 10000:
-        batch_size = min(2000, len(process_rows) // 20)  # Aim for ~20 batches for large datasets
-    else:
-        batch_size = min(1000, len(process_rows) // 5)  # Aim for ~5 batches for smaller datasets
-
-    batch_size = max(100, batch_size)  # Minimum batch size
-    n_batches = (len(process_rows) + batch_size - 1) // batch_size
-
-    for batch_idx in tqdm(range(n_batches), desc=f"Processing in {n_batches} batches of {batch_size} pixels..."):
-        start_idx = batch_idx * batch_size
-        end_idx = min(start_idx + batch_size, len(process_rows))
-
-        batch_rows = process_rows[start_idx:end_idx]
-        batch_cols = process_cols[start_idx:end_idx]
-        batch_size_actual = len(batch_rows)
-
-        # Initialize batch results
-        batch_max_angles = np.zeros((batch_size_actual, n_azimuths))
-        batch_heights = dsm_data[batch_rows, batch_cols]
-
-        # Vectorized ray casting with adaptive step size for speed
-        step_increment = max(1, search_radius_pixels // 25)  # Use fewer samples along rays
-
-        for step in range(step_increment, search_radius_pixels + 1, step_increment):
-            # Calculate sample positions for all pixels and all azimuths
-            # Shape: (batch_size, n_azimuths)
-            sample_rows_all = batch_rows[:, np.newaxis] + dy_all[np.newaxis, :] * step
-            sample_cols_all = batch_cols[:, np.newaxis] + dx_all[np.newaxis, :] * step
-
-            # Check bounds for all samples
-            valid_samples_mask = ((sample_rows_all >= 0) & (sample_rows_all < height - 1) &
-                                  (sample_cols_all >= 0) & (sample_cols_all < width - 1))
-
-            if not np.any(valid_samples_mask):
-                break
-
-            # Sample heights using bilinear interpolation for all valid positions
-            valid_positions = np.where(valid_samples_mask)
-            if len(valid_positions[0]) > 0:
-                try:
-                    # Efficient batch interpolation
-                    sample_heights = nvi.map_coordinates(
-                        dsm_data,
-                        np.array([sample_rows_all[valid_samples_mask], sample_cols_all[valid_samples_mask]]),
-                        order=1,
-                        mode='constant',
-                        cval=0,
-                        prefilter=False
-                    )
-
-                    # Calculate elevation angles
-                    distance = step * pixel_size
-                    pixel_heights = batch_heights[valid_positions[0]]
-                    height_diffs = sample_heights - pixel_heights
-                    elevation_angles = np.rad2deg(np.arctan(height_diffs / distance))
-
-                    # Update maximum angles efficiently
-                    current_max = batch_max_angles[valid_positions]
-                    batch_max_angles[valid_positions] = np.maximum(current_max, elevation_angles)
-
-                except:
-                    continue
-
-        # Calculate SVF for entire batch
-        batch_max_angles = np.clip(batch_max_angles, 0, max_height_angle)
-        batch_max_angles_rad = np.deg2rad(batch_max_angles)
-        batch_svf_values = np.mean(np.cos(batch_max_angles_rad), axis=1)
-
-        # Store results
-        svf[batch_rows, batch_cols] = batch_svf_values
-
-    # High-quality interpolation to fill missing pixels
-    computed_mask = svf != nodata_fill
-
-    if step_size > 1 and np.any(computed_mask):
-        print("Interpolating to full resolution using bilinear interpolation...", flush=True)
-
-        # Use scipy's griddata for high-quality interpolation
-        from scipy.interpolate import griddata
-
-        missing_mask = (valid_mask & (svf == nodata_fill))
-
-        if np.any(missing_mask):
-            # Get coordinates and values of computed points
-            computed_rows, computed_cols = np.where(computed_mask)
-            computed_values = svf[computed_mask]
-
-            # Get coordinates of missing points
-            missing_rows, missing_cols = np.where(missing_mask)
-
-            if len(computed_rows) > 3:  # Need at least 3 points for interpolation
-                print(f"Interpolating {len(missing_rows)} missing pixels from {len(computed_rows)} computed points",
-                      flush=True)
-
-                # Prepare point coordinates
-                points = np.column_stack([computed_rows, computed_cols])
-                values = computed_values
-                xi = np.column_stack([missing_rows, missing_cols])
-
-                # Use linear interpolation (bilinear)
-                try:
-                    interpolated_values = griddata(
-                        points, values, xi,
-                        method='linear',
-                        fill_value=nodata_fill
-                    )
-
-                    # For points that couldn't be interpolated linearly, use nearest neighbor
-                    still_missing = interpolated_values == nodata_fill
-                    if np.any(still_missing):
-                        nearest_values = griddata(
-                            points, values, xi[still_missing],
-                            method='nearest'
-                        )
-                        interpolated_values[still_missing] = nearest_values
-
-                    # Assign interpolated values
-                    svf[missing_rows, missing_cols] = interpolated_values
-
-                except Exception as e:
-                    print(f"Interpolation failed, using nearest neighbor fallback: {e}", flush=True)
-                    # Fallback to simple nearest neighbor
-                    from scipy.spatial.distance import cdist
-                    distances = cdist(xi, points)
-                    nearest_indices = np.argmin(distances, axis=1)
-                    svf[missing_rows, missing_cols] = values[nearest_indices]
-
-    print("SVF calculation complete. Saving results...", flush=True)
-
-    # Prepare output profile - simple configuration to avoid TIFF issues
-    profile.update(
-        dtype='float32',
-        count=1,
-        nodata=None,  # SVF doesn't use nodata, uses fill value instead
-        driver='GTiff'
+    candidates = sorted(
+        p for p in hillshade_dir.glob(f"{prefix}*.tif")
+        if not p.name.endswith("_raw.tif")
     )
 
-    # Create output directory if needed
-    os.makedirs(os.path.dirname(out_path), exist_ok=True)
-
-    # Write SVF raster
-    with rasterio.open(out_path, 'w', **profile) as dst:
-        dst.write(svf, 1)
-
-        # Add metadata
-        dst.update_tags(
-            1,
-            units='dimensionless',
-            description='Sky View Factor',
-            valid_range='0.0 to 1.0',
-            method='horizon_based',
-            search_radius=f'{search_radius}m',
-            angular_resolution=f'{angular_resolution}°'
+    if not candidates:
+        raise FileNotFoundError(
+            f"No valid hillshade for az={az_i}, alt={alt_i} in {hillshade_dir}"
         )
 
-    print(f"Sky View Factor saved to: {out_path}", flush=True)
+    fn = candidates[0]
 
-    # Print statistics
-    valid_svf = svf[valid_mask]
-    print(f"SVF Statistics:", flush=True)
-    print(f"  Mean: {np.mean(valid_svf):.3f}", flush=True)
-    print(f"  Min:  {np.min(valid_svf):.3f}", flush=True)
-    print(f"  Max:  {np.max(valid_svf):.3f}", flush=True)
-    print(f"  Std:  {np.std(valid_svf):.3f}", flush=True)
+    if fn.stat().st_size == 0:
+        raise ValueError(f"Corrupt hillshade (0 bytes): {fn}")
+
+    with rasterio.open(fn) as ds:
+        hs = ds.read(1).astype(np.float32)
+        nodata = ds.nodata
+
+    if nodata is not None:
+        hs = np.where(hs == nodata, 0.0, hs)
+
+    return hs
+
+def compute_surface_solar_energy(
+    solar_df,
+    *,
+    hillshade_dir,
+    svf_path,
+    out_path,
+    mode: str = "total",   # "total" | "monthly" | "fourier_decomposition"
+    aoi=None,
+    aoi_crs: str = "EPSG:4326",
+    nodata_value: float = -9999.0,
+    overwrite: bool = False,
+) -> None:
+    """
+    Compute surface solar energy with different aggregation strategies.
+
+    Modes
+    -----
+    total:
+        Bands:
+          1 : Direct annual energy (Wh)
+          2 : Diffuse annual energy (Wh)
+
+    monthly:
+        Bands:
+          1–12  : Direct monthly (Jan–Dec)
+          13–24 : Diffuse monthly (Jan–Dec)
+          25    : Direct annual
+          26    : Diffuse annual
+
+    fourier_decomposition:
+        Bands:
+          1 : A0   (direct isotropic)
+          2 : A1c  (direct cos(az))
+          3 : A1s  (direct sin(az))
+          4 : A2   (direct sin(alt))
+          5 : D0   (diffuse isotropic)
+          6 : D1   (diffuse sin(alt))
+
+        These coefficients allow exact POA reconstruction.
+    """
+
+    import numpy as np
+    import rasterio
+    import pyproj
+    from pathlib import Path
+    from tqdm import tqdm
+    from shapely.ops import transform as shp_transform
+
+    if mode not in {"total", "monthly", "fourier_decomposition"}:
+        raise ValueError("mode must be 'total', 'monthly', or 'fourier_decomposition'")
+    out_path = out_path.replace(".tif", f"_{mode}.tif")
+
+    if os.path.exists(out_path) and not overwrite:
+        return out_path
+
+    hillshade_dir = Path(hillshade_dir)
+    svf_path = Path(svf_path)
+    out_path = Path(out_path)
+
+    # ==========================================================
+    # SOLAR DATA PREPARATION
+    # ==========================================================
+    df = solar_df.copy()
+
+    df["az_bin"] = df.azimuth.astype(int)
+    df["alt_bin"] = df.elevation.astype(int)
+
+    df["dt_hours"] = (
+        df.datetime_utc.diff()
+        .dt.total_seconds()
+        .shift(-1)
+        .fillna(0.0) / 3600.0
+    )
+
+    df = df[df.elevation > 0]
+
+    if mode == "monthly":
+        df["month"] = df.datetime_utc.dt.month
+        month_groups = dict(tuple(df.groupby("month")))
+    else:
+        month_groups = {1: df}
+
+    # ==========================================================
+    # GRID & SVF
+    # ==========================================================
+    with rasterio.open(svf_path) as src:
+        profile = src.profile.copy()
+        H, W = src.height, src.width
+        transform = src.transform
+        raster_crs = src.crs
+        svf = src.read(1).astype(np.float32)
+
+    pixel_area = abs(transform.a * transform.e)
+
+    # ==========================================================
+    # AOI MASK
+    # ==========================================================
+    if aoi is not None:
+        transformer = pyproj.Transformer.from_crs(
+            aoi_crs, raster_crs, always_xy=True
+        ).transform
+        aoi_proj = shp_transform(transformer, aoi)
+        aoi_mask = rasterize_aoi_mask(aoi_proj, svf_path)
+    else:
+        aoi_mask = np.ones((H, W), dtype=bool)
+
+    # ==========================================================
+    # OUTPUT PROFILE
+    # ==========================================================
+    if mode == "total":
+        n_bands = 2
+    elif mode == "monthly":
+        n_bands = 26
+    else:  # fourier
+        n_bands = 6
+
+    profile.update(
+        dtype="float32",
+        nodata=nodata_value,
+        count=n_bands,
+        compress="zstd",
+        zstd_level=9,
+        predictor=3,
+        tiled=True,
+        blockxsize=256,
+        blockysize=256,
+        BIGTIFF="IF_SAFER",
+    )
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with rasterio.open(out_path, "w", **profile):
+        pass
+
+    # ==========================================================
+    # ACCUMULATORS
+    # ==========================================================
+    if mode == "fourier_decomposition":
+        A0  = np.zeros((H, W), np.float32)
+        A1c = np.zeros((H, W), np.float32)
+        A1s = np.zeros((H, W), np.float32)
+        A2  = np.zeros((H, W), np.float32)
+        D0  = np.zeros((H, W), np.float32)
+        D1  = np.zeros((H, W), np.float32)
+    else:
+        direct_annual  = np.zeros((H, W), np.float32)
+        diffuse_annual = np.zeros((H, W), np.float32)
+
+    # ==========================================================
+    # MAIN LOOP
+    # ==========================================================
+    for month_key, df_month in month_groups.items():
+        if df_month.empty:
+            continue
+
+        if mode == "monthly":
+            direct_month  = np.zeros((H, W), np.float32)
+            diffuse_month = np.zeros((H, W), np.float32)
+
+        hill_groups = df_month.groupby(["az_bin", "alt_bin"])
+
+        for (az, alt), g in tqdm(
+            hill_groups,
+            desc=f"Solar energy ({mode})",
+            unit="group",
+            dynamic_ncols=True,
+        ):
+            dni_E = np.sum(g.DNI.values * g.dt_hours.values).astype(np.float32)
+            dhi_E = np.sum(g.DHI.values * g.dt_hours.values).astype(np.float32)
+
+            if dni_E == 0 and dhi_E == 0:
+                continue
+
+            hill = load_hillshade(
+                hillshade_dir,
+                azimuth=az,
+                altitude=alt,
+            ).astype(np.float32)
+
+            if mode == "fourier_decomposition":
+                θ = np.deg2rad(az)
+                φ = np.deg2rad(alt)
+
+                _accumulate_fourier(
+                    A0, A1c, A1s, A2,
+                    D0, D1,
+                    hill, svf,
+                    dni_E, dhi_E,
+                    θ, φ,
+                    aoi_mask,
+                    pixel_area,
+                )
+            else:
+                _accumulate_energy_split(
+                    direct_month if mode == "monthly" else direct_annual,
+                    diffuse_month if mode == "monthly" else diffuse_annual,
+                    svf,
+                    hill,
+                    dni_E,
+                    dhi_E,
+                    aoi_mask,
+                    pixel_area,
+                )
+
+        if mode == "monthly":
+            direct_annual  += direct_month
+            diffuse_annual += diffuse_month
+
+            with rasterio.open(out_path, "r+") as dst:
+                direct_month[~aoi_mask]  = nodata_value
+                diffuse_month[~aoi_mask] = nodata_value
+                dst.write(direct_month,  month_key)
+                dst.write(diffuse_month, month_key + 12)
+
+    # ==========================================================
+    # FINAL WRITE
+    # ==========================================================
+    with rasterio.open(out_path, "r+") as dst:
+        if mode == "fourier_decomposition":
+            for arr, band in zip(
+                (A0, A1c, A1s, A2, D0, D1),
+                range(1, 7),
+            ):
+                arr[~aoi_mask] = nodata_value
+                dst.write(arr, band)
+
+            dst.set_band_description(1, "A0 direct")
+            dst.set_band_description(2, "A1c cos(az)")
+            dst.set_band_description(3, "A1s sin(az)")
+            dst.set_band_description(4, "A2 sin(alt)")
+            dst.set_band_description(5, "D0 diffuse")
+            dst.set_band_description(6, "D1 sin(alt)")
+
+        else:
+            direct_annual[~aoi_mask]  = nodata_value
+            diffuse_annual[~aoi_mask] = nodata_value
+
+            if mode == "monthly":
+                dst.write(direct_annual, 25)
+                dst.write(diffuse_annual, 26)
+                dst.set_band_description(1, "Direct - January")
+                dst.set_band_description(2, "Direct - February")
+                dst.set_band_description(3, "Direct - March")
+                dst.set_band_description(4, "Direct - April")
+                dst.set_band_description(5, "Direct - May")
+                dst.set_band_description(6, "Direct - June")
+                dst.set_band_description(7, "Direct - July")
+                dst.set_band_description(8, "Direct - August")
+                dst.set_band_description(9, "Direct - September")
+                dst.set_band_description(10, "Direct - October")
+                dst.set_band_description(11, "Direct - November")
+                dst.set_band_description(12, "Direct - December")
+                dst.set_band_description(13, "Diffuse - January")
+                dst.set_band_description(14, "Diffuse - February")
+                dst.set_band_description(15, "Diffuse - March")
+                dst.set_band_description(16, "Diffuse - April")
+                dst.set_band_description(17, "Diffuse - May")
+                dst.set_band_description(18, "Diffuse - June")
+                dst.set_band_description(19, "Diffuse - July")
+                dst.set_band_description(20, "Diffuse - August")
+                dst.set_band_description(21, "Diffuse - September")
+                dst.set_band_description(22, "Diffuse - October")
+                dst.set_band_description(23, "Diffuse - November")
+                dst.set_band_description(24, "Diffuse - December")
+                dst.set_band_description(25, "Direct - Annual")
+                dst.set_band_description(26, "Diffuse - Annual")
+            else:
+                dst.write(direct_annual, 1)
+                dst.write(diffuse_annual, 2)
+                dst.set_band_description(1, "Direct")
+                dst.set_band_description(2, "Diffuse")
+
+@njit(parallel=True, fastmath=True)
+def _accumulate_energy_split(
+    E_dir, E_dif,
+    svf, hill,
+    dni_E, dhi_E,
+    valid_mask,
+    pixel_area,
+):
+    H, W = E_dir.shape
+    for i in prange(H):
+        for j in range(W):
+            if not valid_mask[i, j]:
+                continue
+            E_dir[i, j] += dni_E * hill[i, j] * pixel_area
+            E_dif[i, j] += dhi_E * svf[i, j] * pixel_area
+
+
+@njit(parallel=True, fastmath=True)
+def _accumulate_fourier(
+    A0, A1c, A1s, A2,
+    D0, D1,
+    hill, svf,
+    dni_E, dhi_E,
+    theta, phi,
+    valid_mask,
+    pixel_area,
+):
+    cθ = np.cos(theta)
+    sθ = np.sin(theta)
+    sφ = np.sin(phi)
+
+    H, W = A0.shape
+    for i in prange(H):
+        for j in range(W):
+            if not valid_mask[i, j]:
+                continue
+
+            E_dir = dni_E * hill[i, j] * pixel_area
+            E_dif = dhi_E * svf[i, j] * pixel_area
+
+            A0[i, j]  += E_dir
+            A1c[i, j] += E_dir * cθ
+            A1s[i, j] += E_dir * sθ
+            A2[i, j]  += E_dir * sφ
+
+            D0[i, j]  += E_dif
+            D1[i, j]  += E_dif * sφ
+
+def calculate_sky_view_factor(
+    dsm_path: str,
+    out_path: str,
+    search_radius: float = 100.0,
+    angular_resolution: float = 5.0,
+    nodata_value: float = -9999.0,
+    *,
+    cuda: bool | None = None,
+    hybrid: bool = False,
+    subsample_factor: int = 2,
+    building_buffer_m: float = 40.0,
+    height_threshold: float = 3.0,
+    class_path: str | None = None,
+    building_classes: Sequence[int] | None = None,
+    vegetation_classes: Sequence[int] | None = None,
+) -> str:
+
+    if cuda is None:
+        cuda = has_cuda()
+
+    if cuda and hybrid:
+        return _calculate_svf_cuda_hybrid(
+            dsm_path=dsm_path,
+            out_path=out_path,
+            search_radius=search_radius,
+            angular_resolution=angular_resolution,
+            subsample_factor=subsample_factor,
+            building_buffer_m=building_buffer_m,
+            height_threshold=height_threshold,
+            class_path=class_path,
+            building_classes=building_classes,
+            vegetation_classes=vegetation_classes,
+            nodata_value=nodata_value,
+        )
+
+    if cuda:
+        return _calculate_svf_cuda(
+            dsm_path=dsm_path,
+            out_path=out_path,
+            search_radius=search_radius,
+            angular_resolution=angular_resolution,
+            nodata_value=nodata_value,
+        )
+
+    return _calculate_svf_cpu(
+        dsm_path=dsm_path,
+        out_path=out_path,
+        search_radius=search_radius,
+        angular_resolution=angular_resolution,
+        nodata_value=nodata_value,
+    )
+
+
+def _calculate_svf_cpu(
+    dsm_path: str,
+    out_path: str,
+    search_radius: float,
+    angular_resolution: float,
+    max_height_angle: float,
+    nodata_value: float,
+    creation_options: Optional[Dict[str, str]],
+    row_block_size: int,
+) -> str:
+    """
+    Existing CPU/Numba SVF (row-based kernel).
+    """
+
+    info("Calculating Sky View Factor (CPU / Numba)")
+
+    with rasterio.open(dsm_path) as src:
+        dsm = src.read(1).astype(np.float32)
+        profile = src.profile.copy()
+        nodata = src.nodata
+        pixel_size = abs(src.transform[0])
+
+    height, width = dsm.shape
+
+    if nodata is not None:
+        valid_mask = (dsm != nodata) & np.isfinite(dsm)
+    else:
+        valid_mask = np.isfinite(dsm)
+
+    svf = np.full(dsm.shape, nodata_value, dtype=np.float32)
+
+    azimuth_angles = np.arange(0.0, 360.0, angular_resolution, dtype=np.float32)
+    azimuth_rad = np.deg2rad(azimuth_angles)
+
+    search_radius_px = int(search_radius / pixel_size)
+    step_px = max(1, int(search_radius_px * 0.02))
+    max_height_angle_rad = np.deg2rad(max_height_angle)
+
+    n_blocks = (height + row_block_size - 1) // row_block_size
+
+    with tqdm(total=n_blocks, desc="SVF CPU", unit="block") as pbar:
+        for i in range(n_blocks):
+            r0 = i * row_block_size
+            r1 = min(r0 + row_block_size, height)
+
+            _svf_kernel_rows(
+                dsm,
+                valid_mask,
+                svf,
+                azimuth_rad,
+                pixel_size,
+                search_radius_px,
+                step_px,
+                max_height_angle_rad,
+                r0,
+                r1,
+            )
+            pbar.update(1)
+
+    profile.update(dtype="float32", count=1, nodata=nodata_value)
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+
+    with rasterio.open(out_path, "w", **profile) as dst:
+        dst.write(svf, 1)
 
     return out_path
+
+
+def build_svf_importance_mask(
+    class_raster: np.ndarray,
+    *,
+    building_classes: Sequence[int],
+    vegetation_classes: Sequence[int],
+    buffer_px: int = 5,
+) -> np.ndarray:
+    """
+    True where full-resolution SVF is required.
+    """
+    from scipy.ndimage import binary_dilation
+
+    importance = np.isin(class_raster, list(building_classes) + list(vegetation_classes))
+
+    if buffer_px > 0:
+        importance = binary_dilation(importance, iterations=buffer_px)
+
+    return importance
+
+def downsample_dsm(dsm: np.ndarray, factor: int) -> np.ndarray:
+    h, w = dsm.shape
+    h2 = h // factor
+    w2 = w // factor
+
+    dsm_crop = dsm[:h2 * factor, :w2 * factor]
+    return dsm_crop.reshape(
+        h2, factor, w2, factor
+    ).mean(axis=(1, 3))
+
+
+def upsample_svf(
+    svf_coarse: np.ndarray,
+    factor: int,
+    out_shape: tuple[int, int],
+) -> np.ndarray:
+    svf_up = zoom(svf_coarse, zoom=factor, order=1)
+    return svf_up[:out_shape[0], :out_shape[1]]
+
+
+def _fit_to_shape(arr: np.ndarray, shape: tuple[int, int]) -> np.ndarray:
+    """
+    Crop or pad array to match target shape.
+    Pads with edge values if needed.
+    """
+    h, w = shape
+    ah, aw = arr.shape
+
+    # Crop if larger
+    arr = arr[:h, :w]
+
+    # Pad if smaller
+    if arr.shape[0] < h or arr.shape[1] < w:
+        pad_h = h - arr.shape[0]
+        pad_w = w - arr.shape[1]
+
+        arr = np.pad(
+            arr,
+            ((0, pad_h), (0, pad_w)),
+            mode="edge",
+        )
+
+    return arr
+
+
+@cuda.jit
+def normalize_svf_kernel(svf, valid_mask, n_az):
+    i, j = cuda.grid(2)
+    rows, cols = svf.shape
+
+    if i >= rows or j >= cols:
+        return
+
+    if not valid_mask[i, j]:
+        return
+
+    svf[i, j] = svf[i, j] / n_az
+
+@cuda.jit
+def svf_horizon_kernel(
+    dsm,
+    valid_mask,
+    svf_acc,
+    dx,
+    dy,
+    pixel_size,
+    max_steps,
+):
+    i, j = cuda.grid(2)
+    rows, cols = dsm.shape
+
+    if i >= rows or j >= cols:
+        return
+    if not valid_mask[i, j]:
+        return
+
+    z0 = dsm[i, j]
+    max_angle = 0.0
+
+    for step in range(1, max_steps + 1):
+        ii = int(i + step * dy)
+        jj = int(j + step * dx)
+
+        if ii < 0 or ii >= rows or jj < 0 or jj >= cols:
+            break
+
+        dz = dsm[ii, jj] - z0
+        ang = math.atan2(dz, step * pixel_size)
+
+        if ang > max_angle:
+            max_angle = ang
+
+    svf_acc[i, j] += math.cos(max_angle) ** 2
+
+
+def _calculate_svf_cuda_hybrid(
+    dsm_path: str,
+    out_path: str,
+    *,
+    search_radius: float,
+    angular_resolution: float,
+    subsample_factor: int,
+    building_buffer_m: float,
+    height_threshold: float,
+    class_path: str | None,
+    building_classes: Sequence[int] | None,
+    vegetation_classes: Sequence[int] | None,
+    nodata_value: float,
+) -> str:
+
+    info("Calculating Sky View Factor (CUDA, hybrid – TRUE)")
+
+    # --- Read DSM ---
+    with rasterio.open(dsm_path) as src:
+        dsm = src.read(1).astype(np.float32)
+        profile = src.profile.copy()
+        nodata = src.nodata
+        pixel_size = abs(src.transform[0])
+
+    H, W = dsm.shape
+
+    # --- Valid mask ---
+    valid = np.isfinite(dsm)
+    if nodata is not None:
+        valid &= (dsm != nodata)
+
+    # --- Buffer in pixels ---
+    building_buffer_px = max(1, int(building_buffer_m / pixel_size))
+
+    # ==========================================================
+    # IMPORTANCE MASK
+    # ==========================================================
+    if class_path is not None:
+        info("Using class raster for SVF importance mask")
+
+        with rasterio.open(class_path) as src:
+            class_raster = src.read(1)
+
+        if building_classes is None:
+            raise ValueError("building_classes must be provided with class_path")
+
+        if vegetation_classes is None:
+            vegetation_classes = set()
+
+        importance_mask = build_svf_importance_mask(
+            class_raster,
+            building_classes=building_classes,
+            vegetation_classes=vegetation_classes,
+            buffer_px=building_buffer_px,
+        )
+
+        importance_mask &= valid
+
+    else:
+        info("Using height-based SVF importance mask")
+
+        ground = np.percentile(dsm[valid], 10)
+        importance_mask = valid & ((dsm - ground) > height_threshold)
+        importance_mask = binary_dilation(
+            importance_mask,
+            iterations=building_buffer_px,
+        )
+
+    frac = 100.0 * importance_mask.mean()
+    info(f"Hybrid SVF: {frac:.1f}% full-resolution pixels")
+
+    # ==========================================================
+    # COARSE SVF (FULL AREA, CHEAP)
+    # ==========================================================
+    factor = subsample_factor
+    dsm_coarse = downsample_dsm(dsm, factor)
+
+    coarse_dsm_path = out_path + ".coarse_dsm.tif"
+    coarse_svf_path = out_path + ".coarse.tif"
+
+    coarse_profile = profile.copy()
+    coarse_profile.update(
+        height=dsm_coarse.shape[0],
+        width=dsm_coarse.shape[1],
+        transform=profile["transform"] * rasterio.Affine.scale(factor, factor),
+    )
+
+    with rasterio.open(coarse_dsm_path, "w", **coarse_profile) as dst:
+        dst.write(dsm_coarse, 1)
+
+    _calculate_svf_cuda(
+        dsm_path=coarse_dsm_path,
+        out_path=coarse_svf_path,
+        search_radius=search_radius,
+        angular_resolution=angular_resolution,
+        nodata_value=nodata_value,
+    )
+
+    with rasterio.open(coarse_svf_path) as ds:
+        svf_coarse = ds.read(1)
+
+    os.remove(coarse_dsm_path)
+    os.remove(coarse_svf_path)
+
+    svf_coarse_up = zoom(svf_coarse, zoom=factor, order=1)
+    svf_coarse_up = _fit_to_shape(svf_coarse_up, (H, W))
+
+    # ==========================================================
+    # FULL SVF ONLY WHERE NEEDED (MASKED CUDA)
+    # ==========================================================
+    masked_valid = valid & importance_mask
+
+    azimuths = np.deg2rad(
+        np.arange(0.0, 360.0, angular_resolution, dtype=np.float32)
+    )
+    n_az = len(azimuths)
+
+    max_steps = int(search_radius / pixel_size)
+
+    d_dsm = cuda.to_device(dsm)
+    d_valid = cuda.to_device(masked_valid)
+    d_svf = cuda.device_array_like(dsm)
+    d_svf[:] = 0.0
+
+    threads = (16, 16)
+    blocks = (
+        (H + threads[0] - 1) // threads[0],
+        (W + threads[1] - 1) // threads[1],
+    )
+
+    with tqdm(
+        azimuths,
+        desc="SVF CUDA azimuths (masked)",
+        dynamic_ncols=True,
+        file=sys.stdout,
+    ) as pbar:
+        for az in pbar:
+            dx = math.cos(az)
+            dy = -math.sin(az)
+
+            svf_horizon_kernel[blocks, threads](
+                d_dsm,
+                d_valid,
+                d_svf,
+                dx,
+                dy,
+                pixel_size,
+                max_steps,
+            )
+            cuda.synchronize()
+
+    normalize_svf_kernel[blocks, threads](
+        d_svf,
+        d_valid,
+        n_az,
+    )
+    cuda.synchronize()
+
+    svf_full = d_svf.copy_to_host()
+
+    # ==========================================================
+    # MERGE
+    # ==========================================================
+    svf = np.where(
+        importance_mask,
+        svf_full,
+        svf_coarse_up,
+    )
+
+    svf = np.where(valid, np.clip(svf, 0.0, 1.0), nodata_value)
+
+    # --- Write output ---
+    profile.update(dtype="float32", nodata=nodata_value)
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+
+    with rasterio.open(out_path, "w", **profile) as dst:
+        dst.write(svf, 1)
+        dst.update_tags(
+            method="cuda_hybrid_true",
+            subsample_factor=subsample_factor,
+            building_buffer_m=building_buffer_m,
+        )
+
+    info("Hybrid SVF computation completed successfully")
+    info(f"Output written to {out_path}")
+
+    return out_path
+
+
+def _calculate_svf_cuda(
+    dsm_path: str,
+    out_path: str,
+    search_radius: float,
+    angular_resolution: float,
+    nodata_value: float,
+) -> str:
+    """
+    CUDA-based physically correct 2D angular Sky View Factor (SVF).
+
+    - One CUDA kernel per azimuth
+    - Progress logging visible (tqdm + cuda.synchronize)
+    - Correct normalization on GPU
+    """
+
+    info("Calculating Sky View Factor (CUDA, 2D angular)")
+
+    # --- Read DSM ---
+    with rasterio.open(dsm_path) as src:
+        dsm = src.read(1).astype(np.float32)
+        profile = src.profile.copy()
+        nodata = src.nodata
+        pixel_size = abs(src.transform[0])
+
+    rows, cols = dsm.shape
+    info(f"DSM size: {cols} × {rows}, pixel size: {pixel_size:.2f} m")
+
+    # --- Valid mask ---
+    if nodata is not None:
+        valid_mask = (dsm != nodata) & np.isfinite(dsm)
+    else:
+        valid_mask = np.isfinite(dsm)
+
+    # --- Geometry ---
+    azimuths = np.deg2rad(
+        np.arange(0.0, 360.0, angular_resolution, dtype=np.float32)
+    )
+    n_az = len(azimuths)
+
+    max_steps = int(search_radius / pixel_size)
+    if max_steps < 2:
+        raise ValueError("search_radius too small for DSM resolution")
+
+    info(f"Azimuth directions: {n_az}")
+    info(f"Ray steps: {max_steps}")
+
+    # --- GPU memory ---
+    d_dsm = cuda.to_device(dsm)
+    d_valid = cuda.to_device(valid_mask)
+    d_svf = cuda.device_array_like(dsm)
+    d_svf[:] = 0.0
+
+    threads = (16, 16)
+    blocks = (
+        (rows + threads[0] - 1) // threads[0],
+        (cols + threads[1] - 1) // threads[1],
+    )
+
+    # --- CUDA azimuth loop with visible progress ---
+    with tqdm(
+        azimuths,
+        desc="SVF CUDA azimuths",
+        dynamic_ncols=True,
+        file=sys.stdout,
+    ) as pbar:
+        for az in pbar:
+            dx = math.cos(az)
+            dy = -math.sin(az)
+
+            svf_horizon_kernel[blocks, threads](
+                d_dsm,
+                d_valid,
+                d_svf,
+                dx,
+                dy,
+                pixel_size,
+                max_steps,
+            )
+
+            # 🔴 REQUIRED: force sync so tqdm updates
+            cuda.synchronize()
+
+    # --- Normalize on GPU ---
+    normalize_svf_kernel[blocks, threads](
+        d_svf,
+        d_valid,
+        n_az,
+    )
+    cuda.synchronize()
+
+    # --- Copy back ---
+    svf = d_svf.copy_to_host()
+    svf = np.where(valid_mask, np.clip(svf, 0.0, 1.0), nodata_value)
+
+    # --- Write output ---
+    profile.update(
+        dtype="float32",
+        count=1,
+        nodata=nodata_value,
+        driver="GTiff",
+    )
+
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+
+    with rasterio.open(out_path, "w", **profile) as dst:
+        dst.write(svf, 1)
+        dst.update_tags(
+            units="dimensionless",
+            description="Sky View Factor",
+            method="cuda_2d_angular_horizon",
+            angular_resolution=f"{angular_resolution}deg",
+            search_radius=f"{search_radius}m",
+        )
+
+    info("SVF CUDA computation completed successfully")
+    info(f"Output written to {out_path}")
+
+    return out_path
+
+
+def pad_to_macroblock(img, block=16):
+    h, w = img.shape[:2]
+    pad_h = (-h) % block
+    pad_w = (-w) % block
+
+    if pad_h == 0 and pad_w == 0:
+        return img
+
+    return np.pad(
+        img,
+        ((0, pad_h), (0, pad_w), (0, 0)),
+        mode="edge",
+    )
+
+
+def generate_daily_shadow_mp4(
+    solar_df,
+    *,
+    hillshade_dir,
+    out_mp4,
+    fps: int = 24,
+    duration_seconds: int = 20,
+    zoom: float = 4.0,
+    center_xy: tuple[int, int] | None = None,
+    frame_size: tuple[int, int] = (1920, 1088),
+    overwrite: bool = False,
+    timestamp_fmt: str = "%Y-%m-%d %H:%M UTC",
+    timestamp_position: tuple[int, int] = (30, 60),
+    timestamp_scale: float = 1.0,
+    timestamp_thickness: int = 2,
+    timestamp_padding: int = 10,
+    timestamp_box_alpha: float = 0.45,
+    solar_line_scale: float | None = None,
+):
+    """
+    Generate an MP4 animation of daily terrain shadows with:
+      - bounded LRU hillshade cache
+      - OpenCV resize
+      - timestamp overlay
+      - solar altitude / azimuth overlay (1 decimal)
+    """
+
+    from functools import lru_cache
+    import gc
+
+    hillshade_dir = Path(hillshade_dir)
+    out_mp4 = Path(out_mp4)
+
+    if out_mp4.exists() and not overwrite:
+        return
+
+    # ----------------------------------------------------------
+    # Prepare solar data
+    # ----------------------------------------------------------
+    df = solar_df.copy()
+    df = df[df.elevation > 0]
+    if df.empty:
+        raise ValueError("No sun-above-horizon data available")
+
+    df["az_bin"] = df.azimuth.astype(int)
+    df["alt_bin"] = df.elevation.astype(int)
+    df = df.sort_values("datetime_utc").reset_index(drop=True)
+
+    times = df.datetime_utc.astype("int64").to_numpy() / 1e9
+    az = df.azimuth.to_numpy(dtype=np.float32)
+    alt = df.elevation.to_numpy(dtype=np.float32)
+    az_bin = df.az_bin.to_numpy(dtype=np.int32)
+    alt_bin = df.alt_bin.to_numpy(dtype=np.int32)
+
+    # ----------------------------------------------------------
+    # LRU Hillshade Cache (bounded)
+    # ----------------------------------------------------------
+    @lru_cache(maxsize=8)
+    def get_hillshade_cached(a: int, h: int) -> np.ndarray:
+        hs = load_hillshade(
+            hillshade_dir,
+            azimuth=a,
+            altitude=h,
+        )
+        return hs.astype(np.float32)
+
+    # ----------------------------------------------------------
+    # Geometry reference
+    # ----------------------------------------------------------
+    ref = get_hillshade_cached(int(az_bin[0]), int(alt_bin[0]))
+    H, W = ref.shape
+
+    if center_xy is None:
+        cx, cy = W // 2, H // 2
+    else:
+        cx, cy = center_xy
+
+    # ----------------------------------------------------------
+    # Crop window (aspect-ratio safe)
+    # ----------------------------------------------------------
+    target_ar = frame_size[0] / frame_size[1]
+
+    base_w = int(W / zoom)
+    base_h = int(H / zoom)
+
+    if base_w / base_h > target_ar:
+        win_h = base_h
+        win_w = int(base_h * target_ar)
+    else:
+        win_w = base_w
+        win_h = int(base_w / target_ar)
+
+    win_w = min(win_w, W)
+    win_h = min(win_h, H)
+
+    x0 = max(0, cx - win_w // 2)
+    y0 = max(0, cy - win_h // 2)
+    x1 = min(W, x0 + win_w)
+    y1 = min(H, y0 + win_h)
+
+    if x1 - x0 < win_w:
+        x0 = max(0, x1 - win_w)
+    if y1 - y0 < win_h:
+        y0 = max(0, y1 - win_h)
+
+    # ----------------------------------------------------------
+    # Temporal sampling
+    # ----------------------------------------------------------
+    total_frames = fps * duration_seconds
+    t_video = np.linspace(times.min(), times.max(), total_frames)
+
+    out_mp4.parent.mkdir(parents=True, exist_ok=True)
+
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    if solar_line_scale is None:
+        solar_line_scale = timestamp_scale * 0.85
+
+    # ----------------------------------------------------------
+    # Video writer
+    # ----------------------------------------------------------
+    with imageio.get_writer(
+        out_mp4,
+        fps=fps,
+        codec="libx264",
+        macro_block_size=16,
+    ) as writer:
+
+        idx = 0
+
+        for t in tqdm(t_video, desc="Generating shadow MP4"):
+
+            while idx < len(times) - 2 and times[idx + 1] < t:
+                idx += 1
+
+            t0, t1 = times[idx], times[idx + 1]
+            w = 0.0 if t1 == t0 else (t - t0) / (t1 - t0)
+
+            # Interpolate solar geometry
+            alt_i = (1 - w) * alt[idx] + w * alt[idx + 1]
+            az_i = (1 - w) * az[idx] + w * az[idx + 1]
+
+            # Load only 2 hillshades (LRU keeps max 8)
+            hs0 = get_hillshade_cached(int(az_bin[idx]), int(alt_bin[idx]))[y0:y1, x0:x1]
+            hs1 = get_hillshade_cached(int(az_bin[idx + 1]), int(alt_bin[idx + 1]))[y0:y1, x0:x1]
+
+            # In-place blend (no extra float64 temp)
+            frame = hs0.copy()
+            frame *= (1.0 - w)
+            frame += hs1 * w
+
+            np.clip(frame, 0.0, 1.0, out=frame)
+            frame = (frame * 255.0).astype(np.uint8)
+
+            # Resize + grayscale → RGB
+            frame = cv2.resize(frame, frame_size, interpolation=cv2.INTER_LINEAR)
+            frame = cv2.cvtColor(frame, cv2.COLOR_GRAY2RGB)
+
+            # --------------------------------------------------
+            # Overlay text
+            # --------------------------------------------------
+            ts = np.datetime64(int(t), "s").astype("datetime64[s]").astype(object)
+            line1 = ts.strftime(timestamp_fmt)
+            line2 = f"Alt: {alt_i:.1f} deg   Az: {az_i:.1f} deg"
+
+            (w1, h1), b1 = cv2.getTextSize(
+                line1, font, timestamp_scale, timestamp_thickness
+            )
+            (w2, h2), b2 = cv2.getTextSize(
+                line2, font, solar_line_scale, timestamp_thickness
+            )
+
+            x, y = timestamp_position
+            line_gap = 6
+
+            box_x0 = x - timestamp_padding
+            box_y0 = y - h1 - timestamp_padding
+            box_x1 = x + max(w1, w2) + timestamp_padding
+            box_y1 = (
+                y
+                + b1
+                + h2
+                + line_gap
+                + b2
+                + timestamp_padding
+            )
+
+            overlay = frame.copy()
+            cv2.rectangle(
+                overlay,
+                (box_x0, box_y0),
+                (box_x1, box_y1),
+                (0, 0, 0),
+                -1,
+            )
+
+            frame = cv2.addWeighted(
+                overlay, timestamp_box_alpha, frame, 1 - timestamp_box_alpha, 0
+            )
+
+            cv2.putText(
+                frame,
+                line1,
+                (x + 2, y + 2),
+                font,
+                timestamp_scale,
+                (0, 0, 0),
+                timestamp_thickness + 1,
+                cv2.LINE_AA,
+            )
+
+            cv2.putText(
+                frame,
+                line2,
+                (x + 2, y + h2 + line_gap + 2),
+                font,
+                solar_line_scale,
+                (0, 0, 0),
+                timestamp_thickness + 1,
+                cv2.LINE_AA,
+            )
+
+            cv2.putText(
+                frame,
+                line1,
+                (x, y),
+                font,
+                timestamp_scale,
+                (255, 255, 255),
+                timestamp_thickness,
+                cv2.LINE_AA,
+            )
+
+            cv2.putText(
+                frame,
+                line2,
+                (x, y + h2 + line_gap),
+                font,
+                solar_line_scale,
+                (255, 255, 255),
+                timestamp_thickness,
+                cv2.LINE_AA,
+            )
+
+            writer.append_data(frame)
+
+            # Explicit cleanup (extra safety)
+            del hs0, hs1, frame
+            gc.collect()
+
+    print(f"Shadow MP4 written to: {out_mp4}")
+
+
+def resize_with_aspect_and_padding(
+    img: np.ndarray,
+    out_w: int,
+    out_h: int,
+    *,
+    pad_value: int = 0,
+) -> np.ndarray:
+    """
+    Resize img preserving aspect ratio and pad to (out_h, out_w).
+    img: (H, W) uint8
+    """
+    h, w = img.shape
+    src_ratio = w / h
+    dst_ratio = out_w / out_h
+
+    if src_ratio > dst_ratio:
+        # limited by width
+        new_w = out_w
+        new_h = int(round(out_w / src_ratio))
+    else:
+        # limited by height
+        new_h = out_h
+        new_w = int(round(out_h * src_ratio))
+
+    resized = resize(
+        img,
+        (new_h, new_w),
+        order=1,
+        preserve_range=True,
+        anti_aliasing=True,
+    ).astype(img.dtype)
+
+    canvas = np.full((out_h, out_w), pad_value, dtype=img.dtype)
+
+    y0 = (out_h - new_h) // 2
+    x0 = (out_w - new_w) // 2
+
+    canvas[y0:y0 + new_h, x0:x0 + new_w] = resized
+    return canvas
+
+def pv_potential_from_fourier_raster(
+    fourier_raster_path,
+    *,
+    out_raster_path,
+    polygons_gdf,
+    tilt,
+    azimuth,
+    latitude_deg,
+    technology,
+    coverage_ratio,
+    albedo=0.2,
+    nodata=-9999.0,
+):
+    import rasterio
+    import numpy as np
+
+    # --- Technology parameters ---
+    TECH = {
+        "mono_Si": dict(eta=0.20, k_dni=0.95, k_dhi=0.70, PR=0.80),
+        "poly_Si": dict(eta=0.18, k_dni=0.93, k_dhi=0.68, PR=0.78),
+        "CdTe":    dict(eta=0.17, k_dni=0.90, k_dhi=0.75, PR=0.82),
+    }
+    tech = TECH[technology]
+
+    phi_bar = np.deg2rad(latitude_deg)
+
+    with rasterio.open(fourier_raster_path) as src:
+        profile = src.profile.copy()
+        A0  = src.read(1)
+        A1c = src.read(2)
+        A1s = src.read(3)
+        A2  = src.read(4)
+        D0  = src.read(5)
+        D1  = src.read(6)
+
+    H, W = A0.shape
+
+    # --- Polygon mask ---
+    poly_mask = rasterize_polygon_mask(polygons_gdf, fourier_raster_path)
+
+    # --- Tilt ---
+    if np.isscalar(tilt):
+        tilt_arr = np.full((H, W), np.deg2rad(tilt), dtype=np.float32)
+    else:
+        with rasterio.open(tilt) as src:
+            tilt_arr = np.deg2rad(src.read(1))
+
+    # --- Azimuth ---
+    if np.isscalar(azimuth):
+        az_arr = np.full((H, W), np.deg2rad(azimuth), dtype=np.float32)
+    else:
+        with rasterio.open(azimuth) as src:
+            az_arr = np.deg2rad(src.read(1))
+
+    out = np.full((H, W), nodata, dtype=np.float32)
+
+    pv_from_fourier_kernel_masked(
+        A0, A1c, A1s, A2,
+        D0, D1,
+        tilt_arr, az_arr,
+        phi_bar,
+        tech["k_dni"], tech["k_dhi"],
+        tech["eta"], tech["PR"],
+        coverage_ratio,
+        albedo,
+        poly_mask,
+        nodata,
+        out,
+    )
+
+    profile.update(count=1, nodata=nodata, dtype="float32")
+
+    with rasterio.open(out_raster_path, "w", **profile) as dst:
+        dst.write(out, 1)
+
+    return out_raster_path
+
+@njit(parallel=True, fastmath=True)
+def pv_from_fourier_kernel_masked(
+    A0, A1c, A1s, A2,
+    D0, D1,
+    tilt, azimuth,
+    phi_bar,
+    k_dni, k_dhi,
+    eta_pv, PR,
+    coverage,
+    albedo,
+    mask,
+    nodata,
+    out,
+):
+    H, W = A0.shape
+    sin_phi = np.sin(phi_bar)
+    cos_phi = np.cos(phi_bar)
+
+    for i in prange(H):
+        for j in range(W):
+            if not mask[i, j]:
+                out[i, j] = nodata
+                continue
+
+            beta = tilt[i, j]
+            gamma = azimuth[i, j]
+
+            cosb = np.cos(beta)
+            sinb = np.sin(beta)
+
+            # --- Direct ---
+            E_dir = k_dni * (
+                A0[i, j]
+                + A1c[i, j] * np.cos(gamma)
+                + A1s[i, j] * np.sin(gamma)
+            ) * (sin_phi * cosb + cos_phi * sinb)
+
+            # --- Diffuse ---
+            E_dif = k_dhi * (
+                D0[i, j] * (1.0 + cosb) * 0.5
+                + D1[i, j] * sinb
+            )
+
+            # --- Ground reflected ---
+            E_ref = (A0[i, j] + D0[i, j]) * albedo * (1.0 - cosb) * 0.5
+
+            out[i, j] = (
+                (E_dir + E_dif + E_ref)
+                * eta_pv * PR * coverage
+            )
+
+
+@njit(parallel=True)
+def zonal_sum(values, zones, out):
+    H, W = values.shape
+    for i in prange(H):
+        for j in range(W):
+            zid = zones[i, j]
+            if zid >= 0:
+                out[zid] += values[i, j]
+
+
+def aggregate_pv_by_polygons(
+    pv_raster: str,
+    polygons_gdf: gpd.GeoDataFrame,
+    id_field: str,
+    nodata: float = -9999.0,
+):
+    """
+    Aggregate PV raster values over Polygon or MultiPolygon geometries.
+    One output row per unique id_field (e.g. plant_id).
+    """
+
+    results = []
+
+    with rasterio.open(pv_raster) as src:
+        data = src.read(1)
+        transform = src.transform
+
+        for plant_id, group in polygons_gdf.groupby(id_field):
+            # Union all geometries (Polygon + MultiPolygon safe)
+            geom = group.geometry.unary_union
+
+            mask = geometry_mask(
+                [geom],
+                out_shape=data.shape,
+                transform=transform,
+                invert=True,
+            )
+
+            values = data[mask]
+            values = values[values != nodata]
+
+            if values.size == 0:
+                results.append({
+                    id_field: plant_id,
+                    "pv_kwh": 0.0,
+                    "area_m2": 0.0,
+                })
+                continue
+
+            pixel_area = abs(transform.a * transform.e)
+            area = values.size * pixel_area
+
+            results.append({
+                id_field: plant_id,
+                "pv_kwh": values.sum() / 1000.0,
+                "area_m2": area,
+                "mean_pv_kwh_m2": values.mean() / 1000.0,
+            })
+
+    return gpd.GeoDataFrame(results)
+
+
+
+VEGETATION_SHADOWING = np.array(
+    [
+        # DECIDUOUS = 0
+        [
+            [0.10, 0.10, 0.15, 0.25, 0.35, 0.45, 0.50, 0.50, 0.40, 0.25, 0.15, 0.10],
+            [0.20, 0.20, 0.30, 0.50, 0.65, 0.75, 0.80, 0.80, 0.70, 0.50, 0.30, 0.20],
+            [0.30, 0.30, 0.40, 0.65, 0.80, 0.88, 0.92, 0.92, 0.85, 0.65, 0.45, 0.30],
+        ],
+
+        # EVERGREEN = 1
+        [
+            [0.30, 0.30, 0.32, 0.35, 0.38, 0.42, 0.45, 0.45, 0.42, 0.38, 0.32, 0.30],
+            [0.55, 0.55, 0.58, 0.60, 0.65, 0.70, 0.75, 0.75, 0.70, 0.65, 0.58, 0.55],
+            [0.75, 0.75, 0.78, 0.80, 0.85, 0.88, 0.90, 0.90, 0.88, 0.85, 0.80, 0.75],
+        ],
+    ],
+    dtype=np.float32,
+)
+
+
+ICGC_DSM_CLASS_TO_HEIGHT_INDEX = np.array(
+    [-1, -1, -1, 0, 1, 2], dtype=np.int8
+)
+
+@njit(inline="always")
+def get_vegetation_shadowing_from_dsm(
+    leaf_type: int,   # 0=deciduous, 1=evergreen
+    dsm_class: int,   # 3, 4, 5
+    month: int,       # 1–12
+) -> float:
+    height_idx = DSM_CLASS_TO_HEIGHT_INDEX[dsm_class]
+    if height_idx < 0:
+        return 0.0  # no vegetation → no attenuation
+    return VEGETATION_SHADOWING[leaf_type, height_idx, month - 1]
+

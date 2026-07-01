@@ -20,12 +20,46 @@ import pandas as pd
 import contextily as ctx
 from typing import List, Union, Dict, Optional, Tuple
 from shapely.geometry.base import BaseGeometry
+import laspy
+import numpy as np
 
 # Import utilities from the new modules
 from .utils import (
     _session, _reproject_geom, _to_shapely, _resolve_existing_url,
     _download_many, _load_featurecollection, _filter_tiles
 )
+from .logging_utils import info, warning
+
+
+
+def _read_laz(path):
+    """
+    Read LAZ file and return Nx4 numpy array (x, y, z, classification).
+    Returns None if file cannot be read.
+    """
+
+    with laspy.open(path) as reader:
+        las = reader.read()
+
+    if las is None:
+        return None
+
+    if len(las.points) == 0:
+        return np.empty((0, 4))
+
+    # Extract coordinates
+    x = np.asarray(las.x, dtype=np.float64)
+    y = np.asarray(las.y, dtype=np.float64)
+    z = np.asarray(las.z, dtype=np.float64)
+
+    # Extract classification safely
+    if hasattr(las, "classification"):
+        classification = np.asarray(las.classification, dtype=np.uint8)
+    else:
+        # If classification not present, fill zeros
+        classification = np.zeros_like(x, dtype=np.uint8)
+
+    return np.column_stack((x, y, z, classification))
 
 
 def icgc_tiles_from_geojson(
@@ -63,12 +97,9 @@ def icgc_tiles_from_geojson(
     aoi_geom = _to_shapely(aoi)
     
     # Load tiles from ICGC
-    print("Loading ICGC tile index...")
     features, tiles_epsg = _load_featurecollection(BASE_JSON)
-    print(f"Loaded {len(features)} tiles in EPSG:{tiles_epsg}")
     
     # Filter tiles
-    print(f"Filtering tiles for AOI (EPSG:{aoi_epsg}, buffer={aoi_buffer_in_meters}m)")
     matching = _filter_tiles(
         features=features,
         aoi=aoi_geom,
@@ -77,8 +108,6 @@ def icgc_tiles_from_geojson(
         aoi_buffer_in_meters=aoi_buffer_in_meters,
         centroid_only=centroid_only
     )
-    
-    print(f"Found {len(matching)} matching tiles")
     
     # Create plot if requested
     if pdf_plot_path or show_plot:
@@ -131,8 +160,6 @@ def icgc_download_from_geojson(
             centroid_only=False,
             pdf_plot_path=f"{wd}/{municipality_name}/tiles.pdf"
         )
-
-    print(f"Resolving download URLs for {len(tiles)} tiles...")
     
     urls = []
     s = _session()
@@ -143,21 +170,19 @@ def icgc_download_from_geojson(
         id10k = props.get("ID10K", "")
         
         if not id1k and not id10k:
-            print(f"Warning: Tile missing IDs: {props}")
+            warning(f"Tile missing IDs: {props}")
             continue
         
         url = _resolve_existing_url(s, id1k, id10k)
         if url:
             urls.append(url)
         else:
-            print(f"Warning: No accessible URL found for tile {id1k}/{id10k}")
+            warning(f"No accessible URL found for tile {id1k}/{id10k}")
     
     if not urls:
-        print("No downloadable URLs found")
+        warning("No downloadable URLs found")
         return []
-    
-    print(f"Found {len(urls)} downloadable files")
-    
+        
     # Download files
     return _download_many(urls, out_dir, max_workers=max_workers)
 
@@ -174,7 +199,7 @@ def _plot_tiles_and_aoi(
     """Plot tiles and AOI for visualization."""
     
     if not tiles:
-        print("No tiles to plot")
+        warning("No tiles to plot")
         return
     
     # Convert tiles to GeoDataFrame
@@ -220,7 +245,7 @@ def _plot_tiles_and_aoi(
         
         ctx.add_basemap(ax, crs=tiles_gdf.crs.to_string(), source=ctx.providers.OpenStreetMap.Mapnik, alpha=0.5)
     except Exception as e:
-        print(f"Could not add basemap: {e}")
+        warning(f"Could not add basemap: {e}")
     
     # Formatting
     ax.set_title(f'ICGC LiDAR Tiles and AOI\n{len(tiles)} tiles found', fontsize=14, fontweight='bold')
@@ -245,7 +270,7 @@ def _plot_tiles_and_aoi(
     if pdf_path:
         os.makedirs(os.path.dirname(os.path.abspath(pdf_path)), exist_ok=True)
         fig.savefig(pdf_path, format='pdf', dpi=300, bbox_inches='tight')
-        print(f"Plot saved to {pdf_path}")
+        info(f"Plot saved to {pdf_path}")
     
     # Show plot if requested
     if show:
@@ -281,7 +306,7 @@ def list_available_tiles(
     from shapely.geometry import box
     from .utils import BASE_JSON
     
-    print("Loading ICGC tile index...")
+    info("Loading ICGC tile index...")
     features, tiles_epsg = _load_featurecollection(BASE_JSON)
     
     # Convert features to GeoDataFrame
@@ -311,7 +336,7 @@ def list_available_tiles(
     result_df['maxy'] = bounds['maxy']
     result_df['tile_crs'] = f'EPSG:{tiles_epsg}'
     
-    print(f"Found {len(result_df)} tiles")
+    info(f"Found {len(result_df)} tiles")
     
     return result_df
 
@@ -346,44 +371,3 @@ def get_tile_info(tile_id: str) -> Optional[Dict]:
             }
     
     return None
-
-
-# Re-export commonly used functions from other modules for backwards compatibility
-from .dsm_dem_estimation import (
-    build_digital_model_from_lidar_pure,
-    build_dem_from_dsm_obstacle_fast,
-    remove_buildings_from_dsm,
-    refine_dem_with_buffered_interpolation
-)
-
-from .shader import (
-    generate_hillshade_gdal,
-    generate_multiple_hillshades_gdal,
-    generate_azimuth_altitude_pairs_by_date,
-    generate_azimuth_altitude_pairs_by_year,
-    apply_height_shadow_to_hillshades,
-    average_hillshades,
-    delete_matching_files
-)
-
-# Make key functions available at module level
-__all__ = [
-    # LiDAR-specific functions
-    'icgc_tiles_from_geojson',
-    'icgc_download_from_geojson', 
-    'list_available_tiles',
-    'get_tile_info',
-    
-    # Re-exported from other modules
-    'build_digital_model_from_lidar_pure',
-    'build_dem_from_dsm_obstacle_fast',
-    'remove_buildings_from_dsm', 
-    'refine_dem_with_buffered_interpolation',
-    'generate_hillshade_gdal',
-    'generate_multiple_hillshades_gdal',
-    'generate_azimuth_altitude_pairs_by_date',
-    'generate_azimuth_altitude_pairs_by_year',
-    'apply_height_shadow_to_hillshades',
-    'average_hillshades',
-    'delete_matching_files'
-]
