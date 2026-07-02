@@ -2,103 +2,30 @@
 
 A Python library for environmental shading analysis using LiDAR data and custom algorithms to simulate the solar shading of rural and urban areas in maximum detail. greenshadow uses hillshade techniques combined with cast shadow calculations to provide accurate solar radiation analysis.
 
-## Features
+[![Python Version](https://img.shields.io/badge/python-3.10+-blue.svg)](https://python.org)
+[![License](https://img.shields.io/badge/license-EUPL%20v1.2-blue.svg)](https://joinup.ec.europa.eu/collection/eupl/eupl-text-eupl-12)
+[![Version](https://img.shields.io/badge/version-1.0.0-green.svg)](https://github.com/BeeGroup-cimne/greenshadow)
 
-- **LiDAR Data Processing**: Access and process LiDAR data from the Institut Cartogràfic i Geològic de Catalunya (ICGC)
-- **DSM/DEM Generation**: Create Digital Surface Models (DSM) and Digital Elevation Models (DEM) from point clouds
-- **Solar Position Calculation**: Compute accurate sun positions for any date, time, and location
-- **Hillshade Generation**: Generate detailed hillshades with cast shadows for solar analysis
-- **Building Integration**: Remove buildings from DSM to create clean terrain models
-- **Temporal Analysis**: Analyze solar exposure over time periods (daily, seasonal, annual)
-- **High-Resolution Output**: Support for sub-meter resolution analysis
+### Key Features
 
-## Installation
+- 🛰️ **LiDAR Data Processing**: Access and process LiDAR data from the Institut Cartogràfic i Geològic de Catalunya (ICGC)
+- 🏔️ **DSM/DEM Generation**: Create Digital Surface Models (DSM) and Digital Elevation Models (DEM) from point clouds
+- ☀️ **Solar Position Calculation**: Compute accurate sun positions for any date, time, and location
+- 🌗 **Hillshade Generation**: Generate detailed hillshades with cast shadows for solar analysis
+- 🏗️ **Building Integration**: Remove buildings from DSM to create clean terrain models
+- 📅 **Temporal Analysis**: Analyze solar exposure over time periods (daily, seasonal, annual)
+- 🔬 **High-Resolution Output**: Support for sub-meter resolution analysis
 
-### Prerequisites
+## 📚 Documentation
 
-greenshadow requires GDAL to be installed on your system. Follow the installation instructions for your platform:
+### Getting Started
+- [**Installation & Quick Start**](docs/installation-quickstart.md) - GDAL prerequisites, installation methods, and your first solar analysis
 
-#### Ubuntu/Debian
+### Library Reference
+- [**Advanced Usage**](docs/advanced-usage.md) - Building integration, annual solar analysis, custom solar calculations, batch processing, and performance tips
+- [**Module & Data Reference**](docs/module-reference.md) - Module structure, data sources, and troubleshooting
 
-```bash
-# Add the unstable PPA for latest GDAL
-sudo add-apt-repository -y ppa:ubuntugis/ubuntugis-unstable
-sudo apt update
-
-# Install GDAL and development headers
-sudo apt install gdal-bin libgdal-dev
-
-# Set environment variables for GDAL Python bindings
-export CPLUS_INCLUDE_PATH=/usr/include/gdal
-export C_INCLUDE_PATH=/usr/include/gdal
-
-# Install GDAL Python bindings matching system version
-GDAL_VERSION=$(gdal-config --version)
-pip install "GDAL==${GDAL_VERSION}.*"
-```
-
-#### macOS
-
-```bash
-# Using Homebrew
-brew install gdal
-
-# Install Python bindings
-pip install GDAL==$(gdal-config --version)
-```
-
-#### Windows
-
-Download and install GDAL from [OSGeo4W](https://trac.osgeo.org/osgeo4w/) or use conda:
-
-```bash
-conda install -c conda-forge gdal
-```
-
-### Install greenshadow
-
-1. Clone the repository:
-```bash
-git clone https://github.com/BeeGroup-cimne/greenshadow.git
-cd greenshadow
-```
-
-2. Create a virtual environment:
-```bash
-python -m venv venv
-source venv/bin/activate  # On Windows: venv\Scripts\activate
-```
-
-3. Install the package:
-```bash
-pip install setuptools wheel
-python setup.py sdist
-pip install dist/greenshadow-1.0.0.tar.gz
-```
-
-Or install in development mode:
-```bash
-pip install -e .
-```
-
-### Optional Dependencies
-
-Install optional dependencies for enhanced functionality:
-
-```bash
-# For accurate solar position calculations
-pip install pysolar sunpy
-
-# For PDAL-based processing (advanced users)
-pip install pdal
-
-# For development
-pip install pytest black flake8
-```
-
-## Quick Start
-
-### Basic Usage
+## 🚀 Quick Start
 
 ```python
 import greenshadow as gs
@@ -106,274 +33,46 @@ from shapely.geometry import Point
 import datetime as dt
 
 # Define area of interest (Barcelona example)
-aoi = Point(2.154, 41.390).buffer(0.01)  # ~1km buffer around Barcelona center
+aoi = Point(2.154, 41.390).buffer(0.01)
 working_dir = "/path/to/your/data"
 
 # 1. Find and download LiDAR tiles
-tiles = gs.icgc_tiles_from_geojson(
-    aoi=aoi,
-    aoi_epsg=4326,
-    aoi_buffer_in_meters=500,
-    pdf_plot_path=f"{working_dir}/tiles_plot.pdf"
-)
+tiles = gs.icgc_tiles_from_geojson(aoi=aoi, aoi_epsg=4326, aoi_buffer_in_meters=500)
+laz_paths = gs.icgc_download_from_geojson(out_dir=f"{working_dir}/lidar_data", tiles=tiles, aoi=aoi, aoi_epsg=4326)
 
-# Download LAZ files
-laz_paths = gs.icgc_download_from_geojson(
-    out_dir=f"{working_dir}/lidar_data",
-    tiles=tiles,
-    aoi=aoi,
-    aoi_epsg=4326,
-    max_workers=8
-)
+# 2. Build a DSM from the point cloud
+dsm_path = gs.build_dsm_from_lidar_pure(laz_paths=laz_paths, out_dsm=f"{working_dir}/dsm.tif", resolution=0.5, epsg=25831)
 
-# 2. Create Digital Surface Model (DSM)
-dsm_path = gs.build_dsm_from_lidar_pure(
-    laz_paths=laz_paths,
-    out_dsm=f"{working_dir}/dsm.tif",
-    resolution=0.5,  # 0.5m resolution
-    classification=(0,),  # Use unclassified points
-    epsg=25831,  # UTM Zone 31N for Barcelona
-    fill_gaps="nearest"
-)
+# 3. Compute solar positions and generate hillshades
+solar_data = gs.generate_azimuth_altitude_pairs_by_date(date=dt.date(2025, 6, 21), lat=41.390, lon=2.154, tz_name="Europe/Madrid")
+hillshade_paths = gs.generate_multiple_hillshades_gdal(raster_dir=f"{working_dir}/hillshades", dsm_path=dsm_path, azimuth_altitude=solar_data['azimuth_altitude_pairs'])
 
-# 3. Create Digital Elevation Model (DEM) by removing obstacles
-dem_path = gs.build_dem_from_dsm_obstacle_fast(
-    dsm_path=dsm_path,
-    out_dem_path=f"{working_dir}/dem.tif",
-    method="multiscale_harmonic",
-    levels=3,
-    relax_iters=50
-)
-
-# 4. Generate solar positions for summer solstice
-summer_solstice = dt.date(2025, 6, 21)
-solar_data = gs.generate_azimuth_altitude_pairs_by_date(
-    date=summer_solstice,
-    lat=41.390,
-    lon=2.154,
-    tz_name="Europe/Madrid",
-    granularity="PT15M",  # Every 15 minutes
-    solar_degrees_discretization=1.0,
-    only_daylight=True
-)
-
-print(f"Generated {len(solar_data['azimuth_altitude_pairs'])} solar positions")
-
-# 5. Generate hillshades with cast shadows
-hillshade_paths = gs.generate_multiple_hillshades_gdal(
-    raster_dir=f"{working_dir}/hillshades",
-    dsm_path=dsm_path,
-    azimuth_altitude=solar_data['azimuth_altitude_pairs'],
-    related_datetimes=solar_data['df']['datetime_local'].tolist(),
-    shadow_floor=0.1,  # 10% illumination in shadow areas
-    zFactor=1.0,
-    include_datetime_info=True,
-    qgis_temporal=True
-)
-
-# 6. Create average hillshade for the day
-average_path = gs.average_hillshades(
-    hillshade_dir=f"{working_dir}/hillshades",
-    out_path=f"{working_dir}/summer_solstice_average.tif",
-    aggregation="mean"
-)
-
-print(f"Analysis complete! Average hillshade saved to: {average_path}")
+# 4. Aggregate into a single average exposure map
+average_path = gs.average_hillshades(hillshade_dir=f"{working_dir}/hillshades", out_path=f"{working_dir}/summer_solstice_average.tif")
 ```
 
-### Working with Buildings
+For GDAL setup, detailed installation steps, and a fully worked example, see [Installation & Quick Start](docs/installation-quickstart.md).
 
-```python
-import geopandas as gpd
+## 🎯 Key Applications
 
-# Load building footprints (example)
-buildings_gdf = gpd.read_file("buildings.gpkg")
+- **Urban Solar Studies**: Rooftop solar potential, façade shading, urban heat island analysis
+- **Rural & Terrain Analysis**: Land suitability, agricultural solar exposure, landscape planning
+- **Energy Modeling**: Input generation for building energy simulation and photovoltaic sizing
+- **Academic Research**: Environmental science, geography, and remote sensing applications
 
-# Remove buildings from DSM to get clean terrain
-clean_dsm_path = gs.remove_buildings_from_dsm(
-    dsm_path=dsm_path,
-    buildings=buildings_gdf,
-    out_path=f"{working_dir}/dsm_no_buildings.tif",
-    buildings_buffer_m=1.0,  # 1m buffer around buildings
-    fill_method="spline",
-    coarse_dem_path=f"{working_dir}/coarse_dem.tif"
-)
+## 📊 Data Coverage
 
-# Generate DEM from clean DSM
-terrain_dem = gs.build_dem_from_dsm_obstacle_fast(
-    dsm_path=clean_dsm_path,
-    out_dem_path=f"{working_dir}/terrain_dem.tif"
-)
+- **Native Support**: Institut Cartogràfic i Geològic de Catalunya (ICGC) LiDAR, covering all of Catalonia (~32,000 km²) at up to 4 points/m²
+- **Extensible**: Works with any LAZ/LAS point cloud data for other regions
 
-# Apply height-based shadows (e.g., for rooftop analysis at 2m height)
-elevated_hillshades = gs.apply_height_shadow_to_hillshades(
-    hillshade_dir=f"{working_dir}/hillshades",
-    dem_path=terrain_dem,
-    dsm_path=dsm_path,
-    out_dir=f"{working_dir}/hillshades_2m",
-    height_m=2.0,
-    pattern="*.tif",
-    recursive=True,
-    mask_value=0.1
-)
-```
+## 🏗️ Advanced Features
 
-### Annual Solar Analysis
+- **Terrain Reconstruction**: Multiscale harmonic DEM generation and building removal from DSMs
+- **Flexible Temporal Resolution**: From single dates to full annual analyses with configurable granularity
+- **Height-Based Shadows**: Apply shadow analysis at custom elevations (e.g., rooftop height)
+- **Parallelized Processing**: Multi-worker downloads and hillshade generation for large areas
 
-```python
-# Generate solar positions for entire year
-annual_solar = gs.generate_azimuth_altitude_pairs_by_year(
-    year=2025,
-    lat=41.390,
-    lon=2.154,
-    tz_name="Europe/Madrid",
-    granularity="PT1H",  # Hourly
-    solar_degrees_discretization=2.0,  # 2-degree precision
-    only_daylight=True
-)
-
-print(f"Unique solar positions for year: {annual_solar['metadata']['unique_positions']}")
-
-# Generate hillshades for all unique positions
-annual_hillshades = gs.generate_multiple_hillshades_gdal(
-    raster_dir=f"{working_dir}/annual_hillshades",
-    dsm_path=dsm_path,
-    azimuth_altitude=annual_solar['azimuth_altitude_pairs'],
-    shadow_floor=0.0,  # Full shadows
-    max_workers=4
-)
-
-# Create annual average
-annual_average = gs.average_hillshades(
-    hillshade_dir=f"{working_dir}/annual_hillshades",
-    out_path=f"{working_dir}/annual_solar_exposure.tif",
-    aggregation="mean"
-)
-```
-
-## Module Structure
-
-greenshadow is organized into specialized modules:
-
-### `greenshadow.lidar`
-- LiDAR tile discovery and download from ICGC
-- Tile management and visualization
-- Core functions: `icgc_tiles_from_geojson()`, `icgc_download_from_geojson()`
-
-### `greenshadow.dsm_dem_estimation`
-- DSM/DEM generation from point clouds
-- Building removal and terrain reconstruction
-- Core functions: `build_dsm_from_lidar_pure()`, `build_dem_from_dsm_obstacle_fast()`, `remove_buildings_from_dsm()`
-
-### `greenshadow.shader`
-- Solar position calculations
-- Hillshade generation with cast shadows
-- Temporal analysis tools
-- Core functions: `generate_hillshade_gdal()`, `generate_azimuth_altitude_pairs_by_date()`
-
-### `greenshadow.utils`
-- Utility functions for geometry, projections, and file handling
-- HTTP session management
-- Validation and environment detection
-
-## Data Sources
-
-### ICGC LiDAR Data
-
-greenshadow provides built-in access to high-resolution LiDAR data from the Institut Cartogràfic i Geològic de Catalunya, covering the Catalonia region with:
-
-- **Resolution**: Up to 4 points/m²
-- **Coverage**: All of Catalonia (~32,000 km²)
-- **Format**: LAZ (compressed LAS)
-- **Coordinate System**: EPSG:25831 (ETRS89 / UTM zone 31N)
-- **Classifications**: Ground, buildings, vegetation, water, etc.
-
-### Other Regions
-
-For areas outside Catalonia, you can use greenshadow with your own LiDAR data:
-
-1. Prepare LAZ/LAS files in a supported format
-2. Use the DSM/DEM generation functions directly
-3. Follow the same workflow for solar analysis
-
-## Advanced Features
-
-### Custom Solar Calculations
-
-```python
-# Use custom solar position libraries
-solar_positions = gs.generate_azimuth_altitude_pairs_by_date(
-    date=dt.date(2025, 3, 20),  # Spring equinox
-    lat=your_latitude,
-    lon=your_longitude,
-    tz_name="Your/Timezone"
-)
-```
-
-### High-Resolution Processing
-
-```python
-# Sub-meter resolution processing
-ultra_high_dsm = gs.build_dsm_from_lidar_pure(
-    laz_paths=laz_paths,
-    out_dsm="ultra_high_dsm.tif",
-    resolution=0.25,  # 25cm pixels
-    aggregation="max",  # Use maximum elevation in each pixel
-    fill_gaps="nearest"
-)
-```
-
-### Batch Processing
-
-```python
-# Process multiple dates
-dates_to_process = [
-    dt.date(2025, 3, 20),  # Spring equinox
-    dt.date(2025, 6, 21),  # Summer solstice
-    dt.date(2025, 9, 22),  # Autumn equinox
-    dt.date(2025, 12, 21), # Winter solstice
-]
-
-for date in dates_to_process:
-    solar_data = gs.generate_azimuth_altitude_pairs_by_date(date=date, ...)
-    hillshades = gs.generate_multiple_hillshades_gdal(
-        raster_dir=f"{working_dir}/{date.strftime('%Y%m%d')}",
-        dsm_path=dsm_path,
-        azimuth_altitude=solar_data['azimuth_altitude_pairs']
-    )
-    # Process results...
-```
-
-## Performance Tips
-
-1. **Resolution vs. Speed**: Higher resolution (smaller pixel size) dramatically increases processing time
-2. **Parallel Processing**: Use `max_workers` parameters for faster downloads and processing
-3. **Memory Management**: For large areas, consider processing in tiles
-4. **Caching**: Downloaded LAZ files and generated DSMs are cached for reuse
-5. **GDAL Optimization**: Ensure GDAL is properly installed with multi-threading support
-
-## Troubleshooting
-
-### Common Issues
-
-1. **GDAL Import Errors**:
-   ```bash
-   # Check GDAL installation
-   gdalinfo --version
-   python -c "from osgeo import gdal; print(gdal.__version__)"
-   ```
-
-2. **Memory Issues with Large Datasets**:
-   - Reduce resolution or process smaller areas
-   - Use `chunk_size` parameters where available
-
-3. **Coordinate System Issues**:
-   - Ensure all inputs use consistent coordinate systems
-   - ICGC data is in EPSG:25831 by default
-
-4. **Download Failures**:
-   - Check internet connection
-   - Some tiles may be temporarily unavailable
+See [Advanced Usage](docs/advanced-usage.md) for detailed examples, and [Module & Data Reference](docs/module-reference.md) for troubleshooting and module details.
 
 ### Getting Help
 
