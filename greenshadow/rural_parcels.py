@@ -7,6 +7,7 @@ from urllib.parse import unquote
 from .utils import _ensure_same_crs, _delete_all_files_in_directory, _fetch_html, _download_file, _unzip_directory, _validate_and_fix_geometries
 from .logging_utils import warning, error, info
 import requests
+import numpy as np
 import pandas as pd
 import geopandas as gpd
 from bs4 import BeautifulSoup
@@ -780,6 +781,102 @@ def load_spanish_preserved_regions(
 
 
 
+SIGPAC_ID_FIELDS = (
+    "provincia", "municipio", "agregado", "zona", "poligono", "parcela", "recinto",
+)
+
+
+# SIGPAC land uses, grouped as FEGA groups them
+# (https://www.fega.gob.es/es/content/%C2%BFqu%C3%A9-usos-se-distinguen-en-sigpac).
+# The 32 uses are agricultural - arable land, permanent crops, pasture -,
+# non-agricultural, or "other": zones SIGPAC does not describe at all.
+
+#: Arable land: greenhouses, arable, vegetable gardens.
+SIGPAC_ARABLE_USES = ("IV", "TA", "TH")
+
+#: Permanent crops: every fruit, nut, olive, citrus and vineyard use, alone or
+#: in association.
+SIGPAC_PERMANENT_CROP_USES = (
+    "FV", "FY", "OC", "OP", "OF", "CF", "OV", "CI",
+    "VF", "CS", "VI", "CV", "VO", "FF", "FL", "FS",
+)
+
+#: Pasture: with trees, shrub pasture, grassland.
+SIGPAC_PASTURE_USES = ("PA", "PR", "PS")
+
+#: Every use FEGA counts as agricultural. Only parcels on one of these are
+#: candidates for crop rows, a PV plant or agrivoltaics.
+SIGPAC_AGRICULTURAL_USES = (
+    SIGPAC_ARABLE_USES + SIGPAC_PERMANENT_CROP_USES + SIGPAC_PASTURE_USES
+)
+
+#: Water, roads, buildings, forest, scrubland, unproductive land, urban zones
+#: and landscape elements.
+SIGPAC_NON_AGRICULTURAL_USES = ("AG", "CA", "ED", "FO", "MT", "IM", "ZU", "EP")
+
+#: Concentrated zones and censored zones: no use is given, so none is assumed.
+SIGPAC_OTHER_USES = ("ZC", "ZV")
+
+
+def filter_agricultural_parcels(
+    parcels_gdf: gpd.GeoDataFrame, use_column: str = "uso_sigpac"
+) -> gpd.GeoDataFrame:
+    """
+    The parcels whose SIGPAC use is agricultural, as FEGA classifies it.
+
+    Non-agricultural uses (water, roads, buildings, forest, scrubland,
+    unproductive land, urban zones, landscape elements) are dropped, and so
+    are the "other" zones and any parcel with no use at all: SIGPAC does not
+    say they are farmland, so nothing here assumes it.
+
+    Raises ``KeyError`` when ``use_column`` is missing. Silently keeping every
+    parcel would hand roads and buildings to the planners downstream.
+    """
+    if use_column not in parcels_gdf.columns:
+        raise KeyError(
+            f"no '{use_column}' column: cannot tell agricultural parcels from "
+            f"the rest. Pass use_column= if the SIGPAC use is stored elsewhere."
+        )
+
+    uses = parcels_gdf[use_column].astype("string").str.strip().str.upper()
+
+    return parcels_gdf[uses.isin(SIGPAC_AGRICULTURAL_USES).fillna(False).to_numpy()]
+
+
+def sigpac_parcel_id(parcels_gdf: gpd.GeoDataFrame, sep: str = "-") -> pd.Series:
+    """
+    Stable identifier for a SIGPAC recinto.
+
+    SIGPAC has no single primary key: a recinto is identified by the 7-tuple
+    provincia/municipio/agregado/zona/poligono/parcela/recinto. Every groupby,
+    join and raster zone label downstream depends on that identity, so it is
+    built once here rather than reconstructed ad hoc at each use.
+
+    Returns
+    -------
+    pd.Series
+        Strings like ``"25-23-0-0-12-45-3"``, indexed like the input.
+    """
+    missing = [field for field in SIGPAC_ID_FIELDS if field not in parcels_gdf.columns]
+
+    if missing:
+        raise KeyError(
+            f"not SIGPAC recintos: missing {', '.join(missing)}. Pass an explicit "
+            f"id column instead."
+        )
+
+    parts = [
+        parcels_gdf[field].astype("Int64").astype(str)
+        for field in SIGPAC_ID_FIELDS
+    ]
+
+    return pd.Series(
+        [sep.join(values) for values in zip(*parts)],
+        index=parcels_gdf.index,
+        name="parcel_id",
+    )
+
+
 def tag_parcels_with_preserved_areas(
     parcels_gdf: gpd.GeoDataFrame,
     preserved_gdf: gpd.GeoDataFrame,
@@ -817,14 +914,20 @@ def tag_parcels_with_preserved_areas(
 
     parcels, preserved = _ensure_same_crs(parcels, preserved)
 
+    # gpd.overlay returns a fresh RangeIndex, so the parcel each piece came
+    # from has to travel as a column; grouping on the result's own index would
+    # aggregate unrelated pieces together.
+    parcels["_parcel_key"] = np.arange(len(parcels))
+
     # --- Spatial intersection ---
     inter = gpd.overlay(
-        parcels,
+        parcels[["_parcel_key", "geometry"]],
         preserved[["resource", "geometry"]],
         how="intersection"
     )
 
     if inter.empty:
+        parcels = parcels.drop(columns="_parcel_key")
         parcels["is_preserved"] = False
         parcels["preserved_resource"] = None
         parcels["preserved_area_m2"] = 0.0
@@ -849,16 +952,20 @@ def tag_parcels_with_preserved_areas(
     # Aggregate per parcel
     agg = (
         inter
-        .groupby(inter.index)
+        .groupby("_parcel_key")
         .agg(
             preserved_area_m2=("preserved_area_m2", "sum"),
             preserved_resource=("resource", lambda x: ", ".join(sorted(set(x))))
         )
     )
 
-    parcels = parcels.join(agg, how="left")
+    parcels = parcels.join(agg, on="_parcel_key", how="left")
     parcels["preserved_area_m2"] = parcels["preserved_area_m2"].fillna(0.0)
-    parcels["preserved_resource"] = parcels["preserved_resource"].fillna(None)
+    # An unprotected parcel has no resource name. fillna(None) is not a way to
+    # say that - pandas rejects it - so the NaNs are replaced directly.
+    parcels["preserved_resource"] = parcels["preserved_resource"].astype(object).where(
+        parcels["preserved_resource"].notna(), None
+    )
 
     parcels["preserved_area_ratio"] = (
         parcels["preserved_area_m2"] / parcels["_parcel_area_m2"]
@@ -868,6 +975,6 @@ def tag_parcels_with_preserved_areas(
         parcels["preserved_area_ratio"] > min_intersection_ratio
     )
 
-    parcels = parcels.drop(columns="_parcel_area_m2")
+    parcels = parcels.drop(columns=["_parcel_area_m2", "_parcel_key"])
 
     return parcels

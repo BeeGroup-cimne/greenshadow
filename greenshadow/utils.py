@@ -289,9 +289,20 @@ def _filter_tiles(
 
 # ---------------- GDAL utilities ----------------
 
-# Configure GDAL to use exceptions for better error handling
+# Configure GDAL to use exceptions for better error handling.
+# Calling UseExceptions() explicitly also silences the GDAL >= 3.7 FutureWarning
+# ("Neither gdal.UseExceptions() nor gdal.DontUseExceptions() has been explicitly
+# called"), which is emitted on the first GDAL call of the process otherwise.
+try:
+    from osgeo import gdal
+except ImportError:
+    gdal = None
+
+
 def _init_gdal():
     """Initialize GDAL with exception handling."""
+    if gdal is None:
+        return False
     try:
         gdal.UseExceptions()
         return True

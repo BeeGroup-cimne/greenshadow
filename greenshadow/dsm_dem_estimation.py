@@ -27,9 +27,10 @@ from pyproj import Transformer
 from shapely.ops import transform as shp_transform
 from scipy.interpolate import griddata
 from scipy.ndimage import (
-    distance_transform_edt, convolve, label, binary_dilation,
+    distance_transform_edt, convolve, label, binary_dilation, binary_erosion,
+    find_objects,
     uniform_filter, gaussian_filter, median_filter, grey_opening,
-    grey_closing, sobel
+    grey_closing, grey_dilation, sobel
 )
 from skimage.restoration import inpaint, denoise_bilateral
 import numpy as np
@@ -564,6 +565,171 @@ def _count_invalid_values(arr, name="array"):
         f"({(n_nan+n_posinf+n_neginf)/total:.6%} invalid)"
     )
 
+def _tin_surface(
+    x,
+    y,
+    z,
+    *,
+    width,
+    height,
+    transform,
+    nodata,
+    aoi=None,
+    aoi_buffer_in_meters=0.0,
+    max_edge_factor=3.0
+):
+    """
+    Sample the DSM off the Delaunay triangulation of the returns.
+
+    Every pixel centre is evaluated on the triangle that contains it, which
+    is linear interpolation over the measured surface rather than a guess
+    made after the fact. Binning asks "which returns landed in this pixel",
+    and at a resolution finer than the point spacing the honest answer for
+    half the pixels is "none" - they then get invented by the gap filler,
+    which knows nothing about roofs and minimises curvature, rounding the
+    very facets that are being looked for. Here no pixel is empty in the
+    first place, because the surface is defined everywhere the points span.
+
+    It pairs with the point smoothing in ``buildings_infer``: on raw
+    returns each triangle's gradient is set by three noisy corners, so the
+    interpolated surface is faceted noise. Smooth the points first and the
+    triangles within a roof face become near-coplanar, and the surface
+    inherits clean gradients.
+
+    Triangles longer than ``max_edge_factor`` times the median edge are left
+    as nodata. Delaunay spans the convex hull of the points, so without this
+    it would interpolate straight across a courtyard, across the notch of an
+    L-shaped block, and over the gap to the next roof - inventing surface
+    where nothing was measured. Those pixels stay nodata and fall through to
+    the normal gap filling.
+
+    When an ``aoi`` is given, only the pixels inside it are evaluated at all.
+    That is both the correct answer - nothing outside the footprint should
+    receive an interpolated roof - and the cheap one, since locating the
+    containing triangle is the expensive step and a building covers a small
+    fraction of its bounding window.
+    """
+    from scipy.spatial import Delaunay
+
+    points = np.column_stack([
+        np.asarray(x, dtype=np.float64),
+        np.asarray(y, dtype=np.float64)
+    ])
+
+    raster = np.full((height, width), nodata, np.float32)
+
+    if points.shape[0] < 3:
+        return raster
+
+    # Triangulate near the origin. On raw UTM coordinates (~4.6e6 m) the
+    # in-circle tests square numbers of ~1e13 and keep millimetres of
+    # precision at best, so Qhull's choice between near-degenerate triangles
+    # depended on every other point in the set - the surface over one roof
+    # changed with the roofs triangulated beside it. Shifting by a whole
+    # number of metres is exact in float64, so nothing else changes.
+    origin = np.floor(points.min(axis=0) / 100.0) * 100.0
+    points = points - origin
+
+    try:
+        triangulation = Delaunay(points)
+    except Exception:
+        return raster
+
+    rows = np.arange(height)
+    cols = np.arange(width)
+
+    grid_x, grid_y = np.meshgrid(
+        transform.c + (cols + 0.5) * transform.a - origin[0],
+        transform.f + (rows + 0.5) * transform.e - origin[1]
+    )
+
+    targets = np.column_stack([grid_x.ravel(), grid_y.ravel()])
+
+    # Only pixels worth asking about: inside the points' own extent, and
+    # inside the AOI when there is one.
+    minx, miny = points.min(axis=0)
+    maxx, maxy = points.max(axis=0)
+
+    candidate = (
+        (targets[:, 0] >= minx) & (targets[:, 0] <= maxx) &
+        (targets[:, 1] >= miny) & (targets[:, 1] <= maxy)
+    )
+
+    if aoi is not None and np.any(candidate):
+        try:
+            from shapely import contains_xy
+
+            geometry = (
+                aoi.buffer(aoi_buffer_in_meters)
+                if aoi_buffer_in_meters > 0 else aoi
+            )
+
+            within = np.zeros(targets.shape[0], dtype=bool)
+
+            within[candidate] = contains_xy(
+                geometry,
+                targets[candidate, 0] + origin[0],
+                targets[candidate, 1] + origin[1]
+            )
+
+            candidate = within
+        except Exception:
+            # An unusable AOI must not silently widen the surface, but it
+            # must not abort the build either: fall back to the extent.
+            pass
+
+    if not np.any(candidate):
+        return raster
+
+    simplex = np.full(targets.shape[0], -1, dtype=np.int64)
+
+    simplex[candidate] = triangulation.find_simplex(targets[candidate])
+
+    inside = simplex >= 0
+
+    if not np.any(inside):
+        return raster
+
+    vertices = triangulation.simplices
+
+    corners = points[vertices]
+
+    edge_lengths = np.linalg.norm(
+        corners - np.roll(corners, -1, axis=1), axis=2
+    ).max(axis=1)
+
+    median_edge = float(np.median(edge_lengths))
+
+    if median_edge > 0:
+        compact = edge_lengths <= max_edge_factor * median_edge
+
+        inside &= compact[simplex]
+
+        if not np.any(inside):
+            return raster
+
+    # Barycentric coordinates come straight off the transform Qhull stores
+    # with each simplex, so no per-pixel solve is needed.
+    chosen = simplex[inside]
+
+    matrices = triangulation.transform[chosen]
+
+    offsets = targets[inside] - matrices[:, 2]
+
+    bary = np.einsum("nij,nj->ni", matrices[:, :2], offsets)
+
+    weights = np.column_stack([bary, 1.0 - bary.sum(axis=1)])
+
+    heights = np.asarray(z, dtype=np.float64)[vertices[chosen]]
+
+    interpolated = np.einsum("ni,ni->n", weights, heights)
+
+    flat = raster.ravel()
+    flat[inside] = interpolated.astype(np.float32)
+
+    return flat.reshape(height, width)
+
+
 def _rasterize_agg(
     laz_path: Optional[str] = None,
     laz_points: Optional[np.ndarray] = None,
@@ -590,7 +756,7 @@ def _rasterize_agg(
     cache_path: Optional[str] = None,
     CLASS_NODATA: int = 255,
     epsg: int = 25831,
-    reclassify_unclassified: bool = True,
+    reclassify_unclassified: bool = False,
     drop_unclassified_after_reclassify: bool = True,
     unclassified_global_fraction_threshold: float = 0.20,
     min_unclassified_pixel_fraction: float = 0.10,
@@ -602,6 +768,9 @@ def _rasterize_agg(
     reclassify_target_building: int = 6,
     reclassify_target_vegetation: int = 4,
     reclassify_target_terrain: int = 2,
+    crane_point_gap_m: float = 4.0,
+    crane_max_upper_fraction: float = 0.34,
+    crane_bands_out: Optional[dict] = None,
 ):
     """
     Rasterize LiDAR points with aggregation, AOI filtering and raster-based filtering.
@@ -627,7 +796,22 @@ def _rasterize_agg(
             aoi_buffer_in_meters=aoi_buffer_in_meters,
             filter_points_from_class=filter_points_from_class,
             filter_mode=filter_mode,
-            epsg=25831,
+            epsg=epsg,
+            # These all change the rasterized output but were missing from the
+            # key, so a re-run with different values silently returned the old
+            # raster.
+            lidar_class_priority=lidar_class_priority,
+            lidar_class_window_diameter=lidar_class_window_diameter,
+            unclassified_classes=unclassified_classes,
+            reclassify_unclassified=reclassify_unclassified,
+            drop_unclassified_after_reclassify=drop_unclassified_after_reclassify,
+            # Stage A changes what the file holds (6 bands, not 2), so it has
+            # to key its own cache entry. Stage B's parameters deliberately do
+            # NOT appear here: they do not affect rasterization, so tuning them
+            # must not force every LAZ file to be read again.
+            crane_bands=crane_bands_out is not None,
+            crane_point_gap_m=crane_point_gap_m,
+            crane_max_upper_fraction=crane_max_upper_fraction,
         )
         param_hash = _cache_hash(params)
         base = os.path.splitext(cache_path)[0]
@@ -648,6 +832,8 @@ def _rasterize_agg(
     # ------------------------------------------------------------
     if cache_path is not None and os.path.exists(cache_path):
 
+        usable = True
+
         with rasterio.open(cache_path) as src:
             raster = src.read(1)
 
@@ -656,12 +842,28 @@ def _rasterize_agg(
             else:
                 class_raster = None
 
+            if crane_bands_out is not None:
+                # Returning here without the Stage A bands would leave the seed
+                # vote with no seeds, and the crane filter would quietly do
+                # nothing on the second run of an otherwise identical job.
+                # Recompute instead.
+                if src.count >= 6:
+                    crane_bands_out.update(
+                        second=src.read(3),
+                        n_above=src.read(4).astype(np.uint16),
+                        n_total=src.read(5).astype(np.uint16),
+                        suspect=src.read(6) > 0.5,
+                    )
+                else:
+                    usable = False
+
             profile = src.profile
 
-        if return_classification:
-            return raster, class_raster, profile
-        else:
-            return raster, profile
+        if usable:
+            if return_classification:
+                return raster, class_raster, profile
+            else:
+                return raster, profile
 
     # ------------------------------------------------------------
     # Input validation
@@ -682,15 +884,19 @@ def _rasterize_agg(
         with laspy.open(laz_path) as lf:
             las = lf.read()
 
-        x = np.asarray(las.x, dtype=np.float32)
-        y = np.asarray(las.y, dtype=np.float32)
+        # Coordinates stay float64: in float32 a UTM northing near 4.6e6 m
+        # is rounded to 0.5 m, which moves returns by up to 0.25 m between
+        # pixels and stacks them on a lattice that leaves the TIN's Delaunay
+        # triangulation without a unique answer. z is fine in float32.
+        x = np.asarray(las.x, dtype=np.float64)
+        y = np.asarray(las.y, dtype=np.float64)
         z = np.asarray(las.z, dtype=np.float32)
         class_vals = np.asarray(las.classification, dtype=np.uint8)
 
     else:
         # laz_points expected shape: Nx3 or Nx4
-        x = laz_points[:, 0].astype(np.float32)
-        y = laz_points[:, 1].astype(np.float32)
+        x = laz_points[:, 0].astype(np.float64)
+        y = laz_points[:, 1].astype(np.float64)
         z = laz_points[:, 2].astype(np.float32)
 
         if laz_points.shape[1] >= 4:
@@ -889,10 +1095,15 @@ def _rasterize_agg(
             return raster, profile
 
         # unpack back
-        x = pts[:, 0].astype(np.float32)
-        y = pts[:, 1].astype(np.float32)
+        x = pts[:, 0].astype(np.float64)
+        y = pts[:, 1].astype(np.float64)
         z = pts[:, 2].astype(np.float32)
         class_vals = pts[:, 3].astype(np.uint8)
+
+    # The TIN needs every point, including those just outside the window:
+    # a triangle with one corner beyond the edge still covers pixels inside
+    # it, and clipping first would leave a ragged border of nodata.
+    tin_x, tin_y, tin_z = x, y, z
 
     # ------------------------------------------------------------
     # Pixel mapping  ✅ FIXED
@@ -960,6 +1171,17 @@ def _rasterize_agg(
         raster[rows, cols] = med_vals
         raster[~np.isfinite(raster)] = nodata
 
+    elif aggregation == "tin":
+        raster = _tin_surface(
+            tin_x, tin_y, tin_z,
+            width=width,
+            height=height,
+            transform=transform,
+            nodata=nodata,
+            aoi=aoi,
+            aoi_buffer_in_meters=aoi_buffer_in_meters
+        )
+
     elif aggregation == "min":
         # --- height ---
         np.minimum.at(raster, (py, px), z)
@@ -977,7 +1199,27 @@ def _rasterize_agg(
         raster[mask] = (sum_r[mask] / count[mask]).astype(np.float32)
 
     else:
-        raise ValueError(f"Unknown aggregation: {aggregation} ('mean', 'max', 'smart_for_roofs', 'min' are available)")
+        raise ValueError(
+            f"Unknown aggregation: {aggregation} "
+            "('mean', 'max', 'smart_for_roofs', 'min', 'tin' are available)"
+        )
+
+    # ------------------------------------------------------------
+    # Crane evidence (Stage A, point domain)
+    #
+    # Filled in place so the six return paths above keep their shapes.
+    # `px`, `py`, `z` and `class_vals` are still mutually aligned here; the
+    # classification block below re-filters them.
+    # ------------------------------------------------------------
+    if crane_bands_out is not None:
+        crane_bands_out.update(_crane_point_evidence(
+            px, py, z, class_vals, width, height,
+            top=raster if aggregation == "max" else None,
+            vegetation_classes=vegetation_classes,
+            gap_min=crane_point_gap_m,
+            max_upper_fraction=crane_max_upper_fraction,
+            nodata=nodata,
+        ))
 
     ######
     # Classification aggregation
@@ -1033,7 +1275,11 @@ def _rasterize_agg(
 
         write_profile = profile.copy()
 
-        if return_classification and class_raster is not None:
+        has_bands = crane_bands_out is not None and "second" in crane_bands_out
+
+        if has_bands:
+            write_profile.update(count=6, dtype="float32")
+        elif return_classification and class_raster is not None:
             write_profile.update(count=2, dtype="float32")
         else:
             write_profile.update(count=1)
@@ -1041,8 +1287,19 @@ def _rasterize_agg(
         with rasterio.open(cache_path, "w", **write_profile) as dst:
             dst.write(raster.astype(np.float32), 1)
 
-            if return_classification and class_raster is not None:
-                dst.write(class_raster.astype(np.float32), 2)
+            if write_profile["count"] >= 2:
+                cls = (
+                    class_raster
+                    if class_raster is not None
+                    else np.full((height, width), CLASS_NODATA, np.uint8)
+                )
+                dst.write(cls.astype(np.float32), 2)
+
+            if has_bands:
+                dst.write(crane_bands_out["second"].astype(np.float32), 3)
+                dst.write(crane_bands_out["n_above"].astype(np.float32), 4)
+                dst.write(crane_bands_out["n_total"].astype(np.float32), 5)
+                dst.write(crane_bands_out["suspect"].astype(np.float32), 6)
 
     return (raster, class_raster, profile) if return_classification else (raster, profile)
 
@@ -1647,6 +1904,758 @@ def _median_per_pixel(px, py, z, width):
         out[i] = np.median(v)
 
     return rows, cols, out
+
+
+# ======================================================================
+# THIN TALL OUTLIERS (construction cranes, masts, catenaries)
+# ======================================================================
+#
+# A tower crane returns LiDAR points tens of metres above the roofs. With
+# `aggregation="max"` the jib becomes the DSM surface: a thin bright streak
+# that casts a long false shadow over roofs that are really sunlit.
+#
+# Detection needs two independent signals, because neither works alone:
+#
+#   Stage A (point domain, `_crane_point_evidence`)
+#       A crane jib is a LATTICE - the laser sees through it, so a pixel
+#       under the jib holds both the jib return and the roof return far
+#       below. Large vertical gap + very few points above it = "suspect".
+#       Alone it is too noisy (roof edges, tree canopy and balconies show
+#       the same per-pixel signature) and it misses the solid mast, where
+#       no return ever reaches the roof.
+#
+#   Stage B (raster domain, `_detect_thin_tall_structures`)
+#       A white top-hat plus shape analysis finds thin, tall, elongated
+#       CONNECTED objects. Alone it cannot tell a crane jib from a church
+#       spire, chimney, silo or antenna mast - all thin and tall, and all
+#       structures whose shadow is real and must be kept.
+#
+# The combination works because the lattice/solid distinction maps exactly
+# onto "has Stage A seeds" / "has none". Voting at COMPONENT level (not per
+# pixel) removes the solid mast by association with the seeded jib it joins,
+# keeps spires and chimneys, and discards Stage A's per-pixel noise.
+# ----------------------------------------------------------------------
+
+
+@njit(cache=True)
+def _crane_top_kernel(px, py, z, width, height, nodata):
+    """Per-pixel maximum z. Only needed when `aggregation != "max"`."""
+    top = np.full(height * width, np.float32(-np.inf), dtype=np.float32)
+
+    for i in range(px.shape[0]):
+        f = py[i] * width + px[i]
+        if z[i] > top[f]:
+            top[f] = z[i]
+
+    for f in range(top.shape[0]):
+        if not np.isfinite(top[f]):
+            top[f] = nodata
+
+    return top
+
+
+@njit(cache=True)
+def _crane_second_surface_kernel(px, py, z, veg_flag, width, height,
+                                 top_flat, gap_min, nodata):
+    """
+    One linear pass over the points.
+
+    For every pixel, split its returns at `top - gap_min` and describe the
+    two groups:
+
+        second      highest z strictly below the gap (the surface the laser
+                    reached THROUGH the lattice) - `nodata` when the pixel
+                    holds nothing down there
+        n_above     returns inside the top band
+        n_total     returns in the pixel
+        n_veg_above returns in the top band carrying a vegetation class
+
+    Deliberately avoids sorting: an `argsort` of the ~12 M points of an ICGC
+    tile costs 4-8 s and ~400 MB, and a bounded band below the top carries
+    the same information as a search over every consecutive gap.
+    """
+    n_pix = height * width
+
+    second = np.full(n_pix, np.float32(-np.inf), dtype=np.float32)
+    n_above = np.zeros(n_pix, dtype=np.uint16)
+    n_total = np.zeros(n_pix, dtype=np.uint16)
+    n_veg_above = np.zeros(n_pix, dtype=np.uint16)
+
+    for i in range(px.shape[0]):
+        f = py[i] * width + px[i]
+
+        t = top_flat[f]
+        if t == nodata:
+            continue
+
+        if n_total[f] < 65535:
+            n_total[f] += 1
+
+        if z[i] >= t - gap_min:
+            if n_above[f] < 65535:
+                n_above[f] += 1
+            if veg_flag[i] and n_veg_above[f] < 65535:
+                n_veg_above[f] += 1
+        elif z[i] > second[f]:
+            second[f] = z[i]
+
+    for f in range(n_pix):
+        if not np.isfinite(second[f]):
+            second[f] = nodata
+
+    return second, n_above, n_total, n_veg_above
+
+
+def _crane_point_evidence(
+    px, py, z, class_vals, width, height,
+    *,
+    top=None,
+    vegetation_classes=(3, 4, 5),
+    gap_min=4.0,
+    max_upper_fraction=0.34,
+    min_points=3,
+    nodata=-9999.0,
+):
+    """
+    Stage A: per-pixel evidence that the top of the column is a see-through
+    structure floating above a surface we actually measured.
+
+    `px`, `py`, `z` must already be clipped to the raster and mutually
+    aligned; `class_vals` may be None. Pass `top` (the elevation raster) when
+    it is already a per-pixel maximum - with `aggregation="max"` it is, and
+    the first pass then costs nothing.
+
+    Returns a dict of (height, width) arrays: `second`, `n_above`, `n_total`,
+    `suspect`.
+    """
+    if px.size == 0:
+        return _init_crane_bands(height, width, nodata)
+
+    px = np.ascontiguousarray(px, dtype=np.int64)
+    py = np.ascontiguousarray(py, dtype=np.int64)
+    z = np.ascontiguousarray(z, dtype=np.float32)
+
+    if top is None:
+        top_flat = _crane_top_kernel(px, py, z, width, height, np.float32(nodata))
+    else:
+        top_flat = np.ascontiguousarray(
+            np.asarray(top, dtype=np.float32).reshape(-1)
+        )
+
+    if class_vals is not None and len(vegetation_classes) > 0:
+        veg_flag = np.isin(
+            class_vals, np.asarray(vegetation_classes, dtype=class_vals.dtype)
+        )
+    else:
+        veg_flag = np.zeros(px.shape[0], dtype=bool)
+
+    second, n_above, n_total, n_veg_above = _crane_second_surface_kernel(
+        px, py, z, np.ascontiguousarray(veg_flag),
+        width, height, top_flat,
+        np.float32(gap_min), np.float32(nodata),
+    )
+
+    # A lattice intercepts roughly one return per pixel while the surface
+    # below still yields two or three. Require a real second surface, a top
+    # band that stays a small minority, and a top band that is not mostly
+    # vegetation - a tree crown over ground has the same vertical signature.
+    allowed_above = np.maximum(
+        1, np.ceil(max_upper_fraction * n_total.astype(np.float32))
+    )
+
+    suspect = (
+        (second != nodata)
+        & (n_total >= min_points)
+        & (n_above <= allowed_above)
+        & (n_veg_above.astype(np.float32) <= 0.5 * n_above.astype(np.float32))
+    )
+
+    return {
+        "second": second.reshape(height, width),
+        "n_above": n_above.reshape(height, width),
+        "n_total": n_total.reshape(height, width),
+        "suspect": suspect.reshape(height, width),
+    }
+
+
+def _init_crane_bands(height, width, nodata):
+    """Empty Stage A accumulator, shaped like `_crane_point_evidence` output."""
+    return {
+        "second": np.full((height, width), np.float32(nodata), dtype=np.float32),
+        "n_above": np.zeros((height, width), dtype=np.uint16),
+        "n_total": np.zeros((height, width), dtype=np.uint16),
+        "suspect": np.zeros((height, width), dtype=bool),
+    }
+
+
+def _accumulate_crane_bands(acc, new, dm_before, raster, nodata, gap_min):
+    """
+    Merge one LAZ file's Stage A evidence into the tile accumulator.
+
+    Must be called BEFORE `dm` is updated with this file's `raster`, because
+    the rule turns on which file supplies the winning maximum:
+
+      - the file that wins the pixel owns the `suspect` verdict, since its
+        own top IS the DSM value being judged;
+      - a file that loses still contributes: its maximum is itself a
+        measurement below the winning top, so it can serve as `second`.
+
+    Conservative on purpose - a pixel is suspect only if the winner flagged it.
+    """
+    if acc is None or not new:
+        return acc
+
+    valid = raster != nodata
+
+    wins = valid & (raster > dm_before)
+    loses = valid & ~wins
+
+    new_second = new["second"]
+
+    # Winner: its verdict and its second surface both apply.
+    acc["suspect"][wins] = new["suspect"][wins]
+
+    better = wins & (new_second != nodata) & (new_second > acc["second"])
+    acc["second"][better] = new_second[better]
+
+    # Loser: keep its own second surface, and consider its top as one.
+    better = loses & (new_second != nodata) & (new_second > acc["second"])
+    acc["second"][better] = new_second[better]
+
+    as_second = (
+        loses
+        & (raster < dm_before - gap_min)
+        & (raster > acc["second"])
+    )
+    acc["second"][as_second] = raster[as_second]
+
+    np.add(acc["n_above"], new["n_above"], out=acc["n_above"], casting="unsafe")
+    np.add(acc["n_total"], new["n_total"], out=acc["n_total"], casting="unsafe")
+
+    return acc
+
+
+def _component_shape_stats(sub_mask, resolution):
+    """
+    Shape descriptors of one connected component, computed on its own bbox
+    slice rather than the full raster.
+
+    `r_inscribed_m` - the radius of the largest disc that fits inside the
+    component - is the authoritative width test: it is isotropic, so a
+    diagonal jib is measured the same as an axis-aligned one.
+    """
+    res = float(abs(resolution))
+    area_px = int(sub_mask.sum())
+
+    # Zero-pad so the EDT sees the component's own border, not the slice edge.
+    padded = np.zeros(
+        (sub_mask.shape[0] + 2, sub_mask.shape[1] + 2), dtype=np.uint8
+    )
+    padded[1:-1, 1:-1] = sub_mask
+    r_inscribed_m = float(distance_transform_edt(padded).max()) * res
+
+    rr, cc = np.nonzero(sub_mask)
+    coords = np.column_stack((rr.astype(np.float64), cc.astype(np.float64)))
+    coords -= coords.mean(axis=0)
+
+    if coords.shape[0] >= 2:
+        # PCA: extent along the principal axis is the length, across it the
+        # minor extent. Robust to orientation, unlike a bbox.
+        cov = np.cov(coords, rowvar=False)
+        evals, evecs = np.linalg.eigh(cov)
+        order = np.argsort(evals)[::-1]
+        proj = coords @ evecs[:, order]
+        length_m = float(proj[:, 0].max() - proj[:, 0].min() + 1.0) * res
+        minor_m = float(proj[:, 1].max() - proj[:, 1].min() + 1.0) * res
+    else:
+        length_m = res
+        minor_m = res
+
+    return {
+        "area_px": area_px,
+        "area_m2": area_px * res * res,
+        "length_m": length_m,
+        "minor_m": minor_m,
+        "r_inscribed_m": r_inscribed_m,
+        "elongation": length_m / max(minor_m, res),
+    }
+
+
+def _disc_structure(radius):
+    """Boolean disc of the given pixel radius, for morphology on masks."""
+    r = max(1, int(radius))
+    yy, xx = np.ogrid[-r:r + 1, -r:r + 1]
+    return (xx * xx + yy * yy) <= r * r
+
+
+def _rasterize_crane_exclusions(gdf, width, height, transform, epsg):
+    """
+    Burn the geometries the user wants protected from crane removal.
+
+    The detector's weak spot is the structure that is genuinely thin, tall,
+    elongated AND see-through: a lattice pylon, a guyed mast, a transporter
+    bridge. There is no image-level test that separates those from a jib, so
+    the escape hatch is a list of places to leave alone.
+    """
+    if gdf is None or len(gdf) == 0:
+        return None
+
+    try:
+        if gdf.crs is not None and gdf.crs.to_epsg() != epsg:
+            gdf = gdf.to_crs(epsg=epsg)
+
+        geoms = [g for g in gdf.geometry if g is not None and not g.is_empty]
+        if not geoms:
+            return None
+
+        return rasterize(
+            geoms,
+            out_shape=(height, width),
+            transform=transform,
+            fill=0,
+            default_value=1,
+            dtype="uint8",
+        ).astype(bool)
+
+    except Exception as e:
+        warnings.warn(f"crane_exclusion_gdf could not be rasterized: {e}")
+        return None
+
+
+def _clearance_raster(dm, valid, cand, r_px):
+    """
+    Per-pixel height above the nearest surface that is NOT itself a candidate.
+
+    This is the test that separates a crane jib from the 1-2 px ring the
+    top-hat leaves along the rim of every large raised surface - a roof edge,
+    a terrace, a cliff. Both are thin, both stand the full height of the
+    structure above the ground beyond them, and where a jib crosses a roof rim
+    the two merge into one component whose shape and clearance then describe
+    neither. Deciding per pixel, before anything is grouped, keeps them apart.
+
+    Excluding the candidates from the reference surface is what makes the
+    measure work on an extended object: without it, the middle of a 60 m jib
+    would be compared against the rest of the jib and read as flush.
+
+    Pixels with no valid non-candidate surface within reach get 0, so a
+    structure beside a large hole is kept rather than invented.
+
+    Returns `(clearance, ground)`. `ground` - the highest nearby surface that
+    is not itself a candidate - is also the best available estimate of what the
+    structure is standing over, and Stage C uses it to sanity-check the second
+    surface it means to restore.
+    """
+    ref = np.where(valid & ~cand, dm, -np.inf).astype(np.float32)
+
+    size = 2 * (r_px + 3) + 1
+    ground = grey_dilation(ref, size=(size, size), mode="nearest")
+
+    clearance = np.where(np.isfinite(ground), dm - ground, np.float32(0.0))
+    clearance = np.where(valid, clearance, np.float32(0.0)).astype(np.float32)
+
+    return clearance, ground.astype(np.float32)
+
+
+def _detect_thin_tall_structures(
+    dm,
+    nodata,
+    resolution,
+    *,
+    width_m=3.0,
+    height_m=4.0,
+    min_length_m=12.0,
+    min_elongation=4.0,
+    max_area_m2=600.0,
+    min_clearance_m=4.0,
+    group_gap_m=1.5,
+    absorb_max_area_m2=150.0,
+    seed_mask=None,
+    min_seeds=4,
+    min_seed_fraction=0.15,
+    protect_mask=None,
+    aoi_mask=None,
+    opening_shape="square",
+    border_relax=True,
+    logger=None,
+):
+    """
+    Stage B: find connected objects that are thin, tall and elongated, and
+    that Stage A confirms are see-through.
+
+    Returns `(crane_mask, stats, context)`. `stats` is one dict per candidate
+    component - kept and rejected alike, each carrying the reason - so the
+    diagnostic script can show why a decision went the way it did. `context`
+    carries the `residual`, `clearance` and `ground` rasters for Stage C and
+    for diagnostics.
+    """
+    res = float(abs(resolution))
+
+    valid = (dm != nodata) & np.isfinite(dm)
+    if aoi_mask is not None:
+        valid = valid & aoi_mask
+
+    empty = np.zeros(dm.shape, dtype=bool)
+    if not np.any(valid):
+        return empty, [], {}
+
+    r_px = max(1, int(round(width_m / res)))
+    k = 2 * r_px + 1
+
+    # A grey opening reads nodata as a legitimate low value: the erosion
+    # would pick -9999, the opening would collapse, and the residual would
+    # spike beside every hole. Lifting nodata to +1e6 instead makes the
+    # dilation push `opened` ABOVE `dm` near holes, so the residual goes
+    # negative and no candidate is ever raised there. Fails safe: this
+    # misses structures beside a hole rather than inventing them.
+    work = dm.astype(np.float32, copy=True)
+    work[~valid] = np.float32(1e6)
+
+    if opening_shape == "disc":
+        yy, xx = np.ogrid[-r_px:r_px + 1, -r_px:r_px + 1]
+        footprint = (xx * xx + yy * yy) <= r_px * r_px
+        opened = grey_opening(work, footprint=footprint, mode="nearest")
+    else:
+        # Separable 1-D min/max passes: 2k operations per pixel instead of
+        # k**2. A square element over-detects on diagonals rather than
+        # under-detecting, and the isotropic width test below is the gate.
+        opened = grey_opening(work, size=(k, k), mode="nearest")
+
+    residual = np.where(valid, dm - opened, np.float32(0.0)).astype(np.float32)
+    cand = valid & (residual > height_m)
+
+    # Enforce the width limit per PIXEL before anything is grouped or labelled.
+    #
+    # The top-hat also fires along the shoulder of every large raised surface -
+    # a roof edge, a terrace, a cliff rim - in a band as wide as the structuring
+    # element's radius. That band is far wider than a jib, but a jib that
+    # crosses one is CONNECTED to it, and the merged blob then reads as neither:
+    # its elongation collapses and its collar clearance is diluted by the roof
+    # it merged with. Opening the mask with a disc of the maximum allowed radius
+    # deletes every such band outright and leaves the narrow ridges standing, so
+    # the crane arrives at the shape tests on its own.
+    half_px = max(1, int(round((width_m / 2.0) / res)))
+    disc = _disc_structure(half_px)
+
+    core = binary_erosion(cand, structure=disc)
+    if core.any():
+        wide = binary_dilation(core, structure=_disc_structure(half_px + 1))
+        cand = cand & ~wide
+
+    # Require every candidate pixel to stand clear of the surrounding surface.
+    clearance, _ = _clearance_raster(dm, valid, cand, r_px)
+    cand = cand & (clearance >= min_clearance_m)
+
+    if not np.any(cand):
+        if logger:
+            logger.log("crane: no top-hat candidates")
+        return empty, [], {}
+
+    # A crane reaches the raster in pieces: the lattice lets the laser through
+    # in places, and `max` aggregation drops a pixel wherever no return landed.
+    # Judging those pieces separately throws away the very evidence that
+    # identifies them - a 2 m long stub is "too short" no matter how obviously
+    # it is floating 26 m above the street. So grow the candidates, label the
+    # grown mask, and judge each group as one object while removing only the
+    # pixels that actually fired.
+    group_px = max(0, int(round(group_gap_m / res)))
+
+    if group_px > 0:
+        grown = binary_dilation(cand, iterations=group_px)
+    else:
+        grown = cand
+
+    labeled, n_comp = label(grown, structure=np.ones((3, 3), dtype=np.uint8))
+    labeled = np.where(cand, labeled, 0)
+    slices = find_objects(labeled)
+
+    h, w = dm.shape
+    max_area_px = max_area_m2 / (res * res)
+
+    crane_mask = np.zeros(dm.shape, dtype=bool)
+    stats = []
+    ground = None
+
+    for cid, sl in enumerate(slices, start=1):
+        if sl is None:
+            continue
+
+        sub = labeled[sl] == cid
+        st = _component_shape_stats(sub, res)
+        st["id"] = cid
+        st["slice"] = sl
+
+        sub_res = residual[sl][sub]
+        st["resid_mean"] = float(sub_res.mean())
+        st["resid_max"] = float(sub_res.max())
+
+        st["clearance_m"] = float(np.median(clearance[sl][sub]))
+
+        if seed_mask is not None:
+            seeds = int(seed_mask[sl][sub].sum())
+        else:
+            seeds = 0
+        st["seeds"] = seeds
+        st["seed_fraction"] = seeds / max(st["area_px"], 1)
+
+        touches_border = (
+            sl[0].start == 0 or sl[1].start == 0
+            or sl[0].stop >= h or sl[1].stop >= w
+        )
+        st["border"] = bool(touches_border)
+
+        # A crane crossing a tile seam arrives as a clipped stub, so judging it
+        # by full-crane length would delete it in one tile and keep it in the
+        # next, leaving half a crane at the seam. Halving the requirement is
+        # enough: the halo is wider than `min_length_m`, so a seam-crossing jib
+        # always shows well over half its minimum. Dropping the test entirely
+        # would admit every clipped treetop in the border row, and elongation
+        # is not relaxed at all - clipping shortens an object, it does not
+        # make it fatter.
+        relaxed = touches_border and border_relax
+        need_length = min_length_m / 2.0 if relaxed else min_length_m
+        need_elong = min_elongation
+
+        if st["area_m2"] > max_area_m2 or st["area_px"] > max_area_px:
+            st["decision"] = "keep (too large)"
+        elif st["r_inscribed_m"] > width_m / 2.0:
+            st["decision"] = "keep (too wide)"
+        elif st["length_m"] < need_length:
+            st["decision"] = "keep (too short)"
+        elif st["elongation"] < need_elong:
+            st["decision"] = "keep (compact)"
+        elif st["clearance_m"] < min_clearance_m:
+            st["decision"] = "keep (no clearance)"
+        elif protect_mask is not None and protect_mask[sl][sub].any():
+            st["decision"] = "keep (protected)"
+        elif not (
+            seeds >= min_seeds
+            or st["seed_fraction"] >= min_seed_fraction
+        ):
+            # No see-through evidence anywhere along it: a solid structure,
+            # i.e. a spire, chimney, silo or antenna. Its shadow is real.
+            st["decision"] = "keep (no seeds: solid)"
+        else:
+            st["decision"] = "REMOVE"
+            crane_mask[sl] |= sub
+
+        stats.append(st)
+
+    if np.any(crane_mask):
+        # A tower crane is not all jib. The mast, the cab and the counterweight
+        # are compact and wider than the width gate, so they never even become
+        # candidates - yet they are the same structure, they are contiguous with
+        # the jib, and they stand just as far above the roof. Left behind they
+        # make a floating block, which reads worse than the streak did.
+        #
+        # So grow the confirmed mask into whatever raised material it touches.
+        # The reference surface for this second clearance pass excludes every
+        # raised pixel, not just the narrow ones, or the mast would be measured
+        # against itself and read as flush.
+        wide_raised = valid & (residual > height_m / 2.0)
+        clearance2, ground = _clearance_raster(dm, valid, wide_raised, r_px)
+        raised = (wide_raised & (clearance2 >= min_clearance_m)) | crane_mask
+
+        lab2, _ = label(raised, structure=np.ones((3, 3), dtype=np.uint8))
+        slices2 = find_objects(lab2)
+
+        absorb_cap_px = absorb_max_area_m2 / (res * res)
+
+        for lid in np.unique(lab2[crane_mask]):
+            if lid == 0:
+                continue
+            sl2 = slices2[lid - 1]
+            comp = lab2[sl2] == lid
+            # Cap the growth: a mast head is tens of square metres, a tree
+            # crown or a narrow building wing is not, and a jib that happens to
+            # pass over one must not swallow it.
+            if comp.sum() <= absorb_cap_px:
+                crane_mask[sl2] |= comp
+
+        # `max` aggregation spills the jib sideways by a pixel wherever a
+        # crane return lands near a pixel edge. Recover that skirt, but only
+        # where the top-hat still says the surface is raised.
+        skirt = binary_dilation(crane_mask, iterations=1)
+        crane_mask = skirt & valid & (residual > height_m / 2.0)
+
+    if logger:
+        n_removed = sum(1 for s in stats if s["decision"] == "REMOVE")
+        logger.log(
+            f"crane: {n_comp} candidates, {n_removed} removed, "
+            f"{int(crane_mask.sum())} px"
+        )
+
+    return crane_mask, stats, {
+        "residual": residual,
+        "clearance": clearance,
+        "ground": ground,
+    }
+
+
+def _remove_thin_tall_outliers(
+    dm,
+    class_dm,
+    *,
+    nodata,
+    CLASS_NODATA,
+    resolution,
+    crane_bands,
+    aoi_mask=None,
+    vegetation_classes=(3, 4, 5),
+    point_gap_m=4.0,
+    second_tolerance_m=2.0,
+    fill="dw_plane",
+    max_ram_gb=8.0,
+    logger=None,
+    **detect_kwargs,
+):
+    """
+    Stages B and C: detect the crane, restore the surface it hid, and fill
+    whatever is left.
+
+    Returns `(dm, class_dm, report)`.
+    """
+    report = {"components": 0, "removed_px": 0, "restored_px": 0,
+              "interpolated_px": 0, "max_drop_m": 0.0, "stats": []}
+
+    second = None
+    seed_mask = None
+
+    if crane_bands is not None:
+        second = crane_bands.get("second")
+        suspect = crane_bands.get("suspect")
+
+        if suspect is not None:
+            seed_mask = suspect.copy()
+            if class_dm is not None and len(vegetation_classes) > 0:
+                # A tree crown over ground shows the same vertical gap as a
+                # lattice. Never let vegetation vote a component alive.
+                seed_mask &= ~np.isin(
+                    class_dm, np.asarray(vegetation_classes, dtype=class_dm.dtype)
+                )
+
+    crane_mask, stats, context = _detect_thin_tall_structures(
+        dm, nodata, resolution,
+        seed_mask=seed_mask,
+        aoi_mask=aoi_mask,
+        logger=logger,
+        **detect_kwargs,
+    )
+
+    report["components"] = len(stats)
+    report["stats"] = stats
+
+    if not np.any(crane_mask):
+        return dm, class_dm, report
+
+    dm_before = dm[crane_mask].copy()
+
+    # Where the laser reached the roof through the lattice we hold a real
+    # measurement. Prefer it over any interpolation - but only after checking
+    # that it IS the roof. A crane is not a single plane: the column under a
+    # pixel can hold the jib top, the jib underside, the cab and the hoist
+    # cable before anything reaches the roof, and the highest return below the
+    # gap can easily be another piece of crane 20 m up. Requiring the second
+    # surface to sit no higher than the surface all around the structure keeps
+    # the restoration honest; the rest becomes a hole and gets interpolated.
+    ground = context.get("ground")
+
+    if second is not None:
+        have_second = (
+            crane_mask
+            & (second != nodata)
+            & np.isfinite(second)
+            & (second < dm - point_gap_m)
+        )
+        if ground is not None:
+            have_second &= second <= ground + second_tolerance_m
+    else:
+        have_second = np.zeros(dm.shape, dtype=bool)
+
+    if second is not None and have_second.any():
+        dm[have_second] = second[have_second]
+
+    hole = crane_mask & ~have_second
+    dm[hole] = nodata
+
+    if class_dm is not None:
+        class_dm[crane_mask] = CLASS_NODATA
+
+    # Fill our own holes HERE, before `_fill_gaps` ever sees them. A 60 m jib
+    # at 0.5 m is ~700 px, which `fill_gaps="smart_general"` treats as a large
+    # hole and floods with the MINIMUM boundary value - the street - cutting a
+    # trench across the roofs. That is worse than the crane.
+    if np.any(hole):
+        if fill == "harmonic":
+            # `_harmonic_fill` adds EVERY non-unknown neighbour to the right
+            # hand side, so a nodata pixel touching the hole enters the solve
+            # as a Dirichlet value of -9999 and drags the whole patch down with
+            # it. A crane streak regularly abuts an ordinary gap, so check
+            # first and fall back rather than emit a -9000 m roof.
+            touches_nodata = (
+                binary_dilation(hole) & (dm == nodata) & ~hole
+            ).any()
+
+            if touches_nodata:
+                warnings.warn(
+                    "crane_fill='harmonic' needs holes fully enclosed by valid "
+                    "data; these touch nodata, falling back to 'dw_plane'"
+                )
+                dm = _dw_plane_fill(dm, nodata, hole)
+            else:
+                dm = _harmonic_fill(dm, nodata, hole)
+        elif fill == "dw_plane":
+            dm = _dw_plane_fill(dm, nodata, hole)
+        elif fill == "nearest":
+            dm = _nearest_fill_chunked(hole, dm, max_ram_gb, aoi_mask)
+        elif fill == "bilinear":
+            for _ in range(int(np.ceil(
+                float(detect_kwargs.get("width_m", 3.0)) / abs(resolution)
+            )) + 1):
+                dm = _bilinear_fill(dm, nodata, hole)
+        elif fill == "defer":
+            pass
+        else:
+            raise ValueError(
+                f"Unknown crane_fill: {fill} "
+                "('dw_plane', 'harmonic', 'nearest', 'bilinear', 'defer' "
+                "are available)"
+            )
+
+    dm_after = dm[crane_mask]
+    still_hole = dm_after == nodata
+
+    # Removing a crane may only ever LOWER the surface. Anything else means
+    # the fill misbehaved, and it would be invisible in the output.
+    raised = (~still_hole) & (dm_after > dm_before + 1e-3)
+    if np.any(raised):
+        worst = float((dm_after - dm_before)[raised].max())
+        msg = (
+            f"crane removal raised {int(raised.sum())} px "
+            f"(max +{worst:.2f} m); clamping to the previous surface"
+        )
+        # Sub-metre rises are ordinary: a skirt pixel already at roof level
+        # gets an interpolated value a few centimetres above its own. The clamp
+        # below makes either case harmless, so only speak up when the size of
+        # the rise suggests the fill actually went wrong.
+        if worst > 1.0:
+            warnings.warn(msg)
+        if logger:
+            logger.log(msg)
+        fixed = dm[crane_mask]
+        fixed[raised] = dm_before[raised]
+        dm[crane_mask] = fixed
+        dm_after = dm[crane_mask]
+
+    drops = dm_before[~still_hole] - dm_after[~still_hole]
+
+    report["removed_px"] = int(crane_mask.sum())
+    report["restored_px"] = int(have_second.sum())
+    report["interpolated_px"] = int(hole.sum())
+    report["max_drop_m"] = float(drops.max()) if drops.size else 0.0
+    report["mean_drop_m"] = float(drops.mean()) if drops.size else 0.0
+
+    return dm, class_dm, report
+
 
 def _remove_local_outliers(raster, nodata, resolution):
     threshold = max(1.2, abs(resolution) * 4)
@@ -2579,6 +3588,25 @@ def build_digital_model_from_lidar_pure(
         isolated_points_exclusion_ratio=None,
         isolated_window_size=3,
 
+        # ---- thin tall outliers (construction cranes, masts) ----
+        crane_removal=False,
+        crane_width_m=4.0,
+        crane_height_m=4.0,
+        crane_min_length_m=12.0,
+        crane_min_elongation=4.0,
+        crane_max_area_m2=600.0,
+        crane_min_clearance_m=4.0,
+        crane_group_gap_m=1.5,
+        crane_absorb_max_area_m2=150.0,
+        crane_point_gap_m=4.0,
+        crane_second_tolerance_m=2.0,
+        crane_max_upper_fraction=0.34,
+        crane_min_seeds=4,
+        crane_min_seed_fraction=0.15,
+        crane_fill="dw_plane",
+        crane_opening_shape="square",
+        crane_exclusion_gdf=None,
+
         # ---- Digital Model smoothing ----
         smooth_classes=None,
         smooth_mode=None,
@@ -2682,14 +3710,17 @@ def build_digital_model_from_lidar_pure(
     elif aggregation == "max":
         dm = np.full((height, width), -np.inf, dtype=np.float32)
         count = None
-    elif aggregation == "smart_for_roofs":
+    elif aggregation in ("smart_for_roofs", "tin"):
         dm = np.full((height, width), nodata, dtype=np.float32)
         count = None
     elif aggregation == "min":
         dm = np.full((height, width), np.inf, dtype=np.float32)
         count = None
     else:
-        raise ValueError(f"Unknown aggregation: {aggregation} ('mean', 'max', 'smart_for_roofs', 'min' are available)")
+        raise ValueError(
+            f"Unknown aggregation: {aggregation} "
+            "('mean', 'max', 'smart_for_roofs', 'min', 'tin' are available)"
+        )
     # ------------------------------------------------------------
     # CLASS COUNTERS
     # ------------------------------------------------------------
@@ -2697,6 +3728,15 @@ def build_digital_model_from_lidar_pure(
         int(cls): np.zeros((height, width), dtype=np.uint32)
         for cls in classification
     }
+
+    # ------------------------------------------------------------
+    # CRANE EVIDENCE ACCUMULATOR (Stage A)
+    # ------------------------------------------------------------
+    crane_bands = (
+        _init_crane_bands(height, width, nodata)
+        if crane_removal and aggregation in ("max", "smart_for_roofs", "tin")
+        else None
+    )
 
     # ------------------------------------------------------------
     # Filter raster
@@ -2720,6 +3760,7 @@ def build_digital_model_from_lidar_pure(
     if laz_points is not None:
         if cache_rasterization:
             cache_file = cache_dir / "points_cache.tif"
+        crane_tmp = {} if crane_bands is not None else None
         raster, class_raster, _ = _rasterize_agg(
             laz_path=None,
             laz_points=laz_points,
@@ -2744,10 +3785,19 @@ def build_digital_model_from_lidar_pure(
             lidar_class_window_diameter=0.5,
             cache_path=str(cache_file) if cache_rasterization else None,
             CLASS_NODATA=CLASS_NODATA,
-            epsg=epsg
+            epsg=epsg,
+            crane_point_gap_m=crane_point_gap_m,
+            crane_max_upper_fraction=crane_max_upper_fraction,
+            crane_bands_out=crane_tmp,
         )
         elev_valid = raster != nodata
         del laz_points
+
+        # Merge BEFORE `dm` takes this file's maximum: the rule turns on which
+        # file wins the pixel.
+        _accumulate_crane_bands(
+            crane_bands, crane_tmp, dm, raster, nodata, crane_point_gap_m
+        )
 
         # ---- Elevation aggregation ----
         if aggregation == "mean":
@@ -2757,7 +3807,7 @@ def build_digital_model_from_lidar_pure(
             dm[elev_valid] = np.maximum(dm[elev_valid], raster[elev_valid])
         elif aggregation == "min":
             dm[elev_valid] = np.minimum(dm[elev_valid], raster[elev_valid])
-        elif aggregation == "smart_for_roofs":
+        elif aggregation in ("smart_for_roofs", "tin"):
             mask = elev_valid & (dm == nodata)
             dm[mask] = raster[mask]
             overlap = elev_valid & (dm != nodata)
@@ -2772,6 +3822,7 @@ def build_digital_model_from_lidar_pure(
         for laz_path in (tqdm(laz_paths,desc="Reading and rasterising the LAZ files...") if len(laz_paths)>12 else laz_paths):
             if cache_rasterization:
                 cache_file = cache_dir / _cache_name_from_path(laz_path)
+            crane_tmp = {} if crane_bands is not None else None
             raster, class_raster, _ = _rasterize_agg(
                 laz_path=laz_path,
                 laz_points=None,
@@ -2796,10 +3847,18 @@ def build_digital_model_from_lidar_pure(
                 lidar_class_window_diameter=0.5,
                 cache_path=str(cache_file) if cache_rasterization else None,
                 CLASS_NODATA=CLASS_NODATA,
-                epsg=epsg
+                epsg=epsg,
+                crane_point_gap_m=crane_point_gap_m,
+                crane_max_upper_fraction=crane_max_upper_fraction,
+                crane_bands_out=crane_tmp,
             )
 
             elev_valid = raster != nodata
+
+            # Merge BEFORE `dm` takes this file's maximum.
+            _accumulate_crane_bands(
+                crane_bands, crane_tmp, dm, raster, nodata, crane_point_gap_m
+            )
 
             if aggregation == "mean":
                 dm[elev_valid] += raster[elev_valid]
@@ -2808,7 +3867,7 @@ def build_digital_model_from_lidar_pure(
                 dm[elev_valid] = np.maximum(dm[elev_valid], raster[elev_valid])
             elif aggregation == "min":
                 dm[elev_valid] = np.minimum(dm[elev_valid], raster[elev_valid])
-            elif aggregation == "smart_for_roofs":
+            elif aggregation in ("smart_for_roofs", "tin"):
                 dm[elev_valid] = raster[elev_valid]
 
             for cls in class_counts:
@@ -2830,7 +3889,7 @@ def build_digital_model_from_lidar_pure(
         dm[dm == -np.inf] = nodata
     elif aggregation == "min":
         dm[dm == np.inf] = nodata
-    elif aggregation == "smart_for_roofs":
+    elif aggregation in ("smart_for_roofs", "tin"):
         dm[~np.isfinite(dm)] = nodata
     # ------------------------------------------------------------
     # ISOLATED PIXELS
@@ -2864,6 +3923,70 @@ def build_digital_model_from_lidar_pure(
     if aoi_mask is not None:
         dm[~aoi_mask] = nodata
         class_dm[~aoi_mask] = CLASS_NODATA
+
+    # ------------------------------------------------------------
+    # THIN TALL OUTLIERS (construction cranes, masts)
+    #
+    # Runs here because `class_dm` exists only now (needed for the vegetation
+    # guard and the CLASS_NODATA reset) and `_remove_isolated_pixels` has
+    # already cleared the hook and cable specks that would fragment the jib.
+    # It must NOT run later: smoothing would smear the crane into the roofs
+    # and slope/aspect would inherit its cliffs.
+    # ------------------------------------------------------------
+    if crane_removal:
+        if aggregation not in ("max", "smart_for_roofs", "tin"):
+            # "mean"/"min" are the DEM paths, where terrain-only classes have
+            # already dropped the crane upstream. Skip quietly - user scripts
+            # forward one parameter set to DSM and DEM builds alike.
+            logger.log(
+                f"crane removal skipped: aggregation={aggregation!r} cannot "
+                "raise a crane"
+            )
+        else:
+            if resolution > 1.0:
+                warnings.warn(
+                    f"crane_removal at resolution={resolution} m is marginal: "
+                    "a jib is only 1-2 px wide. Designed for <= 0.5 m."
+                )
+
+            protect_mask = _rasterize_crane_exclusions(
+                crane_exclusion_gdf, width, height, transform, epsg
+            )
+
+            dm, class_dm, crane_report = _remove_thin_tall_outliers(
+                dm, class_dm,
+                nodata=nodata,
+                CLASS_NODATA=CLASS_NODATA,
+                resolution=resolution,
+                crane_bands=crane_bands,
+                aoi_mask=aoi_mask,
+                vegetation_classes=vegetation_classes,
+                point_gap_m=crane_point_gap_m,
+                second_tolerance_m=crane_second_tolerance_m,
+                fill=crane_fill,
+                max_ram_gb=max_ram_gb if max_ram_gb else 8.0,
+                logger=logger,
+                width_m=crane_width_m,
+                height_m=crane_height_m,
+                min_length_m=crane_min_length_m,
+                min_elongation=crane_min_elongation,
+                max_area_m2=crane_max_area_m2,
+                min_clearance_m=crane_min_clearance_m,
+                group_gap_m=crane_group_gap_m,
+                absorb_max_area_m2=crane_absorb_max_area_m2,
+                min_seeds=crane_min_seeds,
+                min_seed_fraction=crane_min_seed_fraction,
+                protect_mask=protect_mask,
+                opening_shape=crane_opening_shape,
+            )
+            logger.log(
+                "crane removal: {removed_px} px "
+                "({restored_px} restored from LiDAR, {interpolated_px} filled), "
+                "max drop {max_drop_m:.1f} m".format(**crane_report)
+            )
+
+    crane_bands = None
+    gc.collect()
 
     # ------------------------------------------------------------
     # GAP FILL (ELEVATION)
@@ -3282,6 +4405,9 @@ def _compute_tile_buffer_pixels(
     aspect_smooth_iterations,
     fill_gaps,
     resolution,
+    crane_removal=False,
+    crane_width_m=4.0,
+    crane_min_length_m=12.0,
     user_override=None,
 ):
     """
@@ -3322,6 +4448,16 @@ def _compute_tile_buffer_pixels(
     # and we also want to absorb any minor operator asymmetry.
     if fill_gaps is not None:
         halo += 16
+
+    # Thin-tall-outlier removal. The grey opening reaches `2 * width_m` from
+    # its centre, the clearance raster a little further, and a crane cut by the
+    # seam must still look like a crane from inside each tile - hence the extra
+    # `min_length_m` of context, so the halved border test is never the thing
+    # deciding a real crane's fate.
+    if crane_removal:
+        r_px = max(1, int(round(crane_width_m / resolution)))
+        halo += 2 * (2 * r_px + 1)
+        halo += min(int(np.ceil(crane_min_length_m / resolution)), 64)
 
     # Safety margin (absorbs rounding + operator asymmetry)
     halo += 8
@@ -3604,6 +4740,23 @@ def build_digital_model_from_lidar_tiled(
         filter_mode="exclude",
         isolated_points_exclusion_ratio=None,
         isolated_window_size=3,
+        crane_removal=False,
+        crane_width_m=4.0,
+        crane_height_m=4.0,
+        crane_min_length_m=12.0,
+        crane_min_elongation=4.0,
+        crane_max_area_m2=600.0,
+        crane_min_clearance_m=4.0,
+        crane_group_gap_m=1.5,
+        crane_absorb_max_area_m2=150.0,
+        crane_point_gap_m=4.0,
+        crane_second_tolerance_m=2.0,
+        crane_max_upper_fraction=0.34,
+        crane_min_seeds=4,
+        crane_min_seed_fraction=0.15,
+        crane_fill="dw_plane",
+        crane_opening_shape="square",
+        crane_exclusion_gdf=None,
         smooth_classes=None,
         smooth_mode=None,
         smooth_unary=False,
@@ -3679,6 +4832,9 @@ def build_digital_model_from_lidar_tiled(
         aspect_smooth_iterations=aspect_smooth_iterations,
         fill_gaps=fill_gaps,
         resolution=resolution,
+        crane_removal=crane_removal,
+        crane_width_m=crane_width_m,
+        crane_min_length_m=crane_min_length_m,
         user_override=tile_buffer_pixels,
     )
     buffer_m = buffer_px * resolution
@@ -3802,6 +4958,23 @@ def build_digital_model_from_lidar_tiled(
         filter_mode=filter_mode,
         isolated_points_exclusion_ratio=isolated_points_exclusion_ratio,
         isolated_window_size=isolated_window_size,
+        crane_removal=crane_removal,
+        crane_width_m=crane_width_m,
+        crane_height_m=crane_height_m,
+        crane_min_length_m=crane_min_length_m,
+        crane_min_elongation=crane_min_elongation,
+        crane_max_area_m2=crane_max_area_m2,
+        crane_min_clearance_m=crane_min_clearance_m,
+        crane_group_gap_m=crane_group_gap_m,
+        crane_absorb_max_area_m2=crane_absorb_max_area_m2,
+        crane_point_gap_m=crane_point_gap_m,
+        crane_second_tolerance_m=crane_second_tolerance_m,
+        crane_max_upper_fraction=crane_max_upper_fraction,
+        crane_min_seeds=crane_min_seeds,
+        crane_min_seed_fraction=crane_min_seed_fraction,
+        crane_fill=crane_fill,
+        crane_opening_shape=crane_opening_shape,
+        crane_exclusion_gdf=crane_exclusion_gdf,
         smooth_classes=smooth_classes,
         smooth_mode=smooth_mode,
         smooth_unary=smooth_unary,

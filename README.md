@@ -13,6 +13,7 @@ greenshadow enables detailed solar energy analysis by processing LiDAR point clo
 - **Unified Smoothing Algorithms**: Smart elevation surface smoothing that preserves building edges while creating natural terrain transitions
 - **Precise Solar Calculations**: Accurate sun position computation for any date, time, and location
 - **Cast Shadow Simulation**: Generate hillshades with realistic shadow casting from terrain and structures
+- **Semi-Transparent Vegetation**: Trees attenuate the beam instead of blocking it, with modelled treetops and seasonal leaf-on/leaf-off behaviour
 - **Weather Data Integration**: ERA5Land weather data integration for realistic solar radiation modeling
 - **Temporal Solar Analysis**: Daily, seasonal, and annual solar exposure assessment
 - **Photovoltaic Potential**: Direct PV potential calculation from solar exposure analysis
@@ -34,6 +35,7 @@ greenshadow enables detailed solar energy analysis by processing LiDAR point clo
 - **Cast Shadow Modeling**: Advanced algorithms compute shadows cast by terrain features and buildings
 - **Hillshade Generation**: Multiple hillshades are generated for each solar position incorporating both terrain shading and cast shadows
 - **Height-Based Analysis**: Supports elevated analysis (e.g., rooftop solar potential at specific heights above ground)
+- **Semi-Transparent Vegetation**: Optional canopy model in which trees attenuate the beam rather than block it
 
 ### 4. Solar Energy Integration
 - **Weather Data**: ERA5Land reanalysis data provides accurate solar radiation values
@@ -85,6 +87,15 @@ Advanced digital elevation model generation with building integration.
 
 **Advanced Features:**
 - **Classification Correction**: Automatic correction using cadastral building data
+- **Crane Removal**: Optional `crane_removal=True` deletes construction-crane jibs
+  and masts, which otherwise win the `max` aggregation and cast long false
+  shadows. An object is removed only if it is thin, elongated, standing clear of
+  everything around it, *and* see-through in the point cloud - so chimneys, lift
+  shafts, antennas and spires are preserved. Removed pixels are restored from the
+  LiDAR returns that reached the roof through the lattice where those exist, and
+  interpolated otherwise. Overhead cables and power lines meet the same criteria
+  and are removed too. See `diagnose_crane.py` for per-object decisions and
+  `test_crane_removal.py` for the behaviour it guarantees.
 - **Unified Smoothing**: Smart smoothing that preserves building edges
 - **Multi-Resolution Support**: From centimeter to meter-scale processing
 - **Memory Optimization**: Efficient processing of large datasets
@@ -109,6 +120,13 @@ Weather data integration for realistic solar radiation modeling.
 - `download_ERA5Land()`: Download ERA5Land reanalysis data
 - `load_ERA5Land()`: Load and process weather data
 - `ERA5Land_variables()`: Available weather variables
+- `load_ERA5Land_with_direct_radiation()`: ERA5-Land plus ERA5's own all-sky direct radiation (`fdir`) and cloud cover, for `irradiance_decomposition="era5"`
+
+How the global irradiance is aligned in time and split into beam and diffuse
+(`irradiance_decomposition`: `"disc"` by default, `"dirint"`, `"erbs"`,
+`"era5"`), and how each option compares with PVGIS-SARAH3, is documented in
+[docs/irradiance_era5.md](docs/irradiance_era5.md); `eval_irradiance_pvgis.py`
+repeats the comparison for any point and year.
 
 **Features:**
 - **Historical Data**: Access to decades of weather records
@@ -258,6 +276,73 @@ For weather data functionality:
 - **Coverage**: Spain
 
 ## Advanced Features
+
+### Semi-Transparent Vegetation
+
+A plain DSM turns a tree into an extruded column and its shadow into a hard black
+blob. Enabling the canopy model replaces that with a participating medium.
+
+![Semi-transparent vegetation in the hillshade](docs/hillshade_vegetation_prototype.png)
+
+- **Modelled treetops.** High-vegetation pixels are resolved into individual tree
+  crowns. Each is a half-ellipsoid sized from the canopy height `H = DSM - DEM`
+  via the allometry `D = a * H^b`, capped by how much crown the point cloud
+  actually shows, so shadows are crown-shaped rather than column-shaped. Low and
+  medium vegetation keeps the DSM column, which describes a shrub well enough.
+- **Beer-Lambert attenuation.** The ray-march accumulates optical depth through
+  the crown instead of stopping at it, so crown edges are lighter than crown
+  centres and dappled ground shade appears where a hard mask gave black.
+- **One hillshade, every month.** Each output carries three extra bands holding
+  the metres of canopy the beam crossed per LiDAR height class. Those are
+  geometry, so they are season-independent; the month only enters at consumption
+  time through the extinction coefficient. The `(azimuth, altitude)` hillshade
+  cache therefore still serves a full-year run.
+- **Growth correction.** LiDAR is a snapshot, so simulating a future year with
+  the trees frozen at flight size under-shades. `vegetation_growth` ages height
+  and crown diameter forward, additively (metres per year) or multiplicatively
+  (percent per year). For ICGC data the flight date is read from the published
+  per-tile metadata.
+
+```python
+import greenshadow as gs
+
+# When was this point cloud actually flown?
+flown = gs.icgc_lidar_acquisition_date(aoi, cache_dir=laz_dir)   # e.g. 2022-05-28
+
+canopy = gs.build_canopy_model_from_rasters(
+    dsm_path=dsm_path,
+    dem_path=dem_path,
+    class_path=dsm_class_path,
+    under_canopy_path=dsm_no_vegetation_path,
+    growth=gs.vegetation_growth(flown, 2040),   # omit for the canopy as flown
+)
+
+gs.generate_multiple_hillshades_gdal(
+    raster_dir=hillshade_dir,
+    dsm_path=dsm_path,
+    azimuth_altitude=annual_solar["azimuth_altitude_pairs"],
+    canopy=canopy,          # None -> original opaque behaviour, single band
+)
+
+gs.compute_surface_solar_energy(
+    solar_df=annual_solar["df"],
+    hillshade_dir=hillshade_dir,
+    svf_path=svf_path,
+    out_path=out_path,
+    mode="total",
+    canopy_leaf_type=0,     # 0 deciduous, 1 evergreen
+)
+```
+
+The whole feature is opt-in: with `canopy=None` the pipeline produces
+byte-identical single-band hillshades, and a canopy hillshade read without a
+month raises rather than silently dropping all vegetation shading.
+
+Optical properties come from `VEGETATION_SHADOWING`, a leaf-type x height-class x
+month table of the fraction stopped by one full vertical crossing of the crown.
+The crown allometry and `crown_ratio` are literature defaults and have not been
+fitted to Catalan urban species; `leaf_type` is currently one global setting
+rather than a per-tree attribute.
 
 ### Classification Correction
 Automatic correction of LiDAR classification using accurate building footprints from cadastral data, ensuring precise building representation for shadow analysis.

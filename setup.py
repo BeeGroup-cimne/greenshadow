@@ -37,8 +37,9 @@ INSTALL_REQUIRES = [
 OPTIONAL_REQUIRES = {
     'solar': ['pysolar>=0.10', 'sunpy>=4.0.0'],
     'pdal': ['pdal>=3.0.0'],
-    'weather': ['requests>=2.28.0'],
+    'weather': ['hypercadaster_ES>=1.2.3'],
     'dev': ['pytest>=7.0.0', 'black>=22.0.0', 'flake8>=4.0.0'],
+    'viz3d': ['plotly>=5.0.0'],
 }
 
 setup(

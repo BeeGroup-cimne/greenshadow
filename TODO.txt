@@ -1,0 +1,36 @@
+- [done] Reuse the functions of hypercadaster_ES (for each municipality: administrative layers gathering, building geometries gathering, weather data gathering...)
+- Refine the building roofs detection.
+- [done] Create an algorithm to define the crops alignment in the parcel
+  (greenshadow.crop_rows.detect_crop_rows): row azimuth, spacing, canopy width and
+  alley width from the dsm - dsm_no_vegetation canopy model on woody crops; the
+  parcel working axis on herbaceous ones
+- [done] Set and simulate the PV systems for building roofs (greenshadow.dimensionate.plan_pv_strings_in_buildings)
+- Set and simulate the m
+- Create the unary tests.
+- [done] Filter construction-crane outliers from the DSM (crane_removal=True)
+- _fill_gaps(method="smart_general") floods any hole larger than 200 px with the
+  MINIMUM boundary value, which would cut a trench for any feature that punches
+  big holes. Cap that rule by hole aspect ratio.
+- [done] Calculating the simulations for the maximum availability of POA strings for every building roof; aggregate results by building
+- [done] Report the PV results as one layer per mounting scenario (poa_coplanar, poa_south_05 ... poa_best) instead of only the optimum
+- [done, phase 1] PV fields and agrivoltaics over sigpac_parcels (greenshadow.parcel_pv.plan_parcel_pv_scenarios):
+  synthetic N-S and E-W rows on every agricultural parcel; fixed-tilt PV field, solar grazing, overhead and
+  interspace agrivoltaics, pitch per crop; energy from the no-vegetation fourier_poa basis; NPV/IRR/ROI/LCOE/
+  payback/LER against the parcel's current-use margin; best scenario by a selectable criterion
+- [done, phase 2] Single-axis and dual-axis trackers and vertical bifacial fences
+  (compute_surface_solar_energy modes vertical_basis / tracking_basis, layout factors from the sun table;
+  validated against pvlib - docs/pv_tracking_irradiance_plan.md)
+- Single-axis trackers on East-West axes and tilted axes; trackers over existing crop rows
+- Calibrate the parcel_pv defaults (capex, crop margins, SIGPAC_USE_MARGIN_EUR_HA, shade response) against
+  regional data; add grid-connection cost by distance to substation
+- [done] Filter the shades in case of trees. Adapt the hillshades
+  (greenshadow.shader.build_canopy_model_from_rasters + generate_multiple_hillshades_gdal(canopy=...)):
+  high vegetation is resolved into ellipsoidal crowns sized from H = DSM - DEM,
+  the beam is attenuated with Beer-Lambert instead of being blocked, and the
+  hillshades carry per-class canopy path lengths so one raster serves every month.
+  gs.icgc_lidar_acquisition_date + gs.vegetation_growth age the canopy from the
+  flight date to the simulated year. Pass canopy=None for the old opaque model.
+- Calibrate crown_ratio and the D = a*H^b allometry against Catalan urban species;
+  the current defaults are literature values, not fitted.
+- Derive leaf_type per tree (species layer or NDVI seasonality) instead of the
+  single global deciduous/evergreen switch.

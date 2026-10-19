@@ -32,11 +32,20 @@ from .logging_utils import info, warning
 
 
 
-def _read_laz(path):
+def _read_laz(path, bounds=None, classes=None, chunk_size=2_000_000):
     """
     Read LAZ file and return Nx4 numpy array (x, y, z, classification).
     Returns None if file cannot be read.
+
+    ``bounds`` (minx, miny, maxx, maxy, inclusive) and ``classes`` keep only
+    the returns inside that box and of those classes. Either one switches to
+    a chunked read that filters as it goes, so the full tile - ~21M returns,
+    about 2 GB once decoded - is never held in memory at once. Without them
+    the whole tile is returned, as before.
     """
+
+    if bounds is not None or classes is not None:
+        return _read_laz_filtered(path, bounds, classes, chunk_size)
 
     with laspy.open(path) as reader:
         las = reader.read()
@@ -60,6 +69,47 @@ def _read_laz(path):
         classification = np.zeros_like(x, dtype=np.uint8)
 
     return np.column_stack((x, y, z, classification))
+
+
+def _read_laz_filtered(path, bounds, classes, chunk_size):
+    """Chunked ``_read_laz`` keeping only the returns in ``bounds`` and ``classes``."""
+
+    parts = []
+
+    with laspy.open(path) as reader:
+
+        if bounds is not None:
+            minx, miny, maxx, maxy = bounds
+            hmin, hmax = reader.header.mins, reader.header.maxs
+            if hmax[0] < minx or hmin[0] > maxx or hmax[1] < miny or hmin[1] > maxy:
+                return np.empty((0, 4))
+
+        for chunk in reader.chunk_iterator(chunk_size):
+
+            x = np.asarray(chunk.x, dtype=np.float64)
+            y = np.asarray(chunk.y, dtype=np.float64)
+
+            if "classification" in chunk.point_format.dimension_names:
+                classification = np.asarray(chunk.classification, dtype=np.uint8)
+            else:
+                classification = np.zeros(len(x), dtype=np.uint8)
+
+            keep = np.ones(len(x), dtype=bool)
+            if classes is not None:
+                keep &= np.isin(classification, classes)
+            if bounds is not None:
+                keep &= (x >= minx) & (x <= maxx) & (y >= miny) & (y <= maxy)
+
+            if not np.any(keep):
+                continue
+
+            z = np.asarray(chunk.z, dtype=np.float64)[keep]
+            parts.append(np.column_stack((x[keep], y[keep], z, classification[keep])))
+
+    if not parts:
+        return np.empty((0, 4))
+
+    return np.vstack(parts)
 
 
 def icgc_tiles_from_geojson(
@@ -371,3 +421,137 @@ def get_tile_info(tile_id: str) -> Optional[Dict]:
             }
     
     return None
+
+
+# ======================================================================================
+# ACQUISITION DATES
+# ======================================================================================
+
+ICGC_LIDAR_METADATA_URL = (
+    "https://datacloud.ide.cat/metadades/lidar-territorial-metadades.zip"
+)
+
+
+def icgc_lidar_metadata(
+    cache_dir: str,
+    *,
+    url: str = ICGC_LIDAR_METADATA_URL,
+    refresh: bool = False,
+) -> gpd.GeoDataFrame:
+    """
+    Load the ICGC territorial LiDAR metadata: one polygon per 1 km tile carrying
+    the flight window, point density and class list.
+
+    The archive is downloaded once and cached, so repeat calls are offline.
+
+    Args:
+        cache_dir: Where to keep the downloaded archive and its extraction.
+        url: Override the source archive.
+        refresh: Download again even if the cache is populated.
+
+    Returns:
+        GeoDataFrame with CODI_UNIT, NOM_FITXER, DATA_INICI, DATA_FI (as dates),
+        DENSITAT, CLASSES and the tile geometry.
+
+    Example:
+        >>> meta = icgc_lidar_metadata("/mnt/data/greenshadow/icgc")
+        >>> meta[["CODI_UNIT", "DATA_INICI", "DATA_FI", "DENSITAT"]].head(2)
+    """
+    import zipfile
+
+    cache = os.path.join(cache_dir, "lidar_metadata")
+    os.makedirs(cache, exist_ok=True)
+    archive = os.path.join(cache, os.path.basename(url))
+
+    if refresh or not os.path.exists(archive) or os.path.getsize(archive) == 0:
+        info(f"Downloading ICGC LiDAR metadata from {url}")
+        with _session().get(url, stream=True, timeout=300) as response:
+            response.raise_for_status()
+            with open(archive, "wb") as fh:
+                for chunk in response.iter_content(chunk_size=1 << 20):
+                    fh.write(chunk)
+
+    with zipfile.ZipFile(archive) as zf:
+        zf.extractall(cache)
+
+    shapefiles = sorted(
+        os.path.join(cache, name)
+        for name in os.listdir(cache)
+        if name.lower().endswith(".shp")
+    )
+    if not shapefiles:
+        raise FileNotFoundError(f"No shapefile inside {archive}")
+
+    gdf = gpd.read_file(shapefiles[-1])
+    for column in ("DATA_INICI", "DATA_FI"):
+        if column in gdf.columns:
+            gdf[column] = pd.to_datetime(gdf[column], errors="coerce")
+
+    return gdf
+
+
+def icgc_lidar_acquisition_date(
+    aoi: Union[str, dict, BaseGeometry],
+    cache_dir: str,
+    *,
+    aoi_epsg: int = 4326,
+    statistic: str = "mean",
+    **kwargs,
+) -> Optional[pd.Timestamp]:
+    """
+    Representative LiDAR flight date over an area of interest.
+
+    Each tile is reduced to the midpoint of its flight window, then the tiles
+    covering the AOI are combined, weighted by how much of the AOI each one
+    covers. Feed the result to ``greenshadow.shader.vegetation_growth`` to age
+    the canopy from the flight to the year being simulated.
+
+    Args:
+        aoi: Area of interest (WKT, GeoJSON mapping or shapely geometry).
+        cache_dir: Metadata cache directory, see ``icgc_lidar_metadata``.
+        aoi_epsg: CRS of the AOI.
+        statistic: "mean" (area-weighted), "median", "min" or "max".
+        **kwargs: Forwarded to ``icgc_lidar_metadata``.
+
+    Returns:
+        A pandas Timestamp, or None when no tile intersects the AOI.
+
+    Example:
+        >>> flown = icgc_lidar_acquisition_date(aoi, "/mnt/data/greenshadow/icgc")
+        >>> growth = gs.shader.vegetation_growth(flown, 2030)
+    """
+    meta = icgc_lidar_metadata(cache_dir, **kwargs)
+
+    geom = _to_shapely(aoi)
+    if str(aoi_epsg) not in str(meta.crs):
+        geom = gpd.GeoSeries([geom], crs=f"EPSG:{aoi_epsg}").to_crs(meta.crs).iloc[0]
+
+    hit = meta[meta.intersects(geom)].copy()
+    if hit.empty:
+        warning("No ICGC LiDAR metadata tile intersects the AOI")
+        return None
+
+    midpoint = hit.DATA_INICI + (hit.DATA_FI - hit.DATA_INICI) / 2
+    midpoint = midpoint.fillna(hit.DATA_INICI).fillna(hit.DATA_FI)
+    valid = midpoint.notna()
+    if not valid.any():
+        warning("ICGC LiDAR metadata has no usable flight dates over the AOI")
+        return None
+
+    midpoint = midpoint[valid]
+
+    if statistic == "median":
+        return pd.Timestamp(midpoint.median())
+    if statistic == "min":
+        return pd.Timestamp(midpoint.min())
+    if statistic == "max":
+        return pd.Timestamp(midpoint.max())
+    if statistic != "mean":
+        raise ValueError(f"statistic must be mean, median, min or max; got {statistic!r}")
+
+    weight = hit[valid].geometry.intersection(geom).area.to_numpy(dtype=float)
+    if weight.sum() <= 0:
+        weight = np.ones(len(midpoint))
+
+    epoch = midpoint.astype("int64").to_numpy()
+    return pd.Timestamp(int(np.average(epoch, weights=weight)))

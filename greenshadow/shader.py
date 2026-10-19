@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 import fnmatch
 import math
-from typing import List, Dict, Optional, Tuple, Any, Sequence
+from typing import List, Dict, NamedTuple, Optional, Tuple, Any, Sequence
 import pandas as pd
 from rasterio.enums import Resampling
 from rasterio.warp import reproject
@@ -144,6 +144,786 @@ def _cast_shadow_mask(
 
     return lit, valid
 
+# ======================================================================================
+# SEMI-TRANSPARENT VEGETATION
+#
+# The plain cast-shadow model above treats every DSM pixel as an opaque wall, which
+# turns a tree into an extruded column and its shadow into a hard black blob. The
+# functions below replace that for vegetation with a participating medium:
+#
+#   * high vegetation is resolved into individual tree crowns, each a half-ellipsoid
+#     sized from the canopy height H = DSM - DEM (see ``detect_tree_crowns``);
+#   * low and medium vegetation keeps the DSM column, which is a fair description of
+#     a shrub and has no treetop to shape;
+#   * the ray-march accumulates the *path length* through that medium instead of
+#     returning a lit/unlit bit (see ``cast_canopy_path_lengths``).
+#
+# Path length is stored per LiDAR height class and is independent of the season, so
+# one hillshade serves every month of the year: the month only enters at consumption
+# time through the extinction coefficient (``vegetation_extinction`` /
+# ``apply_canopy_transmittance``). That is what keeps the (azimuth, altitude)
+# hillshade cache usable for a full-year run.
+#
+# Everything here is opt-in. With ``canopy=None`` the hillshade pipeline follows the
+# original opaque path and produces byte-identical single-band output.
+# ======================================================================================
+
+# Fraction of the beam stopped by one full vertical crossing of the crown.
+# rows = leaf type (deciduous / evergreen), then height class, then month.
+VEGETATION_SHADOWING = np.array(
+    [
+        # DECIDUOUS = 0
+        [
+            [0.10, 0.10, 0.15, 0.25, 0.35, 0.45, 0.50, 0.50, 0.40, 0.25, 0.15, 0.10],
+            [0.20, 0.20, 0.30, 0.50, 0.65, 0.75, 0.80, 0.80, 0.70, 0.50, 0.30, 0.20],
+            [0.30, 0.30, 0.40, 0.65, 0.80, 0.88, 0.92, 0.92, 0.85, 0.65, 0.45, 0.30],
+        ],
+
+        # EVERGREEN = 1
+        [
+            [0.30, 0.30, 0.32, 0.35, 0.38, 0.42, 0.45, 0.45, 0.42, 0.38, 0.32, 0.30],
+            [0.55, 0.55, 0.58, 0.60, 0.65, 0.70, 0.75, 0.75, 0.70, 0.65, 0.58, 0.55],
+            [0.75, 0.75, 0.78, 0.80, 0.85, 0.88, 0.90, 0.90, 0.88, 0.85, 0.80, 0.75],
+        ],
+    ],
+    dtype=np.float32,
+)
+
+# ICGC LiDAR class -> index into VEGETATION_SHADOWING (-1 = not vegetation).
+ICGC_DSM_CLASS_TO_HEIGHT_INDEX = np.array(
+    [-1, -1, -1, 0, 1, 2], dtype=np.int8
+)
+
+# Nominal crown thickness each row of VEGETATION_SHADOWING is calibrated against.
+# The table gives a *total* attenuation; turning it into an extinction coefficient
+# needs the thickness that attenuation refers to. These follow the ICGC class
+# definitions (low 0.15-2 m, medium 2-5 m, high > 5 m).
+VEGETATION_REFERENCE_THICKNESS_M = np.array([1.0, 2.5, 6.0], dtype=np.float32)
+
+N_VEGETATION_CLASSES = 3
+
+# Bands 2-4 of a canopy hillshade, in the order of ICGC_DSM_CLASS_TO_HEIGHT_INDEX.
+CANOPY_BAND_NAMES = (
+    "canopy_path_low_m",
+    "canopy_path_medium_m",
+    "canopy_path_high_m",
+)
+
+# Stamped on canopy hillshades so readers cannot mistake one for a plain hillshade
+# and silently drop the vegetation attenuation.
+CANOPY_RASTER_TAGS = {"GREENSHADOW_CANOPY": "path_lengths_m"}
+
+
+class CanopyModel(NamedTuple):
+    """
+    The semi-transparent canopy, on the DSM grid.
+
+    crown_top / crown_base
+        Upper and lower envelope of the medium, in metres above the vertical datum.
+        Only meaningful where ``class_index >= 0``.
+    class_index
+        Height class of the medium at each pixel (0 low, 1 medium, 2 high, -1 none).
+        Selects which path-length band the ray-march writes into.
+    opaque
+        The surface that still blocks the beam completely: the DSM everywhere except
+        vegetation, dropping to the under-canopy surface beneath a crown.
+    render_surface
+        DSM with crowns replaced by their own envelope, so the local hillshade draws
+        domes instead of LiDAR speckle.
+    trees
+        Per-tree table (row, col, height_m, crown_radius_m) for inspection.
+    """
+
+    crown_top: np.ndarray
+    crown_base: np.ndarray
+    class_index: np.ndarray
+    opaque: np.ndarray
+    render_surface: np.ndarray
+    trees: dict
+
+
+class VegetationGrowth(NamedTuple):
+    """
+    How much the canopy is assumed to have grown between the LiDAR flight and the
+    year being simulated. ``years`` is negative when simulating before the flight.
+
+    Height and crown diameter are both scaled the same way::
+
+        H' = min(H * height_factor + height_gain_m, max_height_m)
+        D' = D * crown_factor + crown_gain_m
+    """
+
+    years: float = 0.0
+    height_gain_m: float = 0.0
+    crown_gain_m: float = 0.0
+    height_factor: float = 1.0
+    crown_factor: float = 1.0
+    max_height_m: float = 40.0
+
+    @property
+    def is_identity(self) -> bool:
+        return (
+            self.height_gain_m == 0.0
+            and self.crown_gain_m == 0.0
+            and self.height_factor == 1.0
+            and self.crown_factor == 1.0
+        )
+
+
+NO_GROWTH = VegetationGrowth()
+
+
+def _as_date(value) -> Optional[dt.date]:
+    """Accept a date, datetime, ISO string, or bare year."""
+    if value is None:
+        return None
+    if isinstance(value, dt.datetime):
+        return value.date()
+    if isinstance(value, dt.date):
+        return value
+    if isinstance(value, (int, np.integer)):
+        return dt.date(int(value), 7, 1)      # mid-year, so a bare year is unbiased
+    if isinstance(value, str):
+        return dt.date.fromisoformat(value[:10])
+    if isinstance(value, pd.Timestamp):
+        return value.date()
+    raise TypeError(f"Cannot interpret {value!r} as a date")
+
+
+def vegetation_growth(
+    lidar_date=None,
+    simulation_date=None,
+    *,
+    height_rate_m_per_year: float = 0.25,
+    crown_rate_m_per_year: float = 0.20,
+    relative_rate_per_year: Optional[float] = None,
+    max_height_m: float = 40.0,
+) -> VegetationGrowth:
+    """
+    Build the growth correction between a LiDAR acquisition and a simulated year.
+
+    LiDAR is a snapshot. Simulating 2030 shading off a 2022 flight with the trees
+    frozen at their 2022 size systematically under-shades; this ages them forward.
+
+    Two ways to express the rate, and they compose:
+
+    * **additive** (default) - ``height_rate_m_per_year`` metres of height and
+      ``crown_rate_m_per_year`` metres of crown *diameter* per year. Reasonable
+      for established urban trees, which grow roughly linearly over a decade.
+    * **relative** - set ``relative_rate_per_year`` (e.g. 0.02 for 2 %/year) to
+      scale multiplicatively instead, which suits young or fast-growing stands.
+
+    Args:
+        lidar_date: When the point cloud was flown. For ICGC data see
+            ``greenshadow.lidar.icgc_lidar_acquisition_date``.
+        simulation_date: The date or year being simulated.
+        height_rate_m_per_year: Additive height growth.
+        crown_rate_m_per_year: Additive crown *diameter* growth.
+        relative_rate_per_year: If given, use multiplicative growth instead of additive.
+        max_height_m: Hard cap on grown tree height.
+
+    Returns:
+        A ``VegetationGrowth``. With either date missing it is the identity, so
+        growth stays off unless it was asked for.
+
+    Example:
+        >>> flown = gs.lidar.icgc_lidar_acquisition_date(aoi)      # date(2022, 7, 3)
+        >>> growth = gs.shader.vegetation_growth(flown, 2030)
+        >>> growth.years, round(growth.height_gain_m, 2)
+        (7.5, 1.88)
+    """
+    d0 = _as_date(lidar_date)
+    d1 = _as_date(simulation_date)
+    if d0 is None or d1 is None:
+        return VegetationGrowth(max_height_m=max_height_m)
+
+    years = (d1 - d0).days / 365.25
+
+    if relative_rate_per_year is not None:
+        factor = float((1.0 + relative_rate_per_year) ** years)
+        return VegetationGrowth(
+            years=years,
+            height_factor=factor,
+            crown_factor=factor,
+            max_height_m=max_height_m,
+        )
+
+    return VegetationGrowth(
+        years=years,
+        height_gain_m=float(height_rate_m_per_year * years),
+        crown_gain_m=float(crown_rate_m_per_year * years),
+        max_height_m=max_height_m,
+    )
+
+
+def vegetation_extinction(
+    month: int,
+    *,
+    leaf_type: int = 0,
+    reference_thickness_m: Optional[Sequence[float]] = None,
+) -> np.ndarray:
+    """
+    Beer-Lambert extinction coefficients [1/m], one per LiDAR height class.
+
+    ``VEGETATION_SHADOWING`` gives the fraction ``s`` stopped by a full vertical
+    crossing of ``reference_thickness_m`` metres of crown, so
+    ``mu = -ln(1 - s) / thickness``. Every other ray direction then follows from
+    its own path length, which is what makes crown edges lighter than crown centres.
+
+    Args:
+        month: 1-12.
+        leaf_type: 0 deciduous, 1 evergreen.
+        reference_thickness_m: Override the nominal crown thickness per class.
+
+    Returns:
+        float32 array of 3 coefficients, ordered low / medium / high vegetation.
+    """
+    if not 1 <= int(month) <= 12:
+        raise ValueError(f"month must be 1-12, got {month}")
+
+    thickness = (
+        VEGETATION_REFERENCE_THICKNESS_M
+        if reference_thickness_m is None
+        else np.asarray(reference_thickness_m, dtype=np.float32)
+    )
+    s = VEGETATION_SHADOWING[int(leaf_type), :, int(month) - 1]
+    return (-np.log(np.clip(1.0 - s, 1e-3, 1.0)) / np.maximum(thickness, 0.1)).astype(
+        np.float32
+    )
+
+
+def apply_canopy_transmittance(
+    base: np.ndarray,
+    path_lengths: np.ndarray,
+    month: int,
+    *,
+    leaf_type: int = 0,
+    reference_thickness_m: Optional[Sequence[float]] = None,
+) -> np.ndarray:
+    """
+    Combine an opaque-shadow hillshade with its canopy path-length bands.
+
+    Args:
+        base: Band 1 of a canopy hillshade - local shading with opaque shadows only.
+        path_lengths: Bands 2-4, shape (3, H, W), metres of canopy crossed per class.
+        month: 1-12, selects the leaf-on / leaf-off state.
+        leaf_type: 0 deciduous, 1 evergreen.
+        reference_thickness_m: Passed through to ``vegetation_extinction``.
+
+    Returns:
+        float32 direct-beam fraction in [0, 1].
+    """
+    mu = vegetation_extinction(
+        month, leaf_type=leaf_type, reference_thickness_m=reference_thickness_m
+    )
+    optical_depth = np.tensordot(mu, path_lengths, axes=(0, 0))
+    return (base * np.exp(-optical_depth)).astype(np.float32)
+
+
+# --------------------------------------------------------------------------------------
+# Tree crown detection and rasterisation
+# --------------------------------------------------------------------------------------
+@njit(cache=True)
+def _suppress_overlapping_crowns(order_r, order_c, chm, radius_px, claimed):
+    """Greedy non-maximum suppression: the tallest pixel wins and claims its crown."""
+    n = order_r.size
+    tr = np.empty(n, np.int32)
+    tc = np.empty(n, np.int32)
+    th = np.empty(n, np.float32)
+    k = 0
+    H, W = chm.shape
+
+    for idx in range(n):
+        r = order_r[idx]
+        c = order_c[idx]
+        if claimed[r, c]:
+            continue
+
+        rad = radius_px[r, c]
+        ri = int(rad) + 1
+        r0 = max(0, r - ri); r1 = min(H, r + ri + 1)
+        c0 = max(0, c - ri); c1 = min(W, c + ri + 1)
+
+        for rr in range(r0, r1):
+            dr = rr - r
+            for cc in range(c0, c1):
+                dc = cc - c
+                if dr * dr + dc * dc <= rad * rad:
+                    claimed[rr, cc] = True
+
+        tr[k] = r
+        tc[k] = c
+        th[k] = chm[r, c]
+        k += 1
+
+    return tr[:k], tc[:k], th[:k]
+
+
+def detect_tree_crowns(
+    chm: np.ndarray,
+    high_veg_mask: np.ndarray,
+    pixel_size: float,
+    *,
+    min_tree_height_m: float = 3.0,
+    crown_a: float = 1.00,
+    crown_b: float = 0.80,
+    smooth_sigma_m: float = 1.50,
+    max_crown_radius_m: float = 9.0,
+    observed_radius_factor: float = 2.0,
+    growth: VegetationGrowth = NO_GROWTH,
+):
+    """
+    Find individual tree tops on the canopy height model and size their crowns.
+
+    Crown diameter follows the usual allometry ``D = a * H^b`` with H = DSM - DEM,
+    then it is capped by how much crown the point cloud actually shows around the
+    peak, so a single street tree cannot inherit a forest-sized crown.
+
+    Args:
+        chm: Canopy height model (DSM - DEM), metres.
+        high_veg_mask: True on high-vegetation pixels.
+        pixel_size: Raster resolution in metres.
+        min_tree_height_m: Peaks shorter than this are not trees.
+        crown_a: Allometric coefficient a.
+        crown_b: Allometric exponent b.
+        smooth_sigma_m: Gaussian smoothing before peak detection. Raise it to merge
+            a noisy canopy into fewer, larger crowns.
+        max_crown_radius_m: Hard cap on crown radius.
+        observed_radius_factor: How far the crown may exceed the inscribed radius of
+            its own LiDAR blob. LiDAR under-represents thin crown edges, so > 1.
+        growth: Ages the trees forward, see ``vegetation_growth``.
+
+    Returns:
+        (rows, cols, height_m, crown_radius_m), one entry per tree.
+    """
+    sigma_px = max(smooth_sigma_m / pixel_size, 0.3)
+    chm_s = ndi.gaussian_filter(
+        np.where(high_veg_mask, chm, 0.0).astype(np.float32), sigma_px
+    )
+    chm_s[~high_veg_mask] = 0.0
+
+    # Detection runs on the canopy as flown, so growth never changes *which* trees
+    # exist - only how big the ones found are. Ageing happens at the end.
+
+    # allometric crown radius per candidate pixel, in metres
+    radius_m = 0.5 * crown_a * np.power(np.maximum(chm_s, 0.0), crown_b)
+    np.clip(radius_m, 0.0, max_crown_radius_m, out=radius_m)
+
+    # how much crown the point cloud actually shows around each pixel
+    observed_r_m = ndi.distance_transform_edt(
+        high_veg_mask, sampling=pixel_size
+    ).astype(np.float32)
+    radius_m = np.minimum(radius_m, observed_r_m * observed_radius_factor)
+    radius_m = np.maximum(radius_m, 1.0)
+
+    candidates = high_veg_mask & (chm_s >= min_tree_height_m)
+    if not candidates.any():
+        empty_i = np.empty(0, np.int32)
+        empty_f = np.empty(0, np.float32)
+        return empty_i, empty_i, empty_f, empty_f
+
+    # a peak must dominate a window scaled to its own crown
+    window = int(max(3, 2 * np.median(radius_m[candidates]) / pixel_size // 2 * 2 + 1))
+    peaks = candidates & (chm_s >= ndi.maximum_filter(chm_s, size=window))
+
+    rr, cc = np.nonzero(peaks)
+    order = np.argsort(-chm_s[rr, cc])
+    rr = rr[order].astype(np.int32)
+    cc = cc[order].astype(np.int32)
+
+    claimed = np.zeros(chm.shape, dtype=np.bool_)
+    tr, tc, th = _suppress_overlapping_crowns(
+        rr, cc, chm_s, (radius_m / pixel_size).astype(np.float32), claimed
+    )
+    trad = radius_m[tr, tc]
+
+    if not growth.is_identity:
+        # Applied after the observed-footprint cap on purpose: a tree that has
+        # grown for a decade is genuinely wider than the blob the flight saw.
+        th = np.clip(
+            th * growth.height_factor + growth.height_gain_m,
+            0.5, growth.max_height_m,
+        ).astype(np.float32)
+        trad = np.clip(
+            trad * growth.crown_factor + 0.5 * growth.crown_gain_m,
+            1.0, max_crown_radius_m,
+        ).astype(np.float32)
+
+    return tr, tc, th, trad
+
+
+@njit(cache=True)
+def _paint_crowns(
+    tr, tc, th, trad_px, ground, crown_top, crown_base, class_index, crown_ratio
+):
+    """
+    Paint every tree as a half-ellipsoid crown standing on its trunk:
+    horizontal semi-axis = allometric crown radius, vertical semi-axis =
+    crown_ratio * H / 2. Overlapping crowns take the union (max top, min base).
+    """
+    H, W = crown_top.shape
+
+    for t in range(tr.size):
+        r = tr[t]
+        c = tc[t]
+        h = th[t]
+        rad = trad_px[t]
+        if rad < 0.5 or h <= 0.0:
+            continue
+
+        depth = crown_ratio * h              # vertical extent of the crown
+        z_centre = ground[r, c] + h - 0.5 * depth
+        semi_z = 0.5 * depth
+
+        ri = int(rad) + 1
+        r0 = max(0, r - ri); r1 = min(H, r + ri + 1)
+        c0 = max(0, c - ri); c1 = min(W, c + ri + 1)
+        inv_r2 = 1.0 / (rad * rad)
+
+        for rr in range(r0, r1):
+            dr = rr - r
+            for cc in range(c0, c1):
+                dc = cc - c
+                q = (dr * dr + dc * dc) * inv_r2
+                if q > 1.0:
+                    continue
+
+                half = semi_z * np.sqrt(1.0 - q)   # ellipsoid half-thickness here
+                top = z_centre + half
+                base = z_centre - half
+
+                if class_index[rr, cc] < 0:
+                    class_index[rr, cc] = 2        # high vegetation
+                    crown_top[rr, cc] = top
+                    crown_base[rr, cc] = base
+                else:
+                    if top > crown_top[rr, cc]:
+                        crown_top[rr, cc] = top
+                    if base < crown_base[rr, cc]:
+                        crown_base[rr, cc] = base
+
+
+def build_canopy_model(
+    dsm: np.ndarray,
+    dem: np.ndarray,
+    classes: np.ndarray,
+    *,
+    pixel_size: float,
+    under_canopy: Optional[np.ndarray] = None,
+    low_veg_classes: Sequence[int] = (3, 4),
+    high_veg_classes: Sequence[int] = (5,),
+    crown_ratio: float = 0.65,
+    growth: VegetationGrowth = NO_GROWTH,
+    **crown_kwargs,
+) -> CanopyModel:
+    """
+    Turn DSM + DEM + LiDAR classes into the semi-transparent canopy the ray-march needs.
+
+    High-vegetation pixels are resolved into ellipsoidal tree crowns sized from
+    H = DSM - DEM. Low and medium vegetation keeps the DSM column. Any
+    high-vegetation pixel no crown disc reached falls back to the column too, so
+    the gaps between packed crowns still attenuate.
+
+    Args:
+        dsm: Digital surface model, metres.
+        dem: Bare-earth model on the same grid, metres.
+        classes: LiDAR class raster on the same grid (ICGC codes).
+        pixel_size: Resolution in metres.
+        under_canopy: Surface the beam sees beneath a crown, typically the
+            vegetation-free DSM. Defaults to ``dem``.
+        low_veg_classes: Classes kept as a DSM column.
+        high_veg_classes: Classes resolved into tree crowns.
+        crown_ratio: Crown depth as a fraction of tree height.
+        growth: Ages the canopy forward, see ``vegetation_growth``.
+        **crown_kwargs: Forwarded to ``detect_tree_crowns``.
+
+    Returns:
+        A ``CanopyModel`` on the input grid.
+    """
+    dsm = np.asarray(dsm, dtype=np.float32)
+    dem = np.asarray(dem, dtype=np.float32)
+    chm = np.clip(dsm - dem, 0.0, None).astype(np.float32)
+
+    high_mask = np.isin(classes, tuple(high_veg_classes))
+    low_mask = np.isin(classes, tuple(low_veg_classes))
+    veg_mask = high_mask | low_mask
+
+    under = dem if under_canopy is None else np.asarray(under_canopy, dtype=np.float32)
+    opaque = np.where(veg_mask, np.minimum(under, dsm), dsm).astype(np.float32)
+
+    crown_top = np.zeros_like(dsm)
+    crown_base = np.zeros_like(dsm)
+    class_index = np.full(dsm.shape, -1, dtype=np.int8)
+
+    # ---- high vegetation: ellipsoidal treetops ----
+    tr, tc, th, trad = detect_tree_crowns(
+        chm, high_mask, pixel_size, growth=growth, **crown_kwargs
+    )
+    if tr.size:
+        _paint_crowns(
+            tr, tc, th,
+            (trad / pixel_size).astype(np.float32),
+            dem, crown_top, crown_base, class_index,
+            float(crown_ratio),
+        )
+
+    # ---- low/medium vegetation, and any high-veg pixel no crown reached ----
+    column = veg_mask & (class_index < 0)
+    if column.any():
+        top = dsm
+        if not growth.is_identity:
+            grown = dem + np.clip(
+                chm * growth.height_factor + growth.height_gain_m,
+                0.0, growth.max_height_m,
+            )
+            top = np.where(high_mask, np.maximum(grown, dsm), dsm).astype(np.float32)
+        base = np.minimum(opaque, top)
+        crown_top[column] = top[column]
+        crown_base[column] = base[column]
+        for cls_code in tuple(low_veg_classes) + tuple(high_veg_classes):
+            idx = int(ICGC_DSM_CLASS_TO_HEIGHT_INDEX[cls_code])
+            if idx < 0:
+                continue
+            here = column & (classes == cls_code)
+            class_index[here] = idx
+
+    # a crown must have some thickness, otherwise it contributes no optical depth
+    crown_top = np.maximum(crown_top, crown_base + 0.3).astype(np.float32)
+    crown_top[class_index < 0] = 0.0
+    crown_base[class_index < 0] = 0.0
+
+    render_surface = np.where(
+        class_index >= 0, np.maximum(crown_top, opaque), dsm
+    ).astype(np.float32)
+
+    return CanopyModel(
+        crown_top=crown_top,
+        crown_base=crown_base,
+        class_index=class_index,
+        opaque=opaque,
+        render_surface=render_surface,
+        trees={
+            "row": tr,
+            "col": tc,
+            "height_m": th,
+            "crown_radius_m": trad,
+        },
+    )
+
+
+def build_canopy_model_from_rasters(
+    dsm_path: str,
+    dem_path: str,
+    class_path: str,
+    *,
+    under_canopy_path: Optional[str] = None,
+    growth: VegetationGrowth = NO_GROWTH,
+    **kwargs,
+) -> CanopyModel:
+    """
+    Read the rasters a canopy model needs and build it on the DSM grid.
+
+    DEM, class and under-canopy rasters are reprojected onto the DSM grid, so they
+    need not share its extent. Holes are nearest-filled so rays stay continuous.
+
+    Args:
+        dsm_path: Digital surface model - defines the output grid.
+        dem_path: Bare-earth model.
+        class_path: LiDAR class raster (ICGC codes).
+        under_canopy_path: Vegetation-free DSM. Falls back to the DEM.
+        growth: See ``vegetation_growth``.
+        **kwargs: Forwarded to ``build_canopy_model``.
+
+    Returns:
+        A ``CanopyModel`` aligned to the DSM.
+    """
+    with rasterio.open(dsm_path) as src:
+        dsm = src.read(1).astype(np.float32)
+        profile = src.profile.copy()
+        pixel_size = abs(src.transform.a)
+        dsm_nodata = src.nodata
+
+    def _on_dsm_grid(path, resampling, dtype, fill):
+        with rasterio.open(path) as src:
+            out = np.full((profile["height"], profile["width"]), fill, dtype=dtype)
+            reproject(
+                source=rasterio.band(src, 1),
+                destination=out,
+                src_transform=src.transform,
+                src_crs=src.crs,
+                src_nodata=src.nodata,
+                dst_transform=profile["transform"],
+                dst_crs=profile["crs"],
+                dst_nodata=fill,
+                resampling=resampling,
+            )
+        return out
+
+    dem = _on_dsm_grid(dem_path, Resampling.bilinear, np.float32, np.nan)
+    classes = _on_dsm_grid(class_path, Resampling.nearest, np.uint8, 255)
+    under = (
+        _on_dsm_grid(under_canopy_path, Resampling.bilinear, np.float32, np.nan)
+        if under_canopy_path
+        else None
+    )
+
+    invalid = ~np.isfinite(dsm)
+    if dsm_nodata is not None:
+        invalid |= dsm == dsm_nodata
+
+    def _fill(arr):
+        bad = ~np.isfinite(arr)
+        if bad.any() and not bad.all():
+            _, (iy, ix) = ndi.distance_transform_edt(bad, return_indices=True)
+            arr[bad] = arr[iy[bad], ix[bad]]
+        return arr
+
+    dsm[invalid] = np.nan
+    dsm = _fill(dsm)
+    dem = _fill(dem)
+    if under is not None:
+        under = _fill(under)
+
+    return build_canopy_model(
+        dsm, dem, classes,
+        pixel_size=pixel_size,
+        under_canopy=under,
+        growth=growth,
+        **kwargs,
+    )
+
+
+# --------------------------------------------------------------------------------------
+# Ray-march through the canopy
+# --------------------------------------------------------------------------------------
+@njit(parallel=True, fastmath=True, cache=True)
+def _canopy_path_scan(
+    z_rot, opaque_rot, ctop_rot, cbase_rot, cidx_rot, nodata_rot,
+    dz_per_px, ds, zmax, max_steps,
+):
+    """
+    Sun comes from the left of the rotated frame. For every pixel, march column by
+    column towards it, accumulating metres of canopy crossed per height class and
+    stopping dead at the first opaque hit.
+    """
+    H, W = z_rot.shape
+    lit = np.ones((H, W), dtype=np.uint8)
+    path = np.zeros((3, H, W), dtype=np.float32)
+
+    for i in prange(H):
+        for j in range(W):
+            if nodata_rot[i, j]:
+                continue
+
+            ray = z_rot[i, j]
+            jj = j
+            for _ in range(max_steps):
+                jj -= 1
+                if jj < 0:
+                    break
+
+                ray += dz_per_px
+                if ray > zmax:
+                    break
+                if nodata_rot[i, jj]:
+                    continue
+
+                if opaque_rot[i, jj] >= ray:
+                    lit[i, j] = 0
+                    # fully dark already: the path lengths would never be used
+                    path[0, i, j] = 0.0
+                    path[1, i, j] = 0.0
+                    path[2, i, j] = 0.0
+                    break
+
+                ci = cidx_rot[i, jj]
+                if ci >= 0 and cbase_rot[i, jj] <= ray <= ctop_rot[i, jj]:
+                    path[ci, i, j] += ds
+
+    return lit, path
+
+
+def _rotate(arr, theta, order=0, cval=0.0):
+    return ndi.rotate(
+        arr, theta, reshape=False, order=order, mode="constant",
+        cval=cval, prefilter=False,
+    )
+
+
+def cast_canopy_path_lengths(
+    canopy: CanopyModel,
+    pixel_size: float,
+    azimuth_deg: float,
+    altitude_deg: float,
+    *,
+    nodata_mask: Optional[np.ndarray] = None,
+    max_steps: int = 20000,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Ray-march the canopy for one sun position.
+
+    Args:
+        canopy: The model from ``build_canopy_model``.
+        pixel_size: Resolution in metres.
+        azimuth_deg: Solar azimuth, 0 = North, clockwise.
+        altitude_deg: Solar elevation in degrees.
+        nodata_mask: True where the DSM has no data.
+        max_steps: Safety cap on march length. The march normally stops far sooner,
+            when the ray clears the tallest obstacle in the scene.
+
+    Returns:
+        ``(lit, path_lengths, valid)`` where ``lit`` is the opaque shadow mask,
+        ``path_lengths`` has shape (3, H, W) in metres per height class, and
+        ``valid`` is the original footprint (rotation padding excluded).
+    """
+    shape = canopy.opaque.shape
+    if nodata_mask is None:
+        nodata_mask = np.zeros(shape, dtype=bool)
+
+    if altitude_deg <= 0:
+        return (
+            np.zeros(shape, dtype=bool),
+            np.zeros((N_VEGETATION_CLASSES,) + shape, dtype=np.float32),
+            ~nodata_mask,
+        )
+
+    theta = azimuth_deg + 90.0
+    below_everything = np.float32(-1.0e6)
+
+    z_rot = _rotate(canopy.render_surface, theta, cval=below_everything)
+    opaque_rot = _rotate(canopy.opaque, theta, cval=below_everything)
+    ctop_rot = _rotate(canopy.crown_top, theta, cval=0.0)
+    cbase_rot = _rotate(canopy.crown_base, theta, cval=0.0)
+    cidx_rot = _rotate(canopy.class_index, theta, cval=-1)
+    nodata_rot = _rotate(nodata_mask.astype(np.uint8), theta, cval=1) > 0
+
+    altitude = np.deg2rad(altitude_deg)
+    dz_per_px = np.float32(np.tan(altitude) * pixel_size)
+    ds = np.float32(pixel_size / max(np.cos(altitude), 1e-3))
+
+    inside = ~nodata_mask
+    zmax = np.float32(
+        max(
+            float(canopy.opaque[inside].max()) if inside.any() else 0.0,
+            float(canopy.crown_top.max()),
+        )
+    )
+
+    lit_rot, path_rot = _canopy_path_scan(
+        z_rot, opaque_rot, ctop_rot, cbase_rot, cidx_rot, nodata_rot,
+        dz_per_px, ds, zmax, int(max_steps),
+    )
+
+    lit = _rotate(lit_rot, -theta, cval=1) > 0
+    path = np.stack(
+        [_rotate(path_rot[k], -theta, order=1, cval=0.0) for k in range(path_rot.shape[0])]
+    )
+    np.clip(path, 0.0, None, out=path)
+
+    valid = _rotate(_rotate(inside.astype(np.uint8), theta, cval=0), -theta, cval=0) > 0
+    return lit, path.astype(np.float32), valid
+
+
 def _apply_dsm_shadow_to_hillshade(
     hillshade_path: str,
     dsm_path: str,
@@ -152,7 +932,16 @@ def _apply_dsm_shadow_to_hillshade(
     altitude: float,
     *,
     shadow_value: float = 1.0,
+    canopy: Optional[CanopyModel] = None,
 ):
+    """
+    Add cast shadows to a local hillshade.
+
+    With ``canopy=None`` this is the original opaque model: one band, every DSM
+    pixel blocks the beam. With a ``CanopyModel`` the output gains three more
+    bands holding the metres of canopy the beam crossed, per LiDAR height class,
+    so the season can be applied later without recomputing the geometry.
+    """
     with rasterio.open(dsm_path) as dsrc, rasterio.open(hillshade_path) as hsrc:
 
         dsm = dsrc.read(1).astype(np.float32)
@@ -173,14 +962,28 @@ def _apply_dsm_shadow_to_hillshade(
             )
             dsm[nodata_mask] = dsm[iy[nodata_mask], ix[nodata_mask]]
 
-        # Cast shadows
-        lit, valid = _cast_shadow_mask(
-            dsm,
-            pixel_size,
-            azimuth,
-            altitude,
-            nodata_mask=nodata_mask,
-        )
+        if canopy is None:
+            path_lengths = None
+            lit, valid = _cast_shadow_mask(
+                dsm,
+                pixel_size,
+                azimuth,
+                altitude,
+                nodata_mask=nodata_mask,
+            )
+        else:
+            if canopy.opaque.shape != dsm.shape:
+                raise ValueError(
+                    f"canopy model shape {canopy.opaque.shape} does not match the "
+                    f"DSM grid {dsm.shape}; build it from this DSM"
+                )
+            lit, path_lengths, valid = cast_canopy_path_lengths(
+                canopy,
+                pixel_size,
+                azimuth,
+                altitude,
+                nodata_mask=nodata_mask,
+            )
 
         # Apply shadows
         hs[~lit & valid] = shadow_value
@@ -188,9 +991,23 @@ def _apply_dsm_shadow_to_hillshade(
 
         profile = hsrc.profile.copy()
 
-        with rasterio.open(out_path, "w", **profile) as dst:
-            dst.write(hs.astype(profile["dtype"]), 1)
-            dst.update_tags(**hsrc.tags())
+        if path_lengths is None:
+            with rasterio.open(out_path, "w", **profile) as dst:
+                dst.write(hs.astype(profile["dtype"]), 1)
+                dst.update_tags(**hsrc.tags())
+        else:
+            # path lengths are metres, so the uint8 hillshade profile will not do
+            profile.update(dtype="float32", count=1 + N_VEGETATION_CLASSES)
+            path_lengths = path_lengths.astype(np.float32)
+            path_lengths[:, ~valid] = 0.0
+            with rasterio.open(out_path, "w", **profile) as dst:
+                dst.write(hs.astype(np.float32), 1)
+                for band, name in enumerate(CANOPY_BAND_NAMES, start=2):
+                    dst.write(path_lengths[band - 2], band)
+                    dst.set_band_description(band, name)
+                dst.set_band_description(1, "hillshade_opaque")
+                dst.update_tags(**hsrc.tags())
+                dst.update_tags(**CANOPY_RASTER_TAGS)
 
     return out_path
 
@@ -437,6 +1254,12 @@ def _apply_height_shadow_to_hillshade(
     try:
         for hf in tqdm(files, desc="Applying height-based shadows"):
             with rasterio.open(hf) as hs:
+                if "GREENSHADOW_CANOPY" in hs.tags():
+                    raise ValueError(
+                        f"{hf.name} carries canopy path-length bands, which this "
+                        f"per-pixel height test would silently drop. Regenerate the "
+                        f"hillshades with canopy=None to use height shadows."
+                    )
                 hs_band = hs.read(1)  # keep dtype as is (often uint8)
                 hs_mask = (hs.read_masks(1) != 0)  # True where valid
                 H, W = hs.height, hs.width
@@ -543,12 +1366,39 @@ def generate_multiple_hillshades_gdal(
     aoi=None,
     aoi_crs: str = "EPSG:4326",
     nodata_value: float = -9999.0,
+    canopy: Optional[CanopyModel] = None,
 ) -> list[str]:
     """
     Generate hillshades normalized to [0,1], AOI-masked.
+
+    Args:
+        canopy: Optional semi-transparent vegetation model from
+            ``build_canopy_model_from_rasters``. When given, trees stop being
+            opaque walls: each output gains three bands holding the metres of
+            canopy the beam crossed per LiDAR height class, and the local shading
+            is computed on the crown envelope so treetops read as domes. The
+            season is applied later by ``apply_canopy_transmittance``, so one
+            hillshade still serves every month. Leave it ``None`` for the
+            original single-band opaque behaviour.
     """
 
     os.makedirs(raster_dir, exist_ok=True)
+
+    # The local hillshade wants the crown envelope, not the raw LiDAR canopy top.
+    shading_dsm_path = dsm_path
+    render_tmp = None
+    if canopy is not None:
+        with rasterio.open(dsm_path) as src:
+            render_profile = src.profile.copy()
+        if canopy.render_surface.shape != (render_profile["height"], render_profile["width"]):
+            raise ValueError(
+                "canopy model does not match the DSM grid; build it from this DSM"
+            )
+        render_profile.update(dtype="float32", count=1, compress="deflate", predictor=3)
+        render_tmp = os.path.join(raster_dir, "_canopy_render_surface.tif")
+        with rasterio.open(render_tmp, "w", **render_profile) as dst:
+            dst.write(canopy.render_surface.astype(np.float32), 1)
+        shading_dsm_path = render_tmp
 
     valid_positions = []
     for i, (az, alt) in enumerate(azimuth_altitude):
@@ -576,7 +1426,7 @@ def generate_multiple_hillshades_gdal(
             hs_raw = _generate_hillshade_gdal(
                 results_dir=raster_dir,
                 when=when,
-                dsm_path=dsm_path,
+                dsm_path=shading_dsm_path,
                 azimuth=az,
                 altitude=alt,
                 zFactor=zFactor,
@@ -591,12 +1441,19 @@ def generate_multiple_hillshades_gdal(
                 out_path=hs_raw.replace("_raw", ""),
                 azimuth=az,
                 altitude=alt,
+                canopy=canopy,
             )
 
             with rasterio.open(final_path) as src:
                 hs = src.read(1).astype(np.float32)
+                # metres of canopy crossed, left in metres - only band 1 is a ratio
+                path_lengths = (
+                    src.read(list(range(2, src.count + 1))).astype(np.float32)
+                    if src.count > 1 else None
+                )
                 profile = src.profile.copy()
                 raster_crs = src.crs
+                tags = src.tags()
 
             # Normalize 0–255 → 0–1
             hs /= 255.0
@@ -610,6 +1467,8 @@ def generate_multiple_hillshades_gdal(
                 ).transform
                 aoi_mask = rasterize_aoi_mask(transform(transformer, aoi), final_path)
                 hs[~aoi_mask] = nodata_value
+                if path_lengths is not None:
+                    path_lengths[:, ~aoi_mask] = nodata_value
 
             profile.update(
                 dtype="float32",
@@ -620,6 +1479,12 @@ def generate_multiple_hillshades_gdal(
 
             with rasterio.open(out_path, "w", **profile) as dst:
                 dst.write(hs, 1)
+                if path_lengths is not None:
+                    dst.set_band_description(1, "hillshade_opaque")
+                    for band, name in enumerate(CANOPY_BAND_NAMES, start=2):
+                        dst.write(path_lengths[band - 2], band)
+                        dst.set_band_description(band, name)
+                    dst.update_tags(**tags)
 
             if hs_raw != final_path and os.path.exists(hs_raw):
                 os.remove(hs_raw)
@@ -631,12 +1496,16 @@ def generate_multiple_hillshades_gdal(
             return None
 
     results = []
-    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as ex:
-        for r in tqdm(ex.map(process_single, valid_positions),
-                      total=len(valid_positions),
-                      desc="Generating hillshades"):
-            if r:
-                results.append(r)
+    try:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as ex:
+            for r in tqdm(ex.map(process_single, valid_positions),
+                          total=len(valid_positions),
+                          desc="Generating hillshades"):
+                if r:
+                    results.append(r)
+    finally:
+        if render_tmp and os.path.exists(render_tmp):
+            os.remove(render_tmp)
 
     return results
 
@@ -745,6 +1614,155 @@ def _floor_to_step(x: np.ndarray, step: float, low: float, high: float) -> np.nd
     return low + step * np.floor((x_clamped - low) / step)
 
 
+#: Weather columns that describe the record rather than the weather, and are
+#: therefore not carried onto the solar table.
+_WEATHER_METADATA_COLUMNS = (
+    "time", "latitude", "longitude", "weatherStation", "sunPosition",
+    "sunAzimuthDiscrete", "sunElevationDiscrete", "sunElevation", "sunAzimuth",
+)
+
+#: How GHI is split into its direct and diffuse parts.
+IRRADIANCE_DECOMPOSITIONS = ("era5", "dirint", "disc", "erbs", "weather")
+
+
+def _attach_weather(
+    result_df: pd.DataFrame,
+    weather_df: Any,
+    *,
+    lat: float,
+    lon: float,
+    decomposition: str = "disc",
+    time_offset_minutes: float = -30.0,
+) -> pd.DataFrame:
+    """
+    Put the weather on the solar table, with GHI split at the table's own sun.
+
+    ERA5-Land's ``ssrd`` is all-sky: clouds are already in it, and in the GHI
+    the weather frame carries. What is not in it is the split into direct and
+    diffuse, which is what decides how much a shadow costs and how much a
+    tilted panel gains. That split is redone here, at the table's exact sun
+    position, rather than taken from the frame:
+
+    * ``time_offset_minutes`` moves each weather record to the middle of the
+      period it describes. An ERA5 value stamped T is the mean over the hour
+      before T, so -30 is right for ERA5 and ERA5-Land; leaving the stamp where
+      it is pins every hour's sunshine half an hour late, which tilts the whole
+      year towards the afternoon.
+    * ``decomposition`` picks the model; ``docs/irradiance_era5.md`` compares
+      them all against PVGIS-SARAH3, which is how ``"disc"`` became the
+      default: closest on the annual DNI and on tilted planes. ``"dirint"`` (Perez et al. 1992) reads
+      cloudiness from the clearness index **and** from how much it changes hour
+      to hour, which is what tells broken cloud from thin haze; ``"disc"`` uses
+      the clearness index alone; ``"erbs"`` is the classic diffuse-fraction
+      fit; ``"weather"`` keeps whatever DNI and DHI the frame already has.
+      ``"era5"`` does not model the split at all: it takes the beam fraction
+      ERA5's own clouds produced - ``directHorizontal`` over ``GHI_ERA5``,
+      both joined by ``weather.load_ERA5Land_with_direct_radiation`` - and
+      applies it to the frame's GHI. Without those columns it falls back to
+      ``"dirint"`` with a warning.
+
+    Adds or replaces the weather columns in place - ``GHI``, ``DNI``, ``DHI``
+    in W/m2 and ``clearness_index`` - and returns the frame.
+    """
+    import pvlib
+
+    if decomposition not in IRRADIANCE_DECOMPOSITIONS:
+        raise ValueError(f"decomposition must be one of {IRRADIANCE_DECOMPOSITIONS}")
+
+    weather = weather_df.to_pandas() if hasattr(weather_df, "to_pandas") else weather_df.copy()
+
+    stamps = pd.to_datetime(weather["time"])
+    stamps = stamps.dt.tz_localize("UTC") if stamps.dt.tz is None else stamps.dt.tz_convert("UTC")
+    weather.index = pd.DatetimeIndex(stamps) + pd.Timedelta(minutes=time_offset_minutes)
+    weather = weather.sort_index()
+    weather = weather[~weather.index.duplicated()]
+
+    columns = [
+        column for column in weather.columns
+        if column not in _WEATHER_METADATA_COLUMNS
+        and pd.api.types.is_numeric_dtype(weather[column])
+    ]
+
+    target = pd.DatetimeIndex(pd.to_datetime(result_df["datetime_utc"], utc=True))
+    union = weather.index.union(target)
+    values = (
+        weather[columns].reindex(union)
+        .interpolate(method="time", limit_area="inside")
+        .reindex(target)
+    )
+
+    for column in columns:
+        result_df[column] = values[column].to_numpy()
+
+    if "GHI" not in values:
+        return result_df
+
+    ghi = values["GHI"].clip(lower=0.0).fillna(0.0)
+
+    position = pvlib.solarposition.get_solarposition(target, lat, lon)
+    zenith = position["apparent_zenith"]
+    extra = pvlib.irradiance.get_extra_radiation(target)
+
+    result_df["clearness_index"] = pvlib.irradiance.clearness_index(
+        ghi, zenith, extra).to_numpy()
+
+    if decomposition == "weather":
+        return result_df
+
+    pressure = values["surfacePressure"] if "surfacePressure" in values else 101325.0
+
+    if decomposition == "era5" and not {"directHorizontal", "GHI_ERA5"} <= set(values):
+        warnings.warn("irradiance_decomposition='era5' needs the directHorizontal and "
+                      "GHI_ERA5 columns of load_ERA5Land_with_direct_radiation; "
+                      "falling back to 'dirint'")
+        decomposition = "dirint"
+
+    if decomposition == "era5":
+        # ERA5's beam share of its own global, applied to the frame's GHI: the
+        # finer ERA5-Land global keeps its say on how much light there was,
+        # and ERA5's clouds decide how much of it came straight from the sun.
+        global_era5 = values["GHI_ERA5"].to_numpy(dtype=float)
+        direct_era5 = values["directHorizontal"].to_numpy(dtype=float)
+        with np.errstate(invalid="ignore", divide="ignore"):
+            fraction = np.where(global_era5 > 0.0, direct_era5 / global_era5, 0.0)
+        fraction = np.clip(np.nan_to_num(fraction, nan=0.0), 0.0, 1.0)
+        cos_zenith = np.cos(np.radians(zenith.to_numpy()))
+        beam = fraction * ghi.to_numpy()
+        with np.errstate(invalid="ignore", divide="ignore"):
+            dni = np.where(cos_zenith > 1e-3, beam / np.maximum(cos_zenith, 1e-3), 0.0)
+        # An hourly mean over a sunrise hour, divided by the cosine at one
+        # instant of it, can exceed what reaches the top of the atmosphere;
+        # nothing at the surface does.
+        dni = np.minimum(dni, extra.to_numpy())
+    elif decomposition == "dirint":
+        dew = values["dewAirTemperature"] if "dewAirTemperature" in values else None
+        dni = pvlib.irradiance.dirint(
+            ghi, zenith, target, pressure=pressure, temp_dew=dew)
+    elif decomposition == "disc":
+        dni = pvlib.irradiance.disc(ghi, zenith, target, pressure=pressure)["dni"]
+    else:
+        dni = pvlib.irradiance.erbs(ghi, zenith, target)["dni"]
+
+    if decomposition == "era5" and "totalCloudCover" in values:
+        result_df["totalCloudCover"] = values["totalCloudCover"].to_numpy()
+
+    cos_zenith = np.cos(np.radians(zenith.to_numpy()))
+    dni = np.nan_to_num(np.asarray(dni, dtype=float), nan=0.0)
+    dni = np.where(cos_zenith > 0.0, np.clip(dni, 0.0, None), 0.0)
+
+    # The beam can never deliver more onto the horizontal than the global
+    # does: where a model overshoots - near the horizon, mostly - the beam is
+    # cut back and the diffuse is what is left, never negative.
+    beam = np.minimum(dni * np.clip(cos_zenith, 0.0, None), ghi.to_numpy())
+    dni = np.where(cos_zenith > 1e-3, beam / np.maximum(cos_zenith, 1e-3), 0.0)
+
+    result_df["GHI"] = ghi.to_numpy()
+    result_df["DNI"] = dni
+    result_df["DHI"] = ghi.to_numpy() - beam
+
+    return result_df
+
+
 def generate_azimuth_altitude_pairs_by_date(
     date: dt.date,
     lat: float,            # Madrid by default
@@ -755,6 +1773,8 @@ def generate_azimuth_altitude_pairs_by_date(
     solar_degrees_discretization: float = 1.0,
     only_daylight: bool = True,
     weather_df: Optional[Any] = None,
+    irradiance_decomposition: str = "disc",
+    weather_time_offset_minutes: float = -30.0,
 ) -> Dict[str, Any]:
     """
     Generate azimuth/altitude pairs for solar positions on a given date.
@@ -768,6 +1788,10 @@ def generate_azimuth_altitude_pairs_by_date(
         solar_degrees_discretization: Round positions to this many degrees
         only_daylight: Only include positions above horizon
         weather_df: Optional weather Pandas dataframe
+        irradiance_decomposition: How GHI is split into DNI and DHI at each
+            sun position; see ``_attach_weather``.
+        weather_time_offset_minutes: Shift from a weather record's stamp to
+            the middle of the period it averages; -30 for ERA5(-Land).
     
     Returns:
         Dictionary with 'df' containing DataFrame of positions and metadata
@@ -827,48 +1851,12 @@ def generate_azimuth_altitude_pairs_by_date(
     
     # Integrate weather data if provided
     if weather_df is not None:
-        try:
-            # Convert weather_df to pandas if it's a polars DataFrame
-            if hasattr(weather_df, 'to_pandas'):
-                weather_pd = weather_df.to_pandas()
-            else:
-                weather_pd = weather_df
-            
-            # Ensure time columns are datetime
-            result_df['datetime_local'] = pd.to_datetime(result_df['datetime_local'])
-            weather_pd['time'] = pd.to_datetime(weather_pd['time'])
-            
-            # Convert weather UTC time to local timezone for proper joining
-            tz = pytz.timezone(tz_name)
-            weather_pd['time_local'] = weather_pd['time'].dt.tz_convert(tz)
-            
-            # Set local time as index for resampling/interpolation
-            weather_indexed = weather_pd.set_index('time_local').sort_index()
-            
-            # Select weather columns to join (exclude time and spatial columns)
-            weather_cols = [col for col in weather_indexed.columns 
-                          if col not in ['time', 'latitude', 'longitude', 'weatherStation', 'sunPosition', 
-                                       'sunAzimuthDiscrete', 'sunElevationDiscrete']]
-            weather_subset = weather_indexed[weather_cols]
-            
-            # Resample weather data to match our granularity and interpolate
-            granularity_pandas = granularity.replace('PT', '').replace('M', 'min').replace('H', 'h')
-            weather_resampled = weather_subset.resample(granularity_pandas).interpolate(method='linear')
-            
-            # Create a temporary DataFrame with local times for joining
-            temp_df = result_df[['datetime_local']].copy()
-            temp_df = temp_df.set_index('datetime_local')
-            
-            # Left join with weather data using local time
-            joined = temp_df.join(weather_resampled, how='left')
-            
-            # Add weather columns to result DataFrame
-            for col in joined.columns:
-                result_df[col] = joined[col].values
-                
-        except Exception as e:
-            print(f"Warning: Failed to integrate weather data: {e}")
-            # Continue without weather data
+        _attach_weather(
+            result_df, weather_df,
+            lat=lat, lon=lon,
+            decomposition=irradiance_decomposition,
+            time_offset_minutes=weather_time_offset_minutes,
+        )
     
     return {
         'df': result_df,
@@ -894,11 +1882,14 @@ def generate_azimuth_altitude_pairs_by_year(
     solar_degrees_discretization: float = 1.0,
     only_daylight: bool = True,
     weather_df: Optional[Any] = None,
+    irradiance_decomposition: str = "disc",
+    weather_time_offset_minutes: float = -30.0,
 ) -> Dict[str, Any]:
     """
     Generate azimuth/altitude pairs for solar positions across a full year.
 
-    Includes optional weather integration (same semantics as daily function).
+    Includes optional weather integration (same semantics as daily function,
+    including ``irradiance_decomposition`` and ``weather_time_offset_minutes``).
     """
 
     start_date = dt.date(year, 1, 1)
@@ -999,58 +1990,15 @@ def generate_azimuth_altitude_pairs_by_year(
     )
 
     # ==================================================
-    # WEATHER INTEGRATION (IDENTICAL TO DAILY FUNCTION)
+    # WEATHER INTEGRATION (SAME AS THE DAILY FUNCTION)
     # ==================================================
     if weather_df is not None:
-        try:
-            if hasattr(weather_df, "to_pandas"):
-                weather_pd = weather_df.to_pandas()
-            else:
-                weather_pd = weather_df
-
-            result_df["datetime_local"] = pd.to_datetime(result_df["datetime_local"])
-            weather_pd["time"] = pd.to_datetime(weather_pd["time"])
-
-            tz = pytz.timezone(tz_name)
-            weather_pd["time_local"] = weather_pd["time"].dt.tz_convert(tz)
-
-            weather_indexed = weather_pd.set_index("time_local").sort_index()
-
-            weather_cols = [
-                c
-                for c in weather_indexed.columns
-                if c
-                not in [
-                    "time",
-                    "latitude",
-                    "longitude",
-                    "weatherStation",
-                    "sunPosition",
-                    "sunAzimuthDiscrete",
-                    "sunElevationDiscrete",
-                ]
-            ]
-
-            weather_subset = weather_indexed[weather_cols]
-
-            granularity_pandas = (
-                granularity.replace("PT", "")
-                .replace("M", "min")
-                .replace("H", "h")
-            )
-
-            weather_resampled = weather_subset.resample(
-                granularity_pandas
-            ).interpolate(method="linear")
-
-            tmp = result_df[["datetime_local"]].set_index("datetime_local")
-            joined = tmp.join(weather_resampled, how="left")
-
-            for col in joined.columns:
-                result_df[col] = joined[col].values
-
-        except Exception as e:
-            print(f"Warning: Failed to integrate weather data: {e}")
+        _attach_weather(
+            result_df, weather_df,
+            lat=lat, lon=lon,
+            decomposition=irradiance_decomposition,
+            time_offset_minutes=weather_time_offset_minutes,
+        )
 
     # --------------------------------------------------
     # Unique azimuth-altitude pairs
@@ -1175,12 +2123,28 @@ def apply_height_shadow_to_hillshades(
     if not files:
         return []
 
-    with rasterio.open(dem_path) as dem_src:
-        dem = dem_src.read(1).astype(np.float32)
-
     with rasterio.open(dsm_path) as dsm_src:
         dsm = dsm_src.read(1).astype(np.float32)
         raster_crs = dsm_src.crs
+        dsm_transform = dsm_src.transform
+        if dsm_src.nodata is not None:
+            dsm[dsm == dsm_src.nodata] = np.nan
+
+    # The DEM may cover a different extent; resample it onto the DSM grid
+    # (which is also the hillshade grid). Its nodata becomes NaN.
+    dem = np.full(dsm.shape, np.nan, dtype=np.float32)
+    with rasterio.open(dem_path) as dem_src:
+        reproject(
+            source=rasterio.band(dem_src, 1),
+            destination=dem,
+            src_transform=dem_src.transform,
+            src_crs=dem_src.crs,
+            src_nodata=dem_src.nodata,
+            dst_transform=dsm_transform,
+            dst_crs=raster_crs,
+            dst_nodata=np.nan,
+            resampling=Resampling.bilinear,
+        )
 
     if aoi is not None:
         transformer = pyproj.Transformer.from_crs(
@@ -1251,24 +2215,14 @@ def discretize_solar_position(
     return az_bin, alt_bin
 
 
-def load_hillshade(
-    hillshade_dir: Path,
-    azimuth: float,
-    altitude: float,
-) -> np.ndarray:
-    """
-    Load hillshade generated by generate_multiple_hillshades_gdal.
-
-    Output:
-      float32 array with values clipped to [0, 1]
-    """
-
+def _resolve_hillshade_path(hillshade_dir: Path, azimuth: float, altitude: float) -> Path:
+    """Find the hillshade file for one (azimuth, altitude) bin."""
     az_i = int(azimuth)
     alt_i = int(altitude)
     prefix = f"{az_i:03d}_{alt_i:02d}"
 
     candidates = sorted(
-        p for p in hillshade_dir.glob(f"{prefix}*.tif")
+        p for p in Path(hillshade_dir).glob(f"{prefix}*.tif")
         if not p.name.endswith("_raw.tif")
     )
 
@@ -1278,18 +2232,145 @@ def load_hillshade(
         )
 
     fn = candidates[0]
-
     if fn.stat().st_size == 0:
         raise ValueError(f"Corrupt hillshade (0 bytes): {fn}")
 
-    with rasterio.open(fn) as ds:
+    return fn
+
+
+def _read_hillshade_bands(path: Path):
+    """
+    Read one hillshade file.
+
+    Returns ``(base, path_lengths)`` where ``base`` is the [0, 1] hillshade with
+    opaque shadows applied and nodata zeroed, and ``path_lengths`` is the
+    (3, H, W) canopy path length in metres, or None for a plain hillshade.
+    """
+    with rasterio.open(path) as ds:
         hs = ds.read(1).astype(np.float32)
         nodata = ds.nodata
+        has_canopy = (
+            "GREENSHADOW_CANOPY" in ds.tags()
+            and ds.count >= 1 + N_VEGETATION_CLASSES
+        )
+        path_lengths = (
+            ds.read(list(range(2, 2 + N_VEGETATION_CLASSES))).astype(np.float32)
+            if has_canopy
+            else None
+        )
 
     if nodata is not None:
         hs = np.where(hs == nodata, 0.0, hs)
+        if path_lengths is not None:
+            path_lengths = np.where(path_lengths == nodata, 0.0, path_lengths)
 
-    return hs
+    return hs, path_lengths
+
+
+def load_hillshade(
+    hillshade_dir: Path,
+    azimuth: float,
+    altitude: float,
+    *,
+    month: Optional[int] = None,
+    leaf_type: int = 0,
+    reference_thickness_m: Optional[Sequence[float]] = None,
+    ignore_canopy: bool = False,
+) -> np.ndarray:
+    """
+    Load a hillshade generated by ``generate_multiple_hillshades_gdal``.
+
+    A canopy hillshade carries three extra path-length bands. They only become a
+    beam fraction once a month picks the leaf-on / leaf-off state, so reading one
+    without saying which month is an error rather than a silent loss of all
+    vegetation shading.
+
+    Args:
+        hillshade_dir: Directory holding the hillshades.
+        azimuth: Solar azimuth in degrees.
+        altitude: Solar elevation in degrees.
+        month: 1-12. Required for canopy hillshades, ignored for plain ones.
+        leaf_type: 0 deciduous, 1 evergreen.
+        reference_thickness_m: Passed through to ``vegetation_extinction``.
+        ignore_canopy: Read band 1 only from a canopy hillshade, i.e. opaque
+            obstacles but fully transparent vegetation. Deliberate escape hatch.
+
+    Returns:
+        float32 array with values clipped to [0, 1].
+    """
+
+    fn = _resolve_hillshade_path(hillshade_dir, azimuth, altitude)
+    hs, path_lengths = _read_hillshade_bands(fn)
+    if ignore_canopy:
+        path_lengths = None
+
+    if path_lengths is not None:
+        if month is None:
+            raise ValueError(
+                f"{fn.name} is a canopy hillshade: pass month=1..12 so the leaf-on "
+                f"state can be applied, or ignore_canopy=True to read band 1 alone "
+                f"(which leaves vegetation fully transparent)"
+            )
+        hs = apply_canopy_transmittance(
+            hs, path_lengths, month,
+            leaf_type=leaf_type,
+            reference_thickness_m=reference_thickness_m,
+        )
+
+    return np.clip(hs, 0.0, 1.0).astype(np.float32)
+
+def _hillshade_energy_variants(
+    group,
+    hillshade_dir: Path,
+    azimuth: int,
+    altitude: int,
+    *,
+    leaf_type: Optional[int] = None,
+    reference_thickness_m: Optional[Sequence[float]] = None,
+):
+    """
+    Yield ``(beam, dni_energy, dhi_energy)`` for one (azimuth, altitude) bin.
+
+    Without a canopy this is a single item, exactly as before. With one it is a
+    item per month present in the bin, because the same sun position attenuates
+    differently in February and in July. The raster is read once either way and
+    only the cheap exponential is repeated.
+    """
+    def _energies(g):
+        return (
+            np.sum(g.DNI.values * g.dt_hours.values).astype(np.float32),
+            np.sum(g.DHI.values * g.dt_hours.values).astype(np.float32),
+        )
+
+    dni_E, dhi_E = _energies(group)
+    if dni_E == 0 and dhi_E == 0:
+        return
+
+    fn = _resolve_hillshade_path(hillshade_dir, azimuth, altitude)
+    base, path_lengths = _read_hillshade_bands(fn)
+
+    if path_lengths is None:
+        yield np.clip(base, 0.0, 1.0), dni_E, dhi_E
+        return
+
+    if leaf_type is None:
+        raise ValueError(
+            f"{fn.name} is a canopy hillshade: pass canopy_leaf_type=0 (deciduous) "
+            f"or 1 (evergreen) to compute_surface_solar_energy, or regenerate the "
+            f"hillshades with canopy=None"
+        )
+
+    for month, g in group.groupby(group.datetime_utc.dt.month):
+        dni_E, dhi_E = _energies(g)
+        if dni_E == 0 and dhi_E == 0:
+            continue
+        beam = apply_canopy_transmittance(
+            base, path_lengths, int(month),
+            leaf_type=leaf_type,
+            reference_thickness_m=reference_thickness_m,
+        )
+        yield np.clip(beam, 0.0, 1.0), dni_E, dhi_E
+
 
 def compute_surface_solar_energy(
     solar_df,
@@ -1302,9 +2383,32 @@ def compute_surface_solar_energy(
     aoi_crs: str = "EPSG:4326",
     nodata_value: float = -9999.0,
     overwrite: bool = False,
-) -> None:
+    canopy_leaf_type: Optional[int] = None,
+    canopy_reference_thickness_m: Optional[Sequence[float]] = None,
+    tracker_max_rotation_deg: float = 60.0,
+) -> str:
     """
     Compute surface solar energy with different aggregation strategies.
+
+    ``mode="vertical_basis"`` and ``mode="tracking_basis"`` extend
+    ``"fourier_poa"`` to the panels it cannot represent: vertical panels,
+    whose beam has to be split by the side of the panel it falls on, and
+    trackers, whose orientation changes with every sun position. They are
+    read back with ``reconstruct_vertical_poa`` and
+    ``reconstruct_tracking_poa``, and both write a ``*_sun.csv`` next to the
+    raster: the sun-position bins and their beam and diffuse energy, from
+    which a planner works out the shading between rows of a given layout.
+    ``tracker_max_rotation_deg`` is the single-axis tracker's rotation limit.
+
+    ``canopy_leaf_type`` (0 deciduous, 1 evergreen) is required when the
+    hillshades were generated with a ``CanopyModel``: it selects the leaf-on /
+    leaf-off column of ``VEGETATION_SHADOWING``, and every (azimuth, altitude)
+    bin is then resolved per month so a single sun position attenuates correctly
+    in both February and July. Leave it ``None`` for plain opaque hillshades.
+
+    Returns the path actually written, which is *not* ``out_path``: the mode is
+    appended to the stem (``foo.tif`` -> ``foo_total.tif``). Always use the
+    return value rather than rebuilding the name at the call site.
 
     Modes
     -----
@@ -1330,6 +2434,38 @@ def compute_surface_solar_energy(
           6 : D1   (diffuse sin(alt))
 
         These coefficients allow exact POA reconstruction.
+
+    fourier_poa:
+        Bands:
+          1 : B_z    (direct, pairs with cos(tilt))
+          2 : B_east (direct, pairs with sin(tilt)*sin(azimuth))
+          3 : B_north(direct, pairs with sin(tilt)*cos(azimuth))
+          4 : D_sky  (diffuse on the horizontal, SVF-weighted)
+          5 : GHI    (global horizontal, for the ground-reflected term)
+
+        Reconstruct the annual plane-of-array irradiation of a panel at tilt
+        beta and azimuth gamma (0 = North, clockwise) with
+        ``reconstruct_poa_from_basis``, or directly::
+
+            POA = B_z*cos(beta)
+                + sin(beta) * (B_north*cos(gamma) + B_east*sin(gamma))
+                + D_sky * (1 + cos(beta)) / 2
+                + GHI * albedo * (1 - cos(beta)) / 2
+
+        This is exact for the direct component, because
+        cos(AOI) = cos(beta)*sin(phi) + sin(beta)*cos(phi)*cos(theta - gamma)
+        expands into precisely those three basis terms. At beta = 0 it collapses
+        to B_z + D_sky == GHI, which is the cheapest self-check.
+
+        Unlike every other mode, these bands are in **Wh/m2**, not Wh per pixel:
+        a panel's energy is the band value times the module area.
+
+        Limitation: the lit fraction is recovered as hill / sin(altitude), which
+        assumes a near-horizontal surface. That is exactly where this basis is
+        meant to be used - flat roofs carrying tilted racks. A module mounted
+        coplanar with an inclined roof already has the roof's own orientation,
+        so for those the ``total`` mode raster *is* the POA and should be used
+        instead.
     """
 
     import numpy as np
@@ -1339,8 +2475,12 @@ def compute_surface_solar_energy(
     from tqdm import tqdm
     from shapely.ops import transform as shp_transform
 
-    if mode not in {"total", "monthly", "fourier_decomposition"}:
-        raise ValueError("mode must be 'total', 'monthly', or 'fourier_decomposition'")
+    if mode not in {"total", "monthly", "fourier_decomposition", "fourier_poa",
+                    "vertical_basis", "tracking_basis"}:
+        raise ValueError(
+            "mode must be 'total', 'monthly', 'fourier_decomposition', "
+            "'fourier_poa', 'vertical_basis' or 'tracking_basis'"
+        )
     out_path = out_path.replace(".tif", f"_{mode}.tif")
 
     if os.path.exists(out_path) and not overwrite:
@@ -1358,12 +2498,15 @@ def compute_surface_solar_energy(
     df["az_bin"] = df.azimuth.astype(int)
     df["alt_bin"] = df.elevation.astype(int)
 
-    df["dt_hours"] = (
-        df.datetime_utc.diff()
-        .dt.total_seconds()
-        .shift(-1)
-        .fillna(0.0) / 3600.0
-    )
+    # Every row stands for one step of the table. Taking the gap to the next
+    # row instead is wrong wherever the table has holes - a daylight-only
+    # table jumps the whole night after each day's last hour, which then
+    # counted for twelve to sixteen hours of evening sun, inflated the annual
+    # direct and diffuse totals by a fifth and a half respectively, and leaned
+    # the year towards the West.
+    steps = df.datetime_utc.diff().dt.total_seconds()
+    steps = steps[steps > 0]
+    df["dt_hours"] = (float(steps.median()) / 3600.0) if len(steps) else 1.0
 
     df = df[df.elevation > 0]
 
@@ -1404,7 +2547,13 @@ def compute_surface_solar_energy(
         n_bands = 2
     elif mode == "monthly":
         n_bands = 26
-    else:  # fourier
+    elif mode == "fourier_poa":
+        n_bands = 5
+    elif mode == "vertical_basis":
+        n_bands = 4
+    elif mode == "tracking_basis":
+        n_bands = 6
+    else:  # fourier_decomposition
         n_bands = 6
 
     profile.update(
@@ -1434,6 +2583,16 @@ def compute_surface_solar_energy(
         A2  = np.zeros((H, W), np.float32)
         D0  = np.zeros((H, W), np.float32)
         D1  = np.zeros((H, W), np.float32)
+    elif mode == "fourier_poa":
+        B_z   = np.zeros((H, W), np.float32)
+        B_e   = np.zeros((H, W), np.float32)
+        B_n   = np.zeros((H, W), np.float32)
+        D_sky = np.zeros((H, W), np.float32)
+        GHI   = np.zeros((H, W), np.float32)
+    elif mode == "vertical_basis":
+        vertical = [np.zeros((H, W), np.float32) for _ in range(4)]
+    elif mode == "tracking_basis":
+        tracking = [np.zeros((H, W), np.float32) for _ in range(6)]
     else:
         direct_annual  = np.zeros((H, W), np.float32)
         diffuse_annual = np.zeros((H, W), np.float32)
@@ -1457,42 +2616,69 @@ def compute_surface_solar_energy(
             unit="group",
             dynamic_ncols=True,
         ):
-            dni_E = np.sum(g.DNI.values * g.dt_hours.values).astype(np.float32)
-            dhi_E = np.sum(g.DHI.values * g.dt_hours.values).astype(np.float32)
-
-            if dni_E == 0 and dhi_E == 0:
-                continue
-
-            hill = load_hillshade(
+            for hill, dni_E, dhi_E in _hillshade_energy_variants(
+                g,
                 hillshade_dir,
-                azimuth=az,
-                altitude=alt,
-            ).astype(np.float32)
+                az,
+                alt,
+                leaf_type=canopy_leaf_type,
+                reference_thickness_m=canopy_reference_thickness_m,
+            ):
+                hill = hill.astype(np.float32)
 
-            if mode == "fourier_decomposition":
-                θ = np.deg2rad(az)
-                φ = np.deg2rad(alt)
+                if mode == "fourier_decomposition":
+                    θ = np.deg2rad(az)
+                    φ = np.deg2rad(alt)
 
-                _accumulate_fourier(
-                    A0, A1c, A1s, A2,
-                    D0, D1,
-                    hill, svf,
-                    dni_E, dhi_E,
-                    θ, φ,
-                    aoi_mask,
-                    pixel_area,
-                )
-            else:
-                _accumulate_energy_split(
-                    direct_month if mode == "monthly" else direct_annual,
-                    diffuse_month if mode == "monthly" else diffuse_annual,
-                    svf,
-                    hill,
-                    dni_E,
-                    dhi_E,
-                    aoi_mask,
-                    pixel_area,
-                )
+                    _accumulate_fourier(
+                        A0, A1c, A1s, A2,
+                        D0, D1,
+                        hill, svf,
+                        dni_E, dhi_E,
+                        θ, φ,
+                        aoi_mask,
+                        pixel_area,
+                    )
+                elif mode == "fourier_poa":
+                    θ = np.deg2rad(az)
+                    φ = np.deg2rad(alt)
+
+                    _accumulate_poa_basis(
+                        B_z, B_e, B_n,
+                        D_sky, GHI,
+                        hill, svf,
+                        dni_E, dhi_E,
+                        θ, φ,
+                        aoi_mask,
+                    )
+                elif mode == "vertical_basis":
+                    _accumulate_vertical_basis(
+                        *vertical,
+                        hill,
+                        dni_E,
+                        np.deg2rad(az), np.deg2rad(alt),
+                        aoi_mask,
+                    )
+                elif mode == "tracking_basis":
+                    _accumulate_tracking_basis(
+                        *tracking,
+                        hill, svf,
+                        dni_E, dhi_E,
+                        np.deg2rad(az), np.deg2rad(alt),
+                        np.deg2rad(tracker_max_rotation_deg),
+                        aoi_mask,
+                    )
+                else:
+                    _accumulate_energy_split(
+                        direct_month if mode == "monthly" else direct_annual,
+                        diffuse_month if mode == "monthly" else diffuse_annual,
+                        svf,
+                        hill,
+                        dni_E,
+                        dhi_E,
+                        aoi_mask,
+                        pixel_area,
+                    )
 
         if mode == "monthly":
             direct_annual  += direct_month
@@ -1522,6 +2708,33 @@ def compute_surface_solar_energy(
             dst.set_band_description(4, "A2 sin(alt)")
             dst.set_band_description(5, "D0 diffuse")
             dst.set_band_description(6, "D1 sin(alt)")
+
+        elif mode == "fourier_poa":
+            for arr, band in zip(
+                (B_z, B_e, B_n, D_sky, GHI),
+                range(1, 6),
+            ):
+                arr[~aoi_mask] = nodata_value
+                dst.write(arr, band)
+
+            dst.set_band_description(1, "B_z direct cos(tilt)")
+            dst.set_band_description(2, "B_east direct sin(tilt)sin(az)")
+            dst.set_band_description(3, "B_north direct sin(tilt)cos(az)")
+            dst.set_band_description(4, "D_sky diffuse horizontal")
+            dst.set_band_description(5, "GHI global horizontal")
+
+        elif mode == "vertical_basis":
+            for band, (arr, name) in enumerate(zip(vertical, VERTICAL_BASIS_BANDS), 1):
+                arr[~aoi_mask] = nodata_value
+                dst.write(arr, band)
+                dst.set_band_description(band, name)
+
+        elif mode == "tracking_basis":
+            for band, (arr, name) in enumerate(zip(tracking, TRACKING_BASIS_BANDS), 1):
+                arr[~aoi_mask] = nodata_value
+                dst.write(arr, band)
+                dst.set_band_description(band, name)
+            dst.update_tags(TRACKER_MAX_ROTATION_DEG=str(tracker_max_rotation_deg))
 
         else:
             direct_annual[~aoi_mask]  = nodata_value
@@ -1561,6 +2774,151 @@ def compute_surface_solar_energy(
                 dst.write(diffuse_annual, 2)
                 dst.set_band_description(1, "Direct")
                 dst.set_band_description(2, "Diffuse")
+
+    if mode in ("vertical_basis", "tracking_basis"):
+        write_sun_table(df, sun_table_path(out_path))
+
+    return str(out_path)
+
+
+def sun_table_path(basis_path) -> str:
+    """Where the sun table of a vertical or tracking basis is written."""
+    return str(basis_path).replace(".tif", "_sun.csv")
+
+
+def write_sun_table(solar_df: pd.DataFrame, path) -> str:
+    """
+    The sun-position bins of a solar table, with their annual energy.
+
+    One row per (azimuth, altitude) bin, as the hillshades are discretised:
+    ``azimuth_deg``, ``altitude_deg``, and the beam (``dni_wh_m2``, normal to
+    the sun) and diffuse (``dhi_wh_m2``, horizontal) energy the year delivers
+    from it, unobstructed. It is what shading between rows is computed from:
+    that depends on the layout, not on the pixel, and needs the sun only.
+    """
+    table = solar_df[solar_df.elevation > 0].copy()
+    if "dt_hours" not in table:
+        steps = table.datetime_utc.diff().dt.total_seconds()
+        steps = steps[steps > 0]
+        table["dt_hours"] = (float(steps.median()) / 3600.0) if len(steps) else 1.0
+    table["dni_wh_m2"] = table.DNI * table.dt_hours
+    table["dhi_wh_m2"] = table.DHI * table.dt_hours
+    bins = (table.groupby([table.azimuth.astype(int), table.elevation.astype(int)])
+            [["dni_wh_m2", "dhi_wh_m2"]].sum().reset_index())
+    bins.columns = ["azimuth_deg", "altitude_deg", "dni_wh_m2", "dhi_wh_m2"]
+    bins.to_csv(path, index=False)
+    return str(path)
+
+
+def read_sun_table(basis_path) -> pd.DataFrame:
+    """The sun table written next to a vertical or tracking basis."""
+    return pd.read_csv(sun_table_path(basis_path))
+
+
+#: Band order of ``mode="vertical_basis"``: the lit beam on a vertical panel
+#: facing each way, Wh/m2.
+VERTICAL_BASIS_BANDS = (
+    "H_east direct on an East-facing vertical",
+    "H_west direct on a West-facing vertical",
+    "H_north direct on a North-facing vertical",
+    "H_south direct on a South-facing vertical",
+)
+
+#: Band order of ``mode="tracking_basis"``, Wh/m2. The ground bands are the
+#: global the panel sees reflected, before the albedo.
+TRACKING_BASIS_BANDS = (
+    "T2_dir dual-axis direct",
+    "T2_sky dual-axis sky diffuse",
+    "T2_gnd dual-axis ground view",
+    "T1_dir single-axis N-S direct",
+    "T1_sky single-axis N-S sky diffuse",
+    "T1_gnd single-axis N-S ground view",
+)
+
+_VERTICAL_FACES = {90.0: 0, 270.0: 1, 0.0: 2, 180.0: 3}
+
+
+def reconstruct_vertical_poa(vertical_bands, d_sky, ghi, *, facing_azimuth_deg,
+                             albedo: float = 0.2):
+    """
+    Annual ``(direct, sky, ground)`` on a vertical panel, Wh/m2.
+
+    ``vertical_bands`` are the four bands of ``mode="vertical_basis"``;
+    ``d_sky`` and ``ghi`` bands 4 and 5 of ``mode="fourier_poa"`` built on the
+    same hillshades. The facing must be one of the four cardinal points the
+    basis was split along - which is what North-South and East-West rows give.
+    A vertical panel sees half the sky and half the ground.
+    """
+    key = float(facing_azimuth_deg) % 360.0
+    if key not in _VERTICAL_FACES:
+        raise ValueError("a vertical panel must face 0, 90, 180 or 270 degrees")
+    direct = vertical_bands[_VERTICAL_FACES[key]]
+    return direct, 0.5 * d_sky, 0.5 * albedo * ghi
+
+
+def reconstruct_tracking_poa(tracking_bands, *, kind: str, albedo: float = 0.2):
+    """
+    Annual ``(direct, sky, ground)`` on a tracker, Wh/m2.
+
+    ``tracking_bands`` are the six bands of ``mode="tracking_basis"``;
+    ``kind`` is ``"dual_axis"`` or ``"single_axis"`` (horizontal North-South
+    axis). Shading between trackers is not in it: multiply the direct (and,
+    for backtracking, the sky) by the layout's factors.
+    """
+    if kind == "dual_axis":
+        direct, sky, ground = tracking_bands[0], tracking_bands[1], tracking_bands[2]
+    elif kind == "single_axis":
+        direct, sky, ground = tracking_bands[3], tracking_bands[4], tracking_bands[5]
+    else:
+        raise ValueError("kind must be 'dual_axis' or 'single_axis'")
+    return direct, sky, albedo * ground
+
+
+def reconstruct_poa_from_basis(
+    b_z, b_east, b_north, d_sky, ghi,
+    *,
+    tilt_deg,
+    azimuth_deg,
+    albedo: float = 0.2,
+):
+    """
+    Annual plane-of-array irradiation (Wh/m2) for an arbitrary panel orientation.
+
+    Takes the five bands written by ``compute_surface_solar_energy`` in
+    ``mode="fourier_poa"``. Each may be a scalar or a numpy array; ``tilt_deg``
+    and ``azimuth_deg`` may likewise be scalars or arrays broadcastable against
+    them, so a whole tilt sweep can be evaluated in one call.
+
+    Parameters
+    ----------
+    b_z, b_east, b_north, d_sky, ghi : float or np.ndarray
+        Bands 1-5 of the ``fourier_poa`` raster, in Wh/m2.
+    tilt_deg : float or np.ndarray
+        Panel tilt from the horizontal, degrees.
+    azimuth_deg : float or np.ndarray
+        Panel azimuth, degrees, 0 = North and increasing clockwise, so 180 is
+        South. This matches the solar azimuth convention the basis was
+        accumulated with.
+    albedo : float, default=0.2
+        Ground reflectance for the isotropic reflected term. The default is the
+        usual value for mixed urban surfaces; it only matters at steep tilts.
+    """
+    import numpy as np
+
+    beta = np.deg2rad(tilt_deg)
+    gamma = np.deg2rad(azimuth_deg)
+
+    cos_b = np.cos(beta)
+    sin_b = np.sin(beta)
+
+    direct = b_z * cos_b + sin_b * (b_north * np.cos(gamma) + b_east * np.sin(gamma))
+    diffuse = d_sky * (1.0 + cos_b) * 0.5
+    reflected = ghi * albedo * (1.0 - cos_b) * 0.5
+
+    # A panel can never receive negative direct beam: the expansion goes negative
+    # when the sun is behind the plane, which physically means zero, not a debit.
+    return np.maximum(direct, 0.0) + diffuse + reflected
+
 
 @njit(parallel=True, fastmath=True)
 def _accumulate_energy_split(
@@ -1609,6 +2967,175 @@ def _accumulate_fourier(
 
             D0[i, j]  += E_dif
             D1[i, j]  += E_dif * sφ
+
+
+@njit(parallel=True, fastmath=True)
+def _accumulate_poa_basis(
+    B_z, B_e, B_n,
+    D_sky, GHI,
+    hill, svf,
+    dni_E, dhi_E,
+    theta, phi,
+    valid_mask,
+):
+    """
+    Exact plane-of-array basis for an arbitrary panel tilt/azimuth.
+
+    Unlike ``_accumulate_fourier``, the hillshade is not used as a weight but as
+    the source of the lit fraction: on a near-horizontal surface the GDAL
+    hillshade equals sin(phi) where the pixel is lit and ~0 where it is shadowed,
+    so ``hill / sin(phi)`` recovers the shadow mask itself. Dividing the surface
+    cos-incidence back out is what makes the stored coefficients independent of
+    the roof orientation, and therefore reusable for any rack tilt.
+
+    Bands accumulate in Wh/m2 (no pixel_area factor), so panel energy is a plain
+    multiplication by the module area.
+    """
+    cφ = np.cos(phi)
+    sφ = np.sin(phi)
+    cθ = np.cos(theta)
+    sθ = np.sin(theta)
+
+    H, W = B_z.shape
+    for i in prange(H):
+        for j in range(W):
+            if not valid_mask[i, j]:
+                continue
+
+            if sφ > 1e-6:
+                lit = hill[i, j] / sφ
+                if lit > 1.0:
+                    lit = 1.0
+                elif lit < 0.0:
+                    lit = 0.0
+            else:
+                lit = 0.0
+
+            E_dir = dni_E * lit
+            E_dif = dhi_E * svf[i, j]
+
+            B_z[i, j]   += E_dir * sφ
+            B_e[i, j]   += E_dir * cφ * sθ
+            B_n[i, j]   += E_dir * cφ * cθ
+
+            D_sky[i, j] += E_dif
+            GHI[i, j]   += E_dir * sφ + E_dif
+
+
+@njit(parallel=True, fastmath=True)
+def _accumulate_vertical_basis(
+    H_ep, H_em, H_np, H_nm,
+    hill,
+    dni_E,
+    theta, phi,
+    valid_mask,
+):
+    """
+    The lit beam split by which side of a vertical panel it reaches.
+
+    A vertical panel facing East takes the beam only while the sun is East of
+    it, so its annual direct is the sum of ``E_dir * max(0, s_east)`` - which
+    the signed ``B_e`` of ``_accumulate_poa_basis`` cannot give back once the
+    mornings and afternoons have been added together. One band per half axis,
+    in Wh/m2: East, West, North, South faces.
+    """
+    cφ = np.cos(phi)
+    sφ = np.sin(phi)
+    s_e = cφ * np.sin(theta)
+    s_n = cφ * np.cos(theta)
+
+    east = s_e if s_e > 0.0 else 0.0
+    west = -s_e if s_e < 0.0 else 0.0
+    north = s_n if s_n > 0.0 else 0.0
+    south = -s_n if s_n < 0.0 else 0.0
+
+    H, W = H_ep.shape
+    for i in prange(H):
+        for j in range(W):
+            if not valid_mask[i, j]:
+                continue
+
+            if sφ > 1e-6:
+                lit = hill[i, j] / sφ
+                if lit > 1.0:
+                    lit = 1.0
+                elif lit < 0.0:
+                    lit = 0.0
+            else:
+                lit = 0.0
+
+            E_dir = dni_E * lit
+
+            H_ep[i, j] += E_dir * east
+            H_em[i, j] += E_dir * west
+            H_np[i, j] += E_dir * north
+            H_nm[i, j] += E_dir * south
+
+
+@njit(parallel=True, fastmath=True)
+def _accumulate_tracking_basis(
+    T2_dir, T2_sky, T2_gnd,
+    T1_dir, T1_sky, T1_gnd,
+    hill, svf,
+    dni_E, dhi_E,
+    theta, phi,
+    max_rotation,
+    valid_mask,
+):
+    """
+    Plane-of-array sums for trackers, whose orientation follows the sun.
+
+    Dual axis: the panel faces the sun, so the beam arrives at normal
+    incidence and the panel's tilt is the zenith angle. Single axis,
+    horizontal and North-South: the panel rotates East-West by
+    ``R = atan2(s_east, s_up)``, held within ``max_rotation``, so the beam
+    meets it at ``cos AOI = s_east sin R + s_up cos R`` and its tilt is
+    ``|R|``. Each gets its direct, its isotropic sky diffuse and its ground
+    view (``GHI * (1 - cos tilt) / 2``, to be multiplied by the albedo), in
+    Wh/m2. Shading of one tracker by the next depends on the layout and is
+    applied afterwards (``tracker_row_factors`` in ``parcel_pv``).
+    """
+    cφ = np.cos(phi)
+    sφ = np.sin(phi)
+    s_e = cφ * np.sin(theta)
+
+    rotation = np.arctan2(s_e, sφ)
+    if rotation > max_rotation:
+        rotation = max_rotation
+    elif rotation < -max_rotation:
+        rotation = -max_rotation
+
+    cos_aoi_1 = s_e * np.sin(rotation) + sφ * np.cos(rotation)
+    if cos_aoi_1 < 0.0:
+        cos_aoi_1 = 0.0
+    cos_tilt_1 = np.cos(rotation)
+
+    H, W = T2_dir.shape
+    for i in prange(H):
+        for j in range(W):
+            if not valid_mask[i, j]:
+                continue
+
+            if sφ > 1e-6:
+                lit = hill[i, j] / sφ
+                if lit > 1.0:
+                    lit = 1.0
+                elif lit < 0.0:
+                    lit = 0.0
+            else:
+                lit = 0.0
+
+            E_dir = dni_E * lit
+            E_dif = dhi_E * svf[i, j]
+            G = E_dir * sφ + E_dif
+
+            T2_dir[i, j] += E_dir
+            T2_sky[i, j] += E_dif * (1.0 + sφ) * 0.5
+            T2_gnd[i, j] += G * (1.0 - sφ) * 0.5
+
+            T1_dir[i, j] += E_dir * cos_aoi_1
+            T1_sky[i, j] += E_dif * (1.0 + cos_tilt_1) * 0.5
+            T1_gnd[i, j] += G * (1.0 - cos_tilt_1) * 0.5
 
 def calculate_sky_view_factor(
     dsm_path: str,
@@ -2187,6 +3714,8 @@ def generate_daily_shadow_mp4(
     timestamp_padding: int = 10,
     timestamp_box_alpha: float = 0.45,
     solar_line_scale: float | None = None,
+    canopy_leaf_type: Optional[int] = None,
+    canopy_reference_thickness_m: Optional[Sequence[float]] = None,
 ):
     """
     Generate an MP4 animation of daily terrain shadows with:
@@ -2194,6 +3723,10 @@ def generate_daily_shadow_mp4(
       - OpenCV resize
       - timestamp overlay
       - solar altitude / azimuth overlay (1 decimal)
+
+    ``canopy_leaf_type`` (0 deciduous, 1 evergreen) is required when the
+    hillshades carry canopy path-length bands; the month comes from each frame's
+    own timestamp, so a clip spanning a leaf-out date shows the canopy filling in.
     """
 
     from functools import lru_cache
@@ -2222,23 +3755,27 @@ def generate_daily_shadow_mp4(
     alt = df.elevation.to_numpy(dtype=np.float32)
     az_bin = df.az_bin.to_numpy(dtype=np.int32)
     alt_bin = df.alt_bin.to_numpy(dtype=np.int32)
+    month_of = df.datetime_utc.dt.month.to_numpy(dtype=np.int32)
 
     # ----------------------------------------------------------
     # LRU Hillshade Cache (bounded)
     # ----------------------------------------------------------
     @lru_cache(maxsize=8)
-    def get_hillshade_cached(a: int, h: int) -> np.ndarray:
+    def get_hillshade_cached(a: int, h: int, month: int) -> np.ndarray:
         hs = load_hillshade(
             hillshade_dir,
             azimuth=a,
             altitude=h,
+            month=month if canopy_leaf_type is not None else None,
+            leaf_type=canopy_leaf_type or 0,
+            reference_thickness_m=canopy_reference_thickness_m,
         )
         return hs.astype(np.float32)
 
     # ----------------------------------------------------------
     # Geometry reference
     # ----------------------------------------------------------
-    ref = get_hillshade_cached(int(az_bin[0]), int(alt_bin[0]))
+    ref = get_hillshade_cached(int(az_bin[0]), int(alt_bin[0]), int(month_of[0]))
     H, W = ref.shape
 
     if center_xy is None:
@@ -2311,8 +3848,12 @@ def generate_daily_shadow_mp4(
             az_i = (1 - w) * az[idx] + w * az[idx + 1]
 
             # Load only 2 hillshades (LRU keeps max 8)
-            hs0 = get_hillshade_cached(int(az_bin[idx]), int(alt_bin[idx]))[y0:y1, x0:x1]
-            hs1 = get_hillshade_cached(int(az_bin[idx + 1]), int(alt_bin[idx + 1]))[y0:y1, x0:x1]
+            hs0 = get_hillshade_cached(
+                int(az_bin[idx]), int(alt_bin[idx]), int(month_of[idx])
+            )[y0:y1, x0:x1]
+            hs1 = get_hillshade_cached(
+                int(az_bin[idx + 1]), int(alt_bin[idx + 1]), int(month_of[idx + 1])
+            )[y0:y1, x0:x1]
 
             # In-place blend (no extra float64 temp)
             frame = hs0.copy()
@@ -2474,6 +4015,17 @@ def pv_potential_from_fourier_raster(
     albedo=0.2,
     nodata=-9999.0,
 ):
+    """
+    Coarse per-pixel PV yield from the ``fourier_decomposition`` basis.
+
+    Note that this basis weights every coefficient by the hillshade, which
+    already contains the surface's own cos-incidence, so it cannot separate the
+    panel orientation from the ground orientation. For panel-level work at a
+    tilt that differs from the underlying surface - tilted racks on a flat roof -
+    use ``mode="fourier_poa"`` and ``reconstruct_poa_from_basis`` instead, which
+    is exact. This function is retained for quick whole-raster screening where
+    tilt and azimuth track the terrain.
+    """
     import rasterio
     import numpy as np
 
@@ -2650,41 +4202,4 @@ def aggregate_pv_by_polygons(
             })
 
     return gpd.GeoDataFrame(results)
-
-
-
-VEGETATION_SHADOWING = np.array(
-    [
-        # DECIDUOUS = 0
-        [
-            [0.10, 0.10, 0.15, 0.25, 0.35, 0.45, 0.50, 0.50, 0.40, 0.25, 0.15, 0.10],
-            [0.20, 0.20, 0.30, 0.50, 0.65, 0.75, 0.80, 0.80, 0.70, 0.50, 0.30, 0.20],
-            [0.30, 0.30, 0.40, 0.65, 0.80, 0.88, 0.92, 0.92, 0.85, 0.65, 0.45, 0.30],
-        ],
-
-        # EVERGREEN = 1
-        [
-            [0.30, 0.30, 0.32, 0.35, 0.38, 0.42, 0.45, 0.45, 0.42, 0.38, 0.32, 0.30],
-            [0.55, 0.55, 0.58, 0.60, 0.65, 0.70, 0.75, 0.75, 0.70, 0.65, 0.58, 0.55],
-            [0.75, 0.75, 0.78, 0.80, 0.85, 0.88, 0.90, 0.90, 0.88, 0.85, 0.80, 0.75],
-        ],
-    ],
-    dtype=np.float32,
-)
-
-
-ICGC_DSM_CLASS_TO_HEIGHT_INDEX = np.array(
-    [-1, -1, -1, 0, 1, 2], dtype=np.int8
-)
-
-@njit(inline="always")
-def get_vegetation_shadowing_from_dsm(
-    leaf_type: int,   # 0=deciduous, 1=evergreen
-    dsm_class: int,   # 3, 4, 5
-    month: int,       # 1–12
-) -> float:
-    height_idx = DSM_CLASS_TO_HEIGHT_INDEX[dsm_class]
-    if height_idx < 0:
-        return 0.0  # no vegetation → no attenuation
-    return VEGETATION_SHADOWING[leaf_type, height_idx, month - 1]
 
