@@ -207,7 +207,8 @@ the night after each day's last hour, so those evening positions counted for
 the horizontal and 998 of diffuse, against the weather's 1,083 and 625, and
 leaned strongly West. Every row now counts for one step of the table. Energy
 rasters written before that date overstate the annual energy by about a third
-and must be recomputed (`recalculate_solar_exposure = True` in the example);
+and must be recomputed (`recalculate_solar_exposure=True` in the pipeline
+configuration, `overwrite=True` when calling the energy functions);
 the hillshades remain valid.
 
 ## References

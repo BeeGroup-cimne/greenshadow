@@ -37,7 +37,9 @@ INSTALL_REQUIRES = [
 OPTIONAL_REQUIRES = {
     'solar': ['pysolar>=0.10', 'sunpy>=4.0.0'],
     'pdal': ['pdal>=3.0.0'],
-    'weather': ['hypercadaster_ES>=1.2.3'],
+    # zarr/fsspec/aiohttp: hypercadaster's ERA5-Land ARCO Zarr path (else CDS-queue fallback)
+    'weather': ['hypercadaster_ES>=1.2.3', 'zarr>=2.18', 'fsspec>=2023.1.0', 'aiohttp>=3.8'],
+    'cuda': ['numba-cuda[cu13]'],  # pip CUDA toolkit (libNVVM) for numba
     'dev': ['pytest>=7.0.0', 'black>=22.0.0', 'flake8>=4.0.0'],
     'viz3d': ['plotly>=5.0.0'],
 }

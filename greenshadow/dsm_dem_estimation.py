@@ -13,7 +13,10 @@ import warnings
 from typing import Union, Optional, Tuple, Any, Sequence
 import geopandas as gpd
 import rasterio
-from tqdm import tqdm
+try:
+    from .logging_utils import tqdm
+except ImportError:
+    from greenshadow.logging_utils import tqdm
 import json
 import shapely.geometry as sg
 from rasterio.features import rasterize
@@ -37,10 +40,10 @@ import numpy as np
 import laspy
 from numba import njit, prange
 try:
-    from .logging_utils import error
+    from .logging_utils import error, info, warning
     from .utils import _build_raster_profile, force_raster_value_based_on_geometries, RAMLogger, _write_raster_in_blocks, _filter_by_class_priority_grid
 except ImportError:
-    from greenshadow.logging_utils import error
+    from greenshadow.logging_utils import error, info, warning
     from greenshadow.utils import _build_raster_profile, force_raster_value_based_on_geometries, RAMLogger, _write_raster_in_blocks, _filter_by_class_priority_grid
 from scipy.spatial import cKDTree
 import psutil
@@ -56,6 +59,20 @@ from shapely.geometry import box as shp_box
 
 # Set number of threads when Numba parallel execution
 set_num_threads(int(np.ceil(get_num_threads()/3)))
+
+# LiDAR points kept around a raster window before rasterising (m). Wide enough
+# for the TIN's triangles that cross the window edge.
+_POINT_CROP_MARGIN_M = 10.0
+
+# Peak memory of one tile worker (GB): ~2.2 measured on 1 km ICGC tiles at
+# 0.5 m, plus headroom for denser files.
+_TILE_WORKER_RAM_GB = 3.5
+
+# laspy LAZ backend; None lets laspy pick (lazrs' multithreaded decoder). The
+# tiled builder's forked workers switch to the single-threaded one: rayon's
+# thread pool does not survive fork(), and a child decoding with it after the
+# parent has hangs for good.
+_LAZ_BACKEND = None
 
 def _hybrid_dsm_fill(arr, nodata, building_mask):
 
@@ -438,7 +455,7 @@ def _nearest_fill_chunked(
     overlap = 32
     step = chunk_side - overlap
 
-    print(f"[nearest_fill_chunked] chunk={chunk_side} overlap={overlap}")
+    info(f"[nearest_fill_chunked] chunk={chunk_side} overlap={overlap}")
 
     # --------------------------------------------------
     # Iterate chunks
@@ -557,7 +574,7 @@ def _count_invalid_values(arr, name="array"):
 
     total = arr.size
 
-    print(
+    info(
         f"{name}: "
         f"NaN={n_nan} "
         f"+Inf={n_posinf} "
@@ -730,6 +747,65 @@ def _tin_surface(
     return flat.reshape(height, width)
 
 
+def _in_box(x, y, box):
+    minx, miny, maxx, maxy = box
+    return (x >= minx) & (x <= maxx) & (y >= miny) & (y <= maxy)
+
+
+def _read_lidar_points(path, crop=None):
+    """
+    Read x, y (float64), z (float32) and classification (uint8) from a LAZ/LAS
+    file, or from a halo-strip ``.npz`` written by the tiled builder, keeping
+    only the points inside ``crop`` = (minx, miny, maxx, maxy) when given.
+    """
+    if str(path).endswith(".npz"):
+        with np.load(path) as f:
+            x, y, z, c = f["x"], f["y"], f["z"], f["c"]
+    else:
+        # Only x, y, z and classification are used: LAS 1.4 layered
+        # compression lets lazrs skip the other fields (intensity, GPS time,
+        # RGB/NIR...), a third of the decode time on ICGC point format 8.
+        with laspy.open(
+                path,
+                laz_backend=_LAZ_BACKEND,
+                decompression_selection=(
+                    laspy.DecompressionSelection.XY_RETURNS_CHANNEL
+                    | laspy.DecompressionSelection.Z
+                    | laspy.DecompressionSelection.CLASSIFICATION
+                ),
+        ) as lf:
+            las = lf.read()
+
+        X, Y, Z = las.X, las.Y, las.Z
+        (sx, sy, sz), (ox, oy, oz) = las.header.scales, las.header.offsets
+        c = np.asarray(las.classification, dtype=np.uint8)
+        if crop is not None:
+            # Crop on the raw integers (bounds rounded outwards; the exact
+            # test follows), so only the kept points are scaled.
+            keep = _in_box(
+                X, Y,
+                (math.floor((crop[0] - ox) / sx), math.floor((crop[1] - oy) / sy),
+                 math.ceil((crop[2] - ox) / sx), math.ceil((crop[3] - oy) / sy)),
+            )
+            X, Y, Z, c = X[keep], Y[keep], Z[keep], c[keep]
+        del las
+
+        # Same arithmetic as laspy's scaled .x/.y/.z. Coordinates stay
+        # float64: in float32 a UTM northing near 4.6e6 m is rounded to
+        # 0.5 m, which moves returns by up to 0.25 m between pixels and
+        # stacks them on a lattice that leaves the TIN's Delaunay
+        # triangulation without a unique answer. z is fine in float32.
+        x = X * sx + ox
+        y = Y * sy + oy
+        z = (Z * sz + oz).astype(np.float32)
+
+    if crop is not None:
+        keep = _in_box(x, y, crop)
+        if not keep.all():
+            x, y, z, c = x[keep], y[keep], z[keep], c[keep]
+    return x, y, z, c
+
+
 def _rasterize_agg(
     laz_path: Optional[str] = None,
     laz_points: Optional[np.ndarray] = None,
@@ -877,21 +953,17 @@ def _rasterize_agg(
     # ------------------------------------------------------------
     # Load data
     # ------------------------------------------------------------
+    # The tiled builder feeds every neighbouring LAZ file to each tile, and
+    # only the strip of it inside the halo lands in the raster. Dropping the
+    # rest on load, before any per-point work, saves most of the run: the AOI
+    # test alone was 2 s per file. The margin keeps the points the TIN needs
+    # just outside the window; every other step bins by pixel and drops them.
+    west, south, east, north = rasterio.transform.array_bounds(height, width, transform)
+    m = _POINT_CROP_MARGIN_M
+    crop = (west - m, south - m, east + m, north + m)
+
     if laz_path is not None:
-
-        import laspy
-
-        with laspy.open(laz_path) as lf:
-            las = lf.read()
-
-        # Coordinates stay float64: in float32 a UTM northing near 4.6e6 m
-        # is rounded to 0.5 m, which moves returns by up to 0.25 m between
-        # pixels and stacks them on a lattice that leaves the TIN's Delaunay
-        # triangulation without a unique answer. z is fine in float32.
-        x = np.asarray(las.x, dtype=np.float64)
-        y = np.asarray(las.y, dtype=np.float64)
-        z = np.asarray(las.z, dtype=np.float32)
-        class_vals = np.asarray(las.classification, dtype=np.uint8)
+        x, y, z, class_vals = _read_lidar_points(laz_path, crop)
 
     else:
         # laz_points expected shape: Nx3 or Nx4
@@ -903,6 +975,12 @@ def _rasterize_agg(
             class_vals = laz_points[:, 3].astype(np.uint8)
         else:
             class_vals = None
+
+        keep = _in_box(x, y, crop)
+        if not keep.all():
+            x, y, z = x[keep], y[keep], z[keep]
+            if class_vals is not None:
+                class_vals = class_vals[keep]
 
     # ------------------------------------------------------------
     # Classification filter
@@ -924,15 +1002,26 @@ def _rasterize_agg(
     # ------------------------------------------------------------
     if aoi is not None and x.size > 0:
         try:
-            geom = aoi.buffer(aoi_buffer_in_meters) if aoi_buffer_in_meters > 0 else aoi
-            minx, miny, maxx, maxy = geom.bounds
+            # Clip the AOI to the points' extent (grown by the buffer, so the
+            # buffered edge is the same inside it) before buffering: a
+            # municipality outline has thousands of vertices, and both the
+            # buffer and the point-in-polygon test scale with them. A window
+            # wholly inside the AOI then skips the test altogether.
+            pts_box = shp_box(x.min(), y.min(), x.max(), y.max())
+            geom = aoi.intersection(pts_box.buffer(
+                aoi_buffer_in_meters + 1.0, join_style="mitre"
+            ))
+            if aoi_buffer_in_meters > 0:
+                geom = geom.buffer(aoi_buffer_in_meters)
 
-            bbox = (
-                    (x >= minx) & (x <= maxx) &
-                    (y >= miny) & (y <= maxy)
-            )
-
-            if np.any(bbox):
+            if geom.contains(pts_box):
+                pass  # every point is inside
+            elif not geom.is_empty:
+                minx, miny, maxx, maxy = geom.bounds
+                bbox = (
+                        (x >= minx) & (x <= maxx) &
+                        (y >= miny) & (y <= maxy)
+                )
                 inside = contains_xy(geom, x[bbox], y[bbox])
                 keep = np.zeros_like(x, bool)
                 keep[np.where(bbox)[0]] = inside
@@ -965,11 +1054,15 @@ def _rasterize_agg(
 
         in_range = np.zeros_like(x, bool)
         if np.any(valid):
-            band = filter_raster.read(filter_raster_band)
-            in_range[valid] = np.isin(
-                band[rows[valid], cols[valid]],
-                filter_points_from_class
+            # Read only the window the points cover: the filter raster spans
+            # the whole municipality and this runs once per LAZ file.
+            rv, cv = rows[valid], cols[valid]
+            r0, c0 = int(rv.min()), int(cv.min())
+            band = filter_raster.read(
+                filter_raster_band,
+                window=Window(c0, r0, int(cv.max()) - c0 + 1, int(rv.max()) - r0 + 1),
             )
+            in_range[valid] = np.isin(band[rv - r0, cv - c0], filter_points_from_class)
 
         keep = ~in_range if filter_mode == "exclude" else in_range
         x, y, z, class_vals = x[keep], y[keep], z[keep], class_vals[keep]
@@ -1764,7 +1857,7 @@ def reclassify_unclassified_points(
     return new_class, info
 
 
-@njit(parallel=True)
+@njit(parallel=True, cache=True)
 def _classify_pixels_numba(
     flat_idx,
     class_vals,
@@ -2753,7 +2846,7 @@ def _create_aoi_mask(
         return mask
         
     except Exception as e:
-        print(f"Warning: Could not create optimized AOI mask, falling back to pixel-by-pixel method: {e}")
+        warning(f"Could not create optimized AOI mask, falling back to pixel-by-pixel method: {e}")
         
         # Fallback: pixel-by-pixel method (slower but more reliable)
         mask = np.zeros((height, width), dtype=bool)
@@ -2783,7 +2876,7 @@ def _create_aoi_mask(
                     
         return mask
 
-@njit(parallel=True, fastmath=True)
+@njit(parallel=True, fastmath=True, cache=True)
 def _compute_slope_aspect(
     dem,
     slope,
@@ -3551,6 +3644,9 @@ def build_digital_model_from_lidar_pure(
         out_slope_path=None,
         out_aspect_path=None,
         cache_rasterization=True,
+        # False with return_arrays=True: compute every output (slope/aspect
+        # still follow their paths) but write none of them.
+        write_rasters=True,
 
         # ---- grid ----
         resolution=1.0,
@@ -4291,8 +4387,10 @@ def build_digital_model_from_lidar_pure(
     # SLOPE / ASPECT AND WRITE RASTERS
     # ------------------------------------------------------------
 
-    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    if write_rasters:
+        os.makedirs(os.path.dirname(out_path), exist_ok=True)
 
+    slope = aspect = None
     if out_slope_path or out_aspect_path:
         slope = np.full_like(dm, nodata, dtype=np.float32)
         aspect = np.full_like(dm, nodata, dtype=np.float32)
@@ -4320,27 +4418,44 @@ def build_digital_model_from_lidar_pure(
                     )
                     aspect, tmp = tmp, aspect
 
-        if out_slope_path:
+    # ------------------------------------------------------------
+    # CLIP TO THE BUFFERED AOI
+    #
+    # Last, so gap filling, smoothing and slope/aspect at the edge still saw
+    # the data beyond it; the filling above writes those pixels back.
+    # ------------------------------------------------------------
+    if aoi_mask is not None:
+        outside = ~aoi_mask
+        dm[outside] = nodata
+        class_dm[outside] = CLASS_NODATA
+        if out_slope_path or out_aspect_path:
+            slope[outside] = nodata
+            aspect[outside] = nodata
+        del outside
+
+    if out_slope_path or out_aspect_path:
+        if out_slope_path and write_rasters:
             with rasterio.open(out_slope_path, "w", **profile) as dst:
                 _write_raster_in_blocks(dst, slope, block_size)
         if not return_arrays:
             del slope
             gc.collect()
 
-        if out_aspect_path:
+        if out_aspect_path and write_rasters:
             with rasterio.open(out_aspect_path, "w", **profile) as dst:
                 _write_raster_in_blocks(dst, aspect, block_size)
         if not return_arrays:
             del aspect
             gc.collect()
 
-    with rasterio.open(out_path, "w", **profile) as dst:
-        _write_raster_in_blocks(dst,dm, block_size)
+    if write_rasters:
+        with rasterio.open(out_path, "w", **profile) as dst:
+            _write_raster_in_blocks(dst,dm, block_size)
     if not return_arrays:
         del dm
         gc.collect()
 
-    if out_classification_path:
+    if out_classification_path and write_rasters:
         cp = profile.copy()
         cp.update(dtype="uint8", nodata=CLASS_NODATA)
         with rasterio.open(out_classification_path, "w", **cp) as dst:
@@ -4353,8 +4468,7 @@ def build_digital_model_from_lidar_pure(
         filter_raster.close()
 
     if return_arrays:
-        return dm, class_dm, slope if 'slope' in locals() else None, \
-            aspect if 'aspect' in locals() else None, transform
+        return dm, class_dm, slope, aspect, transform
     else:
         return out_path
 
@@ -4491,7 +4605,7 @@ def _build_tile_plan(
         try:
             bb = _laz_bbox(p)
         except Exception as e:
-            logging.warning(f"Skipping {p}: cannot read header ({e})")
+            warning(f"Skipping {p}: cannot read header ({e})")
             continue
         all_bboxes.append(bb)
         kept_paths.append(str(p))
@@ -4574,6 +4688,81 @@ def _global_bounds_from_tiles(tiles, resolution, aoi_transformed=None):
 # PER-TILE WORKER
 # =============================================================================
 
+def _tile_windows(tile, buffer_px, global_tf, global_w, global_h, res):
+    """
+    Where a tile sits in the global grid: its CORE window (col, row, w, h),
+    the offset of its BUFFERED window and that window's bounds in metres.
+    None when the tile falls outside the grid.
+    """
+    cminx, cminy, cmaxx, cmaxy = tile["bbox"]
+
+    # ---------- CORE region snapped to the GLOBAL grid ----------
+    gx0 = global_tf.c                       # global minx
+    gy1 = global_tf.f                       # global maxy
+
+    core_col_off = int(math.floor((cminx - gx0) / res))
+    core_row_off = int(math.floor((gy1 - cmaxy) / res))
+    core_col_end = int(math.ceil((cmaxx - gx0) / res))
+    core_row_end = int(math.ceil((gy1 - cminy) / res))
+
+    core_col_off = max(0, core_col_off)
+    core_row_off = max(0, core_row_off)
+    core_col_end = min(global_w, core_col_end)
+    core_row_end = min(global_h, core_row_end)
+
+    core_w = core_col_end - core_col_off
+    core_h = core_row_end - core_row_off
+    if core_w <= 0 or core_h <= 0:
+        return None
+
+    # ---------- BUFFERED region (what we actually process) ----------
+    buf_col_off = max(0, core_col_off - buffer_px)
+    buf_row_off = max(0, core_row_off - buffer_px)
+    buf_col_end = min(global_w, core_col_end + buffer_px)
+    buf_row_end = min(global_h, core_row_end + buffer_px)
+
+    return {
+        "core": (core_col_off, core_row_off, core_w, core_h),
+        "buf_off": (buf_col_off, buf_row_off),
+        "buf_bounds": (
+            gx0 + buf_col_off * res,
+            gy1 - buf_row_end * res,
+            gx0 + buf_col_end * res,
+            gy1 - buf_row_off * res,
+        ),
+    }
+
+
+def _write_halo_strip(task):
+    """
+    Decode one LAZ file once and keep only the points its neighbouring tiles
+    read into their halos, so each tile decodes its own file alone instead
+    of itself plus up to eight neighbours. Returns (laz path, strip path).
+
+    The strip holds every point of the file inside any neighbour's buffered
+    window, grown past `_rasterize_agg`'s own crop margin, so each tile
+    gets exactly the points it would have read from the LAZ file.
+    """
+    path, windows, classification, strip_path = (
+        task["path"], task["windows"], task["classification"], task["strip_path"]
+    )
+    x, y, z, c = _read_lidar_points(path)
+    keep = np.zeros(x.shape, bool)
+    for w in windows:
+        keep |= _in_box(x, y, w)
+    if classification:
+        keep &= np.isin(c, classification)
+    np.savez(strip_path, x=x[keep], y=y[keep], z=z[keep], c=c[keep])
+    return path, strip_path
+
+
+def _tile_worker_init(numba_threads):
+    """Pool initializer: see `_LAZ_BACKEND`; share the cores between workers."""
+    global _LAZ_BACKEND
+    _LAZ_BACKEND = laspy.LazBackend.Lazrs
+    set_num_threads(max(1, min(numba_threads, get_num_threads())))
+
+
 def _process_single_tile(tile_kwargs):
     """
     Run build_digital_model_from_lidar_pure on a single LAZ tile and
@@ -4609,38 +4798,12 @@ def _process_single_tile(tile_kwargs):
     tmp_dir     = tile_kwargs["tmp_dir"]
     buildings_gdf_pickle = tile_kwargs.get("buildings_gdf_pickle")
 
-    cminx, cminy, cmaxx, cmaxy = tile["bbox"]
-
-    # ---------- CORE region snapped to the GLOBAL grid ----------
-    gx0 = global_tf.c                       # global minx
-    gy1 = global_tf.f                       # global maxy
-    res = resolution
-
-    core_col_off = int(math.floor((cminx - gx0) / res))
-    core_row_off = int(math.floor((gy1 - cmaxy) / res))
-    core_col_end = int(math.ceil((cmaxx - gx0) / res))
-    core_row_end = int(math.ceil((gy1 - cminy) / res))
-
-    core_col_off = max(0, core_col_off)
-    core_row_off = max(0, core_row_off)
-    core_col_end = min(global_w, core_col_end)
-    core_row_end = min(global_h, core_row_end)
-
-    core_w = core_col_end - core_col_off
-    core_h = core_row_end - core_row_off
-    if core_w <= 0 or core_h <= 0:
+    win = _tile_windows(tile, buffer_m, global_tf, global_w, global_h, resolution)
+    if win is None:
         return None
-
-    # ---------- BUFFERED region (what we actually process) ----------
-    buf_col_off = max(0, core_col_off - buffer_m)
-    buf_row_off = max(0, core_row_off - buffer_m)
-    buf_col_end = min(global_w, core_col_end + buffer_m)
-    buf_row_end = min(global_h, core_row_end + buffer_m)
-
-    buf_minx = gx0 + buf_col_off * res
-    buf_maxx = gx0 + buf_col_end * res
-    buf_maxy = gy1 - buf_row_off * res
-    buf_miny = gy1 - buf_row_end * res
+    core_col_off, core_row_off, core_w, core_h = win["core"]
+    buf_col_off, buf_row_off = win["buf_off"]
+    buf_minx, buf_miny, buf_maxx, buf_maxy = win["buf_bounds"]
 
     # ---------- Load buildings GDF subset (if any) ----------
     buildings_gdf = None
@@ -4661,7 +4824,9 @@ def _process_single_tile(tile_kwargs):
     # ---------- LAZ files to feed the pure function ----------
     # Self + neighbors so the halo contains REAL points, not synthetic fill.
     # The pure function already clips to `bounds`, so extra area is free-of-cost.
-    laz_inputs = [tile["path"]] + list(tile.get("neighbors", []))
+    # Neighbours come as halo strips when the builder wrote them.
+    strips = tile_kwargs.get("halo_strips") or {}
+    laz_inputs = [tile["path"]] + [strips.get(n, n) for n in tile.get("neighbors", [])]
 
     # ---------- Build kwargs for the pure function ----------
     pure_kwargs = dict(params)
@@ -4676,6 +4841,8 @@ def _process_single_tile(tile_kwargs):
         out_classification_path=str(tile_dir / "class.tif") if want_class else None,
         classification_correction_buildings_gdf=buildings_gdf,
         cache_rasterization=False,
+        # The driver writes the returned arrays; per-tile files only on request.
+        write_rasters=tile_kwargs.get("keep_tile_files", False),
     ))
 
     with warnings.catch_warnings():
@@ -4779,7 +4946,7 @@ def build_digital_model_from_lidar_tiled(
         out_slope_path=None,
         out_aspect_path=None,
         tile_buffer_pixels=None,   # None = auto from smoothing/slope/gap-fill
-        n_workers=1,
+        n_workers=None,
         tmp_dir=None,
         keep_tile_files=False,
 ):
@@ -4793,7 +4960,8 @@ def build_digital_model_from_lidar_tiled(
 
     Parameters mirror the pure function; extras:
       - tile_buffer_pixels: halo in pixels (auto if None)
-      - n_workers: 1 = sequential, >1 = ProcessPoolExecutor
+      - n_workers: 1 = sequential, >1 = forked worker processes,
+        None = as many as free memory allows (at most half the cores)
       - tmp_dir: where per-tile intermediates live (auto if None)
       - keep_tile_files: keep per-tile rasters after merging
     """
@@ -4838,7 +5006,7 @@ def build_digital_model_from_lidar_tiled(
         user_override=tile_buffer_pixels,
     )
     buffer_m = buffer_px * resolution
-    logging.info(f"[tiled] per-tile buffer = {buffer_px} px ({buffer_m} m)")
+    info(f"Tile halo: {buffer_px} px ({buffer_m} m)")
 
     # ------------------------------------------------------------
     # Tile plan (one tile per LAZ file, with neighbor awareness)
@@ -4853,7 +5021,7 @@ def build_digital_model_from_lidar_tiled(
     if not tiles:
         raise ValueError("No LAZ tiles intersect the AOI.")
     avg_neighbors = sum(len(t["neighbors"]) for t in tiles) / max(1, len(tiles))
-    logging.info(f"[tiled] {len(tiles)} tiles, avg {avg_neighbors:.1f} neighbors/tile")
+    info(f"{len(tiles)} tiles, {avg_neighbors:.1f} neighbours each on average")
 
     # ------------------------------------------------------------
     # Global grid (covering all tile bboxes, optionally clipped by AOI)
@@ -4861,9 +5029,13 @@ def build_digital_model_from_lidar_tiled(
     if bounds is not None:
         gw, gh, gtf, _ = _aligned_grid_from_bounds(*bounds, resolution)
     else:
-        gw, gh, gtf, _ = _global_bounds_from_tiles(tiles, resolution, aoi_transformed)
+        # The buffered AOI: the output keeps the buffer, not just the AOI.
+        aoi_extent = aoi_transformed
+        if aoi_transformed is not None and aoi_buffer_in_meters > 0:
+            aoi_extent = aoi_transformed.buffer(aoi_buffer_in_meters)
+        gw, gh, gtf, _ = _global_bounds_from_tiles(tiles, resolution, aoi_extent)
 
-    logging.info(f"[tiled] global raster: {gw} x {gh} px @ {resolution} m")
+    info(f"Output raster: {gw} x {gh} px at {resolution} m")
 
     # ------------------------------------------------------------
     # Output GeoTIFFs (pre-allocated, tiled, windowed writes)
@@ -4891,28 +5063,26 @@ def build_digital_model_from_lidar_tiled(
     }
     class_profile = dict(elev_profile, dtype="uint8", nodata=255)
 
-    # Open output datasets (kept open for the whole run)
+    # Open output datasets (kept open for the whole run). No explicit nodata
+    # fill: GDAL's GTiff driver reads never-written blocks as, and writes
+    # them out as, the nodata value; filling took ~3 s per output.
     dst_elev   = rasterio.open(out_path, "w", **elev_profile)
-    # Fill with nodata explicitly (GTiff init is platform-dependent)
-    dst_elev.write(np.full((gh, gw), nodata, dtype="float32"), 1)
 
     dst_slope  = None
     dst_aspect = None
     dst_class  = None
     if want_slope:
         dst_slope = rasterio.open(out_slope_path, "w", **elev_profile)
-        dst_slope.write(np.full((gh, gw), nodata, dtype="float32"), 1)
     if want_aspect:
         dst_aspect = rasterio.open(out_aspect_path, "w", **elev_profile)
-        dst_aspect.write(np.full((gh, gw), nodata, dtype="float32"), 1)
     if want_class:
         dst_class = rasterio.open(out_classification_path, "w", **class_profile)
-        dst_class.write(np.full((gh, gw), 255, dtype="uint8"), 1)
 
     # ------------------------------------------------------------
     # Buildings GDF: pickle once, workers load-and-filter by bbox
     # ------------------------------------------------------------
     buildings_pickle_path = None
+    auto_tmp = tmp_dir is None
     if classification_correction_buildings_gdf is not None and len(classification_correction_buildings_gdf):
         import pickle, tempfile
         gdf = classification_correction_buildings_gdf
@@ -4992,6 +5162,70 @@ def build_digital_model_from_lidar_tiled(
         block_size=block_size,
     )
 
+    # ------------------------------------------------------------
+    # Workers: forked (the caller's script may have no __main__ guard, so
+    # spawn would run it again in each one), as many as memory allows.
+    # ------------------------------------------------------------
+    cpus = os.cpu_count() or 1
+    if n_workers is None:
+        free_gb = psutil.virtual_memory().available / 1024 ** 3
+        n_workers = max(1, min(cpus // 2, int(free_gb // _TILE_WORKER_RAM_GB), len(tiles)))
+    n_workers = max(1, min(n_workers, len(tiles)))
+    info(f"{n_workers} worker process(es)")
+
+    pool = None
+    if n_workers > 1:
+        import multiprocessing as mp
+        pool = ProcessPoolExecutor(
+            max_workers=n_workers,
+            mp_context=mp.get_context("fork"),
+            initializer=_tile_worker_init,
+            initargs=(max(1, cpus // n_workers),),
+        )
+
+    def _map(func, tasks, desc):
+        if pool is None:
+            for t in tqdm(tasks, desc=desc):
+                yield t, func(t)
+            return
+        futures = {pool.submit(func, t): t for t in tasks}
+        for fut in tqdm(as_completed(futures), total=len(futures), desc=desc):
+            t = futures[fut]
+            try:
+                yield t, fut.result()
+            except Exception as e:
+                tqdm.write(f"✗ Error: {desc}: {t.get('path') or t['tile']['path']}: {e!r}")
+                yield t, None
+
+    # ------------------------------------------------------------
+    # Halo strips: each neighbouring LAZ file decoded once, not once per
+    # tile that borders it.
+    # ------------------------------------------------------------
+    m = _POINT_CROP_MARGIN_M + 2 * resolution
+    strip_windows = {}
+    for t in tiles:
+        win = _tile_windows(t, buffer_px, gtf, gw, gh, resolution)
+        if win is None:
+            continue
+        bminx, bminy, bmaxx, bmaxy = win["buf_bounds"]
+        for n in t["neighbors"]:
+            strip_windows.setdefault(n, []).append((bminx - m, bminy - m, bmaxx + m, bmaxy + m))
+
+    strip_dir = os.path.join(tmp_root, "halo_strips")
+    os.makedirs(strip_dir, exist_ok=True)
+    strip_tasks = [
+        {
+            "path": p,
+            "windows": wins,
+            "classification": classification,
+            "strip_path": os.path.join(
+                strip_dir, hashlib.sha1(p.encode()).hexdigest()[:12] + ".npz"
+            ),
+        }
+        for p, wins in strip_windows.items()
+    ]
+    halo_strips = {}
+
     tile_tasks = [
         {
             "tile":   t,
@@ -5005,6 +5239,8 @@ def build_digital_model_from_lidar_tiled(
             "want_class":  want_class,
             "tmp_dir":     tmp_root,
             "buildings_gdf_pickle": buildings_pickle_path,
+            "halo_strips": halo_strips,
+            "keep_tile_files": keep_tile_files,
         }
         for t in tiles
     ]
@@ -5032,34 +5268,27 @@ def build_digital_model_from_lidar_tiled(
             shutil.rmtree(res["tile_dir"], ignore_errors=True)
 
     try:
-        if n_workers is None or n_workers <= 1:
-            for task in tqdm(tile_tasks, desc="Tiles"):
-                res = _process_single_tile(task)
-                _write_result(res)
-                gc.collect()
-        else:
-            with ProcessPoolExecutor(max_workers=n_workers) as pool:
-                futures = {pool.submit(_process_single_tile, t): t for t in tile_tasks}
-                for fut in tqdm(as_completed(futures), total=len(futures), desc="Tiles"):
-                    try:
-                        res = fut.result()
-                    except Exception as e:
-                        t = futures[fut]
-                        logging.exception(f"[tiled] tile failed: {t['tile']['path']}: {e}")
-                        continue
-                    _write_result(res)
-                    gc.collect()
+        # A failed strip leaves its tiles reading the LAZ file itself.
+        for _, res in _map(_write_halo_strip, strip_tasks, "Halo strips"):
+            if res is not None:
+                halo_strips[res[0]] = res[1]
+
+        for _, res in _map(_process_single_tile, tile_tasks, "Tiles"):
+            _write_result(res)
+            gc.collect()
     finally:
+        if pool is not None:
+            pool.shutdown(cancel_futures=True)
+        import shutil
+        shutil.rmtree(strip_dir, ignore_errors=True)
         dst_elev.close()
         if dst_slope  is not None: dst_slope.close()
         if dst_aspect is not None: dst_aspect.close()
         if dst_class  is not None: dst_class.close()
 
-        if not keep_tile_files:
-            import shutil
+        if not keep_tile_files and auto_tmp:
             # Remove only auto-created tmp
-            if tmp_dir is None and buildings_pickle_path:
-                shutil.rmtree(os.path.dirname(buildings_pickle_path), ignore_errors=True)
+            shutil.rmtree(tmp_root, ignore_errors=True)
 
         # Restore numpy err state / warnings filter
         np.seterr(**_np_err)
@@ -5067,7 +5296,7 @@ def build_digital_model_from_lidar_tiled(
 
     return out_path
 
-@njit(parallel=True, fastmath=True)
+@njit(parallel=True, fastmath=True, cache=True)
 def _smooth_slope_by_class(
     slope,
     class_raster,
@@ -5133,7 +5362,7 @@ def _smooth_slope_by_class(
             out[i, j] = acc / n if n > 0 else v
 
 
-@njit(parallel=True, fastmath=True)
+@njit(parallel=True, fastmath=True, cache=True)
 def _smooth_slope_unified(
     slope,
     nodata,
@@ -5174,7 +5403,7 @@ def _smooth_slope_unified(
 
             out[i, j] = acc / n if n > 0 else v
 
-@njit(parallel=True, fastmath=True)
+@njit(parallel=True, fastmath=True, cache=True)
 def _smooth_aspect_by_class(
     aspect,
     class_raster,
@@ -5247,7 +5476,7 @@ def _smooth_aspect_by_class(
                 out[i, j] = a
 
 
-@njit(parallel=True, fastmath=True)
+@njit(parallel=True, fastmath=True, cache=True)
 def _smooth_aspect_unified(
     aspect,
     nodata,
@@ -5295,7 +5524,7 @@ def _smooth_aspect_unified(
             else:
                 out[i, j] = a
 
-@njit(parallel=True, fastmath=True) 
+@njit(parallel=True, fastmath=True, cache=True)
 def _smooth_unified(
     dem,
     nodata,
@@ -5337,7 +5566,7 @@ def _smooth_unified(
             out[i, j] = acc / n if n > 0 else z
 
 
-@njit(parallel=True, fastmath=True)
+@njit(parallel=True, fastmath=True, cache=True)
 def _smooth_by_class(
     dem,
     class_raster,
@@ -5560,22 +5789,22 @@ def remove_objects_from_dsm(
     os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
     
     # Read objects
-    print("Reading objects...")
+    info("Reading objects...")
     if isinstance(objects, str):
         objects_gdf = gpd.read_file(objects)
     else:
         objects_gdf = objects.copy()
         
     if objects_gdf.empty:
-        print("No objects to remove, copying original DSM")
+        info("No objects to remove, copying original DSM")
         import shutil
         shutil.copy2(dsm_path, out_path)
         return out_path
     
-    print(f"Processing {len(objects_gdf)} objects")
+    info(f"Processing {len(objects_gdf)} objects")
     
     # Read DSM metadata first
-    print("Reading DSM metadata...")
+    info("Reading DSM metadata...")
     with rasterio.open(dsm_path) as src:
         profile = src.profile.copy()
         transform = src.transform
@@ -5586,16 +5815,16 @@ def remove_objects_from_dsm(
     if objects_gdf.crs is None:
         raise ValueError("Objects GeoDataFrame has no CRS.")
     if crs and objects_gdf.crs != crs:
-        print("Converting CRS...")
+        info("Converting CRS...")
         objects_gdf = objects_gdf.to_crs(crs)
     
     # Apply buffer if specified - optimize by doing all at once
-    print(f"Applying {buffer_m}m buffer...")
+    info(f"Applying {buffer_m}m buffer...")
     if buffer_m > 0:
         # Use unary_union to merge overlapping geometries first, then buffer
         from shapely.ops import unary_union
         if len(objects_gdf) > 100:  # Only merge if many objects
-            print("Merging overlapping geometries for performance...")
+            info("Merging overlapping geometries for performance...")
             merged_geom = unary_union(objects_gdf.geometry.tolist())
             if hasattr(merged_geom, 'geoms'):
                 shapes = [mapping(geom.buffer(buffer_m)) for geom in merged_geom.geoms]
@@ -5607,7 +5836,7 @@ def remove_objects_from_dsm(
         shapes = [mapping(geom) for geom in objects_gdf.geometry if geom and not geom.is_empty]
     
     if shapes:
-        print("Creating mask...")
+        info("Creating mask...")
         from rasterio.features import rasterize
         
         mask = rasterize(
@@ -5620,7 +5849,7 @@ def remove_objects_from_dsm(
             all_touched=True  # This can be faster for small objects
         )
         
-        print("Reading and processing DSM data...")
+        info("Reading and processing DSM data...")
         # Read DSM data only when needed
         with rasterio.open(dsm_path) as src:
             dsm_data = src.read(1)
@@ -5632,14 +5861,14 @@ def remove_objects_from_dsm(
         # Update profile
         profile.update(dtype=rasterio.float32, nodata=nodata_value)
         
-        print("Saving masked DSM...")
+        info("Saving masked DSM...")
         # Save masked DSM
         with rasterio.open(out_path, 'w', **profile) as dst:
             dst.write(dsm_masked, 1)
             
         # Save debug mask if requested
         if save_mask_debug:
-            print("Saving debug mask...")
+            info("Saving debug mask...")
             mask_profile = profile.copy()
             mask_profile.update(dtype=rasterio.uint8, nodata=0)
             with rasterio.open(save_mask_debug, 'w', **mask_profile) as dst:
@@ -5647,15 +5876,15 @@ def remove_objects_from_dsm(
         
         masked_pixels = np.sum(mask)
         total_pixels = mask.size
-        print(f"Masked {masked_pixels:,} pixels ({masked_pixels/total_pixels*100:.1f}%) as objects")
+        info(f"Masked {masked_pixels:,} pixels ({masked_pixels/total_pixels*100:.1f}%) as objects")
         
     else:
-        print("No valid object geometries found, copying original DSM")
+        info("No valid object geometries found, copying original DSM")
         import shutil
         shutil.copy2(dsm_path, out_path)
     
     elapsed = time.time() - start_time
-    print(f"Object removal completed in {elapsed:.1f} seconds")
+    info(f"Object removal completed in {elapsed:.1f} seconds")
     return out_path
 
 
@@ -5703,14 +5932,14 @@ def build_dem_from_masked_dsm(
     
     os.makedirs(os.path.dirname(os.path.abspath(out_dem_path)), exist_ok=True)
     
-    print(f"Processing masked DSM: {dsm_path}")
+    info(f"Processing masked DSM: {dsm_path}")
     with rasterio.open(dsm_path) as ds:
         dsm = ds.read(1).astype(np.float32)
         prof = ds.profile.copy()
         H, W = dsm.shape
         dsm_nodata = ds.nodata
     
-    print(f"DSM size: {H} x {W} pixels")
+    info(f"DSM size: {H} x {W} pixels")
     
     # Create masks
     if dsm_nodata is not None:
@@ -5723,41 +5952,41 @@ def build_dem_from_masked_dsm(
     interpolation_pixels = np.sum(nodata_mask)
     valid_pixels = np.sum(valid_mask)
     
-    print(f"Found {interpolation_pixels:,} pixels to interpolate ({interpolation_pixels/(H*W)*100:.1f}%)")
-    print(f"Using {valid_pixels:,} valid pixels for interpolation")
+    info(f"Found {interpolation_pixels:,} pixels to interpolate ({interpolation_pixels/(H*W)*100:.1f}%)")
+    info(f"Using {valid_pixels:,} valid pixels for interpolation")
     
     if interpolation_pixels == 0:
-        print("No interpolation needed, copying input")
+        info("No interpolation needed, copying input")
         import shutil
         shutil.copy2(dsm_path, out_dem_path)
         return out_dem_path
     
     if valid_pixels < 10:
-        print("Warning: Too few valid pixels for reliable interpolation")
+        warning("Too few valid pixels for reliable interpolation")
         dem = np.full_like(dsm, nodata_out)
         dem[valid_mask] = dsm[valid_mask]
     else:
         # Interpolate NoData areas
-        print(f"Interpolating using {interpolation_method} method...")
+        info(f"Interpolating using {interpolation_method} method...")
         dem = _interpolate_nodata_fast(dsm, valid_mask, nodata_mask, interpolation_method, chunk_size, n_jobs)
     
     # Save debug mask if requested
     if save_mask_debug:
-        print("Saving interpolation mask...")
+        info("Saving interpolation mask...")
         mask_prof = prof.copy()
         mask_prof.update(dtype="uint8", nodata=0)
         with rasterio.open(save_mask_debug, 'w', **mask_prof) as dst:
             dst.write(nodata_mask.astype("uint8"), 1)
     
     # Write output
-    print(f"Writing DEM to: {out_dem_path}")
+    info(f"Writing DEM to: {out_dem_path}")
     prof.update(dtype="float32", nodata=dsm_nodata if dsm_nodata is not None else nodata_out,
                 compress="lzw", tiled=True, blockxsize=256, blockysize=256)
     with rasterio.open(out_dem_path, "w", **prof) as dst:
         dst.write(dem, 1)
     
     elapsed = time.time() - start_time
-    print(f"DEM generation completed in {elapsed:.1f} seconds!")
+    info(f"DEM generation completed in {elapsed:.1f} seconds!")
     return out_dem_path
 
 
@@ -5801,7 +6030,7 @@ def _interpolate_nodata_fast(
                 
             chunks.append((y_start, y_end, x_start, x_end))
     
-    print(f"Processing {len(chunks)} chunks with {n_jobs} workers...")
+    info(f"Processing {len(chunks)} chunks with {n_jobs} workers...")
     
     def process_chunk(chunk_info):
         y_start, y_end, x_start, x_end = chunk_info
@@ -5854,7 +6083,7 @@ def _interpolate_nodata_simple(dsm: np.ndarray, valid_mask: np.ndarray, nodata_m
     max_val = np.max(valid_values)
     value_range = max_val - min_val
     
-    print(f"Valid elevation range: {min_val:.2f} to {max_val:.2f} meters (range: {value_range:.2f}m)")
+    info(f"Valid elevation range: {min_val:.2f} to {max_val:.2f} meters (range: {value_range:.2f}m)")
     
     # Get valid points for interpolation
     y_valid, x_valid = np.where(valid_mask)
@@ -5874,11 +6103,11 @@ def _interpolate_nodata_simple(dsm: np.ndarray, valid_mask: np.ndarray, nodata_m
     distance_map = distance_transform_edt(~valid_mask)
     max_interp_distance = np.max(distance_map[nodata_mask])
     
-    print(f"Maximum interpolation distance: {max_interp_distance:.1f} pixels")
+    info(f"Maximum interpolation distance: {max_interp_distance:.1f} pixels")
     
     # For very isolated areas, use conservative nearest neighbor
     if max_interp_distance > 50:  # More than 50 pixels from valid data
-        print("Warning: Some areas are very far from valid data, using nearest neighbor interpolation")
+        warning("Some areas are very far from valid data, using nearest neighbor interpolation")
         method = 'nearest'
     
     try:
@@ -5896,7 +6125,7 @@ def _interpolate_nodata_simple(dsm: np.ndarray, valid_mask: np.ndarray, nodata_m
             xi = np.column_stack((x_interp, y_interp))  # (x, y) order
             vals_sub = values_valid
         
-        print(f"Interpolating {len(xi)} points using {len(points)} reference points with {method} method")
+        info(f"Interpolating {len(xi)} points using {len(points)} reference points with {method} method")
         
         interpolated = griddata(points, vals_sub, xi, method=method, fill_value=np.nan)
         
@@ -5913,37 +6142,37 @@ def _interpolate_nodata_simple(dsm: np.ndarray, valid_mask: np.ndarray, nodata_m
                 n_extreme = np.sum(extreme_mask)
                 extreme_min = np.min(interpolated[extreme_mask]) if np.any(extreme_mask) else 0
                 extreme_max = np.max(interpolated[extreme_mask]) if np.any(extreme_mask) else 0
-                print(f"Warning: Found {n_extreme} extreme interpolated values (range: {extreme_min:.1f} to {extreme_max:.1f})")
-                print("Clipping to valid data range...")
+                warning(f"Found {n_extreme} extreme interpolated values (range: {extreme_min:.1f} to {extreme_max:.1f})")
+                info("Clipping to valid data range...")
                 
                 interpolated = np.clip(interpolated, lower_bound, upper_bound)
         
         # Handle any remaining NaN values with nearest neighbor
         nan_mask = np.isnan(interpolated)
         if np.any(nan_mask):
-            print(f"Filling {np.sum(nan_mask)} NaN values with nearest neighbor")
+            info(f"Filling {np.sum(nan_mask)} NaN values with nearest neighbor")
             nn_interpolated = griddata(points, vals_sub, xi[nan_mask], method='nearest')
             interpolated[nan_mask] = nn_interpolated
         
         # Final safety check
         final_min = np.min(interpolated)
         final_max = np.max(interpolated)
-        print(f"Interpolated value range: {final_min:.2f} to {final_max:.2f} meters")
+        info(f"Interpolated value range: {final_min:.2f} to {final_max:.2f} meters")
         
         dem[nodata_mask] = interpolated
         
     except Exception as e:
-        print(f"Interpolation failed ({e}), using nearest neighbor fallback")
+        warning(f"Interpolation failed ({e}), using nearest neighbor fallback")
         try:
             points = np.column_stack((x_valid, y_valid))  # (x, y) order
             xi = np.column_stack((x_interp, y_interp))    # (x, y) order
             interpolated = griddata(points, values_valid, xi, method='nearest')
             dem[nodata_mask] = interpolated
-            print(f"Nearest neighbor range: {np.min(interpolated):.2f} to {np.max(interpolated):.2f} meters")
+            info(f"Nearest neighbor range: {np.min(interpolated):.2f} to {np.max(interpolated):.2f} meters")
         except Exception as e2:
-            print(f"Nearest neighbor also failed ({e2}), using mean value")
+            warning(f"Nearest neighbor also failed ({e2}), using mean value")
             mean_val = np.mean(values_valid)
             dem[nodata_mask] = mean_val
-            print(f"Using mean value: {mean_val:.2f} meters")
+            info(f"Using mean value: {mean_val:.2f} meters")
     
     return dem

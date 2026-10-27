@@ -34,25 +34,32 @@ most of them, and on a small or awkward roof that can beat a steeper tilt that
 yields more per module but fits fewer.
 """
 
+import os
+import sys
 from dataclasses import dataclass
+from math import cos, pi, sin
 
 import numpy as np
 import geopandas as gpd
 import pandas as pd
 import rasterio
+import shapely
 from rasterio.features import shapes
 from rasterio.transform import Affine, rowcol
 from shapely.affinity import rotate
 from shapely.geometry import box, shape
 from shapely.ops import unary_union
 from shapely.prepared import prep
-from tqdm import tqdm
+try:
+    from .logging_utils import tqdm
+except ImportError:
+    from greenshadow.logging_utils import tqdm
 
 try:
-    from .buildings_infer import _plane_coefficients, _anchor_height
+    from .buildings_infer import _plane_coefficients, _anchor_height, _WindowedBand
     from .shader import reconstruct_poa_from_basis
 except ImportError:
-    from greenshadow.buildings_infer import _plane_coefficients, _anchor_height
+    from greenshadow.buildings_infer import _plane_coefficients, _anchor_height, _WindowedBand
     from greenshadow.shader import reconstruct_poa_from_basis
 
 try:
@@ -161,42 +168,78 @@ def _grid_in_polygon(
     if maxx - minx < cell_u or maxy - miny < cell_v:
         return []
 
-    prepared = prep(local)
+    # Every candidate cell of every phase is tested in one vectorised call:
+    # a shapely box per cell was most of the planner's time. Positions are
+    # accumulated exactly as a cell-by-cell walk would, so the cell edges do
+    # not depend on how the loop is written.
+    def walk(start, cell, pitch, stop):
+        steps = []
+        while start + cell <= stop + 1e-9:
+            steps.append(start)
+            start += pitch
+        return np.asarray(steps)
 
-    best_cells = []
-
+    phases = []
     for step_u in range(phase_steps):
-        offset_u = step_u * pitch_u / phase_steps
-
+        xs = walk(minx + step_u * pitch_u / phase_steps, cell_u, pitch_u, maxx)
         for step_v in range(phase_steps):
-            offset_v = step_v * pitch_v / phase_steps
+            ys = walk(miny + step_v * pitch_v / phase_steps, cell_v, pitch_v, maxy)
+            if xs.size and ys.size:
+                phases.append(np.meshgrid(xs, ys))
 
-            rows = []
+    if not phases:
+        return []
 
-            y = miny + offset_v
-            while y + cell_v <= maxy + 1e-9:
+    flat_x = np.concatenate([grid_x.ravel() for grid_x, _ in phases])
+    flat_y = np.concatenate([grid_y.ravel() for _, grid_y in phases])
+    shapely.prepare(local)
+    covered = shapely.covers(
+        local, shapely.box(flat_x, flat_y, flat_x + cell_u, flat_y + cell_v)
+    )
 
-                row = []
-                x = minx + offset_u
-                while x + cell_u <= maxx + 1e-9:
+    # The first phase with the most cells wins.
+    best_x = best_y = np.empty(0)
+    offset = 0
+    for grid_x, grid_y in phases:
+        inside = covered[offset:offset + grid_x.size].reshape(grid_x.shape)
+        offset += grid_x.size
 
-                    cell = box(x, y, x + cell_u, y + cell_v)
-                    if prepared.covers(cell):
-                        row.append(cell)
+        if inside.sum() <= best_x.size:
+            continue
 
-                    x += pitch_u
+        # Serpentine: odd rows run right to left.
+        inside[1::2] = inside[1::2, ::-1]
+        grid_x[1::2] = grid_x[1::2, ::-1]
+        best_x = grid_x[inside]
+        best_y = grid_y[inside]
 
-                rows.append(row)
-                y += pitch_v
+    if best_x.size == 0:
+        return []
 
-            cells = []
-            for index, row in enumerate(rows):
-                cells.extend(row if index % 2 == 0 else row[::-1])
+    # Corners as shapely.geometry.box lays them, turned back with the
+    # arithmetic of shapely.affinity.rotate, so the cells are the same to
+    # the last bit as rotating each box would give.
+    x0, x1 = best_x, best_x + cell_u
+    y0, y1 = best_y, best_y + cell_v
+    corners_x = np.stack([x1, x1, x0, x0, x1], axis=1)
+    corners_y = np.stack([y0, y1, y1, y0, y0], axis=1)
 
-            if len(cells) > len(best_cells):
-                best_cells = cells
+    angle = -rotation_deg * pi / 180.0
+    cosp, sinp = cos(angle), sin(angle)
+    if abs(cosp) < 2.5e-16:
+        cosp = 0.0
+    if abs(sinp) < 2.5e-16:
+        sinp = 0.0
+    ox, oy = origin.x, origin.y
+    xoff = ox - ox * cosp + oy * sinp
+    yoff = oy - ox * sinp - oy * cosp
 
-    return [rotate(cell, -rotation_deg, origin=origin) for cell in best_cells]
+    turned = np.stack([
+        cosp * corners_x + -sinp * corners_y + xoff,
+        sinp * corners_x + cosp * corners_y + yoff,
+    ], axis=-1)
+
+    return list(shapely.polygons(turned))
 
 
 # ============================================================
@@ -797,6 +840,7 @@ def plan_pv_strings_in_buildings(
     output_summary_path=None,
     layer_prefix="poa_",
     progress=False,
+    n_workers=None,
 ):
     """
     Plan PV strings over detected roof planes and aggregate them per building.
@@ -909,6 +953,11 @@ def plan_pv_strings_in_buildings(
     layer_prefix : str, default="poa_"
         Prefix for the GeoPackage layer names, so the scenarios sort together
         in the layer list: ``poa_coplanar``, ``poa_south_05``, ``poa_best``.
+    progress : bool, default=False
+        Show a progress bar over the buildings.
+    n_workers : int, optional
+        Buildings planned at once, in forked processes (default: one per
+        CPU). The output does not depend on it.
 
     Returns
     -------
@@ -1042,12 +1091,13 @@ def plan_pv_strings_in_buildings(
         "objective": objective,
     }
 
-    dsm = None
     dsm_transform = None
     dsm_nodata = None
     if dsm_path is not None:
+        # Only its grid here: each process reads the windows under the planes
+        # it plans, rather than the whole raster - 4 GB at 0.2 m on a
+        # municipality - being loaded up front.
         with rasterio.open(dsm_path) as src:
-            dsm = src.read(1)
             dsm_transform = src.transform
             dsm_nodata = src.nodata
 
@@ -1058,186 +1108,60 @@ def plan_pv_strings_in_buildings(
     all_records = []
     summary_rows = []
 
-    groups = planes.groupby(building_id_column, sort=False)
-    iterator = tqdm(groups, desc="Planning PV strings", unit="building") if progress else groups
+    global _PLAN_JOB
+    import multiprocessing as mp
+    from concurrent.futures import ProcessPoolExecutor
 
-    for building_id, building_planes in iterator:
+    groups = list(planes.groupby(building_id_column, sort=False))
 
-        contexts = []
+    _PLAN_JOB = {
+        "groups": groups,
+        "basis_path": poa_basis_path if needs_basis else None,
+        "total_path": annual_energy_path if needs_total else None,
+        "tilt_column": tilt_column,
+        "azimuth_column": azimuth_column,
+        "plane_id_column": plane_id_column,
+        "building_id_column": building_id_column,
+        "setback_m": setback_m,
+        "obstacle_residual_m": obstacle_residual_m,
+        "dsm_path": dsm_path,
+        "dsm_transform": dsm_transform,
+        "dsm_nodata": dsm_nodata,
+        "total_pixel_area": total_pixel_area,
+        "modules": modules,
+        "config": config,
+        "string_size": string_size,
+        "min_string_size": min_string_size,
+        "objective": objective,
+    }
 
-        for _, plane in building_planes.iterrows():
-            context = _plane_context(
-                plane,
-                tilt_column=tilt_column,
-                azimuth_column=azimuth_column,
-                plane_id_column=plane_id_column,
-                setback_m=setback_m,
-                obstacle_residual_m=obstacle_residual_m,
-                dsm=dsm,
-                dsm_transform=dsm_transform,
-                dsm_nodata=dsm_nodata,
-                basis_src=basis_src,
-                total_src=total_src,
-                total_pixel_area=total_pixel_area,
+    if n_workers is None:
+        n_workers = os.cpu_count() or 1
+    n_workers = max(1, min(n_workers, len(groups)))
+    can_fork = sys.platform.startswith("linux") and "fork" in mp.get_all_start_methods()
+
+    # Buildings are independent, so they are spread over forked processes
+    # and come back in order: the output does not depend on n_workers.
+    pool = None
+    try:
+        if n_workers == 1 or not can_fork:
+            results = map(_plan_building, range(len(groups)))
+        else:
+            pool = ProcessPoolExecutor(n_workers, mp_context=mp.get_context("fork"))
+            results = pool.map(
+                _plan_building, range(len(groups)),
+                chunksize=max(1, min(8, len(groups) // (n_workers * 8)))
             )
-            if context is not None:
-                contexts.append(context)
-
-        if not contexts:
-            continue
-
-        # scenario -> the module size that wins it, and what it places.
-        winners = {}
-
-        for module in modules:
-
-            plane_plans = [_plan_plane(context, module, config) for context in contexts]
-
-            # The POA filter is building-wide, so the whole roof has to be laid
-            # out before a single module can be judged. Each scenario layer is
-            # referenced to its own best module - a layer is one mounting
-            # geometry and comparing across tilts inside it would be comparing
-            # different designs - while "best", which mixes mountings freely,
-            # answers to the best module the building reaches at all.
-            scenario_reference = {}
-
-            for plans in plane_plans:
-                for scenario, variants in plans.items():
-                    top = max(variant["poa_max"] for variant in variants)
-                    scenario_reference[scenario] = max(
-                        scenario_reference.get(scenario, 0.0), top
-                    )
-
-            scenarios = sorted(scenario_reference)
-
-            if not scenarios:
-                continue
-
-            ratio = config["min_poa_ratio"]
-            best_threshold = ratio * max(scenario_reference.values())
-
-            # scenario -> the plan each plane takes, aligned with contexts.
-            selected = {
-                scenario: [
-                    _select_variant(
-                        plans.get(scenario, []),
-                        ratio * scenario_reference[scenario],
-                        config,
-                    )
-                    for plans in plane_plans
-                ]
-                for scenario in scenarios
-            }
-
-            # The per-plane optimum, which is what a designer would actually
-            # build: each plane takes its own best mounting rather than being
-            # forced into one municipality-wide orientation the way a scenario
-            # layer is.
-            selected[BEST_SCENARIO] = [
-                max(
-                    (
-                        plan
-                        for plan in (
-                            _select_variant(variants, best_threshold, config)
-                            for variants in plans.values()
-                        )
-                        if plan is not None
-                    ),
-                    key=lambda item: item["score"],
-                    default=None,
-                )
-                for plans in plane_plans
-            ]
-
-            for scenario in scenarios + [BEST_SCENARIO]:
-
-                records = []
-                roof_area = 0.0
-                buildable_area = 0.0
-                next_string_id = 0
-
-                for context, plan in zip(contexts, selected[scenario]):
-
-                    if plan is None:
-                        continue
-
-                    # Copied because the same plan feeds both its own scenario
-                    # and "best", and _assign_strings writes into the records.
-                    strung, next_string_id = _assign_strings(
-                        [dict(record) for record in plan["records"]],
-                        string_size,
-                        min_string_size,
-                        next_string_id,
-                    )
-
-                    if not strung:
-                        continue
-
-                    records.extend(strung)
-
-                    # Only the planes that actually took modules count towards
-                    # the area, so coverage_ratio stays meaningful on a scenario
-                    # that no pitched - or no flat - plane can host.
-                    roof_area += context["roof_area_m2"]
-                    buildable_area += context["buildable_area_m2"]
-
-                if not records:
-                    continue
-
-                energy = float(sum(record["energy_kwh"] for record in records))
-                peak_kw = float(sum(record["peak_kw"] for record in records))
-
-                if objective == "specific_yield":
-                    score = energy / peak_kw if peak_kw else 0.0
-                else:
-                    score = energy
-
-                previous = winners.get(scenario)
-
-                if previous is None or score > previous["score"]:
-                    winners[scenario] = {
-                        "score": score,
-                        "energy_kwh": energy,
-                        "peak_kw": peak_kw,
-                        "records": records,
-                        "module_name": module.name,
-                        "roof_area_m2": roof_area,
-                        "buildable_area_m2": buildable_area,
-                    }
-
-        for scenario in sorted(winners, key=_scenario_sort_key):
-
-            winner = winners[scenario]
-            records = winner["records"]
-
-            for record in records:
-                record["scenario"] = scenario
-                record[building_id_column] = building_id
-
-            all_records.extend(records)
-
-            module_area = float(sum(record["area_m2"] for record in records))
-            buildable_area = winner["buildable_area_m2"]
-            peak_kw = winner["peak_kw"]
-
-            summary_rows.append({
-                "scenario": scenario,
-                building_id_column: building_id,
-                "module_name": winner["module_name"],
-                "n_modules": len(records),
-                "n_strings": len({record["string_id"] for record in records}),
-                "peak_kw": peak_kw,
-                "energy_kwh": winner["energy_kwh"],
-                "specific_yield_kwh_kwp": (
-                    winner["energy_kwh"] / peak_kw if peak_kw else np.nan
-                ),
-                "roof_area_m2": winner["roof_area_m2"],
-                "buildable_area_m2": buildable_area,
-                "module_area_m2": module_area,
-                "coverage_ratio": (
-                    module_area / buildable_area if buildable_area else np.nan
-                ),
-            })
+        if progress:
+            results = tqdm(results, total=len(groups), desc="Planning PV strings", unit="building")
+        for building_records, building_summary in results:
+            all_records.extend(building_records)
+            summary_rows.extend(building_summary)
+    finally:
+        if pool is not None:
+            pool.shutdown()
+        _close_plan_sources()
+        _PLAN_JOB = None
 
     if basis_src is not None:
         basis_src.close()
@@ -1266,6 +1190,249 @@ def plan_pv_strings_in_buildings(
 
     return modules_gdf, building_summary
 
+
+
+def _plan_building(k):
+    """
+    One building's modules and summary rows, every scenario, for
+    ``plan_pv_strings_in_buildings``: ``(records, summary_rows)``.
+
+    Everything else comes from ``_PLAN_JOB``, which forked workers inherit
+    instead of having it pickled per building. The raster sources are opened
+    once per process: a GDAL handle is not shared across ``fork``.
+    """
+    job = _PLAN_JOB
+    building_id, building_planes = job["groups"][k]
+    basis_src, total_src, dsm = _plan_sources(job)
+
+    tilt_column = job["tilt_column"]
+    azimuth_column = job["azimuth_column"]
+    plane_id_column = job["plane_id_column"]
+    building_id_column = job["building_id_column"]
+    setback_m = job["setback_m"]
+    obstacle_residual_m = job["obstacle_residual_m"]
+    dsm_transform, dsm_nodata = job["dsm_transform"], job["dsm_nodata"]
+    total_pixel_area = job["total_pixel_area"]
+    modules = job["modules"]
+    config = job["config"]
+    string_size = job["string_size"]
+    min_string_size = job["min_string_size"]
+    objective = job["objective"]
+
+    building_records = []
+    building_summary = []
+
+
+    contexts = []
+
+    for _, plane in building_planes.iterrows():
+        context = _plane_context(
+            plane,
+            tilt_column=tilt_column,
+            azimuth_column=azimuth_column,
+            plane_id_column=plane_id_column,
+            setback_m=setback_m,
+            obstacle_residual_m=obstacle_residual_m,
+            dsm=dsm,
+            dsm_transform=dsm_transform,
+            dsm_nodata=dsm_nodata,
+            basis_src=basis_src,
+            total_src=total_src,
+            total_pixel_area=total_pixel_area,
+        )
+        if context is not None:
+            contexts.append(context)
+
+    if not contexts:
+        return [], []
+
+    # scenario -> the module size that wins it, and what it places.
+    winners = {}
+
+    for module in modules:
+
+        plane_plans = [_plan_plane(context, module, config) for context in contexts]
+
+        # The POA filter is building-wide, so the whole roof has to be laid
+        # out before a single module can be judged. Each scenario layer is
+        # referenced to its own best module - a layer is one mounting
+        # geometry and comparing across tilts inside it would be comparing
+        # different designs - while "best", which mixes mountings freely,
+        # answers to the best module the building reaches at all.
+        scenario_reference = {}
+
+        for plans in plane_plans:
+            for scenario, variants in plans.items():
+                top = max(variant["poa_max"] for variant in variants)
+                scenario_reference[scenario] = max(
+                    scenario_reference.get(scenario, 0.0), top
+                )
+
+        scenarios = sorted(scenario_reference)
+
+        if not scenarios:
+            continue
+
+        ratio = config["min_poa_ratio"]
+        best_threshold = ratio * max(scenario_reference.values())
+
+        # scenario -> the plan each plane takes, aligned with contexts.
+        selected = {
+            scenario: [
+                _select_variant(
+                    plans.get(scenario, []),
+                    ratio * scenario_reference[scenario],
+                    config,
+                )
+                for plans in plane_plans
+            ]
+            for scenario in scenarios
+        }
+
+        # The per-plane optimum, which is what a designer would actually
+        # build: each plane takes its own best mounting rather than being
+        # forced into one municipality-wide orientation the way a scenario
+        # layer is.
+        selected[BEST_SCENARIO] = [
+            max(
+                (
+                    plan
+                    for plan in (
+                        _select_variant(variants, best_threshold, config)
+                        for variants in plans.values()
+                    )
+                    if plan is not None
+                ),
+                key=lambda item: item["score"],
+                default=None,
+            )
+            for plans in plane_plans
+        ]
+
+        for scenario in scenarios + [BEST_SCENARIO]:
+
+            records = []
+            roof_area = 0.0
+            buildable_area = 0.0
+            next_string_id = 0
+
+            for context, plan in zip(contexts, selected[scenario]):
+
+                if plan is None:
+                    continue
+
+                # Copied because the same plan feeds both its own scenario
+                # and "best", and _assign_strings writes into the records.
+                strung, next_string_id = _assign_strings(
+                    [dict(record) for record in plan["records"]],
+                    string_size,
+                    min_string_size,
+                    next_string_id,
+                )
+
+                if not strung:
+                    continue
+
+                records.extend(strung)
+
+                # Only the planes that actually took modules count towards
+                # the area, so coverage_ratio stays meaningful on a scenario
+                # that no pitched - or no flat - plane can host.
+                roof_area += context["roof_area_m2"]
+                buildable_area += context["buildable_area_m2"]
+
+            if not records:
+                continue
+
+            energy = float(sum(record["energy_kwh"] for record in records))
+            peak_kw = float(sum(record["peak_kw"] for record in records))
+
+            if objective == "specific_yield":
+                score = energy / peak_kw if peak_kw else 0.0
+            else:
+                score = energy
+
+            previous = winners.get(scenario)
+
+            if previous is None or score > previous["score"]:
+                winners[scenario] = {
+                    "score": score,
+                    "energy_kwh": energy,
+                    "peak_kw": peak_kw,
+                    "records": records,
+                    "module_name": module.name,
+                    "roof_area_m2": roof_area,
+                    "buildable_area_m2": buildable_area,
+                }
+
+    for scenario in sorted(winners, key=_scenario_sort_key):
+
+        winner = winners[scenario]
+        records = winner["records"]
+
+        for record in records:
+            record["scenario"] = scenario
+            record[building_id_column] = building_id
+
+        building_records.extend(records)
+
+        module_area = float(sum(record["area_m2"] for record in records))
+        buildable_area = winner["buildable_area_m2"]
+        peak_kw = winner["peak_kw"]
+
+        building_summary.append({
+            "scenario": scenario,
+            building_id_column: building_id,
+            "module_name": winner["module_name"],
+            "n_modules": len(records),
+            "n_strings": len({record["string_id"] for record in records}),
+            "peak_kw": peak_kw,
+            "energy_kwh": winner["energy_kwh"],
+            "specific_yield_kwh_kwp": (
+                winner["energy_kwh"] / peak_kw if peak_kw else np.nan
+            ),
+            "roof_area_m2": winner["roof_area_m2"],
+            "buildable_area_m2": buildable_area,
+            "module_area_m2": module_area,
+            "coverage_ratio": (
+                module_area / buildable_area if buildable_area else np.nan
+            ),
+        })
+
+    return building_records, building_summary
+
+
+# What the workers of plan_pv_strings_in_buildings read their inputs from:
+# inherited with the forked process. _PLAN_SOURCES holds the raster sources
+# this process opened, with the pid that opened them.
+_PLAN_JOB = None
+_PLAN_SOURCES = None
+
+
+def _plan_sources(job):
+    """
+    The (basis, total) raster sources and the DSM, read window by window,
+    opened by this very process.
+    """
+    global _PLAN_SOURCES
+    if _PLAN_SOURCES is None or _PLAN_SOURCES[0] != os.getpid():
+        sources = [
+            rasterio.open(path) if path is not None else None
+            for path in (job["basis_path"], job["total_path"], job["dsm_path"])
+        ]
+        _PLAN_SOURCES = (os.getpid(), sources)
+    basis_src, total_src, dsm_src = _PLAN_SOURCES[1]
+    dsm = None if dsm_src is None else _WindowedBand(dsm_src, dtype=dsm_src.dtypes[0])
+    return basis_src, total_src, dsm
+
+
+def _close_plan_sources():
+    global _PLAN_SOURCES
+    if _PLAN_SOURCES is not None and _PLAN_SOURCES[0] == os.getpid():
+        for src in _PLAN_SOURCES[1]:
+            if src is not None:
+                src.close()
+    _PLAN_SOURCES = None
 
 
 def _plane_context(

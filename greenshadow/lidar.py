@@ -13,6 +13,8 @@ For utility functions, see utils.py
 """
 
 import os
+import json
+import hashlib
 import matplotlib.pyplot as plt
 from matplotlib.patches import Patch
 import geopandas as gpd
@@ -26,7 +28,8 @@ import numpy as np
 # Import utilities from the new modules
 from .utils import (
     _session, _reproject_geom, _to_shapely, _resolve_existing_url,
-    _download_many, _load_featurecollection, _filter_tiles
+    _download_many, _load_featurecollection, _filter_tiles,
+    _candidate_urls, _target_paths_for_url
 )
 from .logging_utils import info, warning
 
@@ -120,6 +123,7 @@ def icgc_tiles_from_geojson(
     *,
     pdf_plot_path: Optional[str] = None,
     show_plot: bool = False,
+    cache_path: Optional[str] = None,
 ) -> List[Dict]:
     """
     Find ICGC LiDAR tiles that intersect with an area of interest (AOI).
@@ -129,8 +133,13 @@ def icgc_tiles_from_geojson(
         aoi_epsg: EPSG code of the AOI coordinate system  
         aoi_buffer_in_meters: Buffer distance to apply to AOI (in meters)
         centroid_only: If True, return only the tile containing AOI centroid
-        pdf_plot_path: Optional path to save plot as PDF
+        pdf_plot_path: Optional path to save plot as PDF. Kept as is when
+            the tiles come from ``cache_path`` and the file exists.
         show_plot: Whether to display the plot
+        cache_path: Optional GeoJSON file holding the tiles found for this
+            AOI, buffer and ``centroid_only``. Reused when they match, so a
+            re-run neither downloads the ICGC tile index nor redraws the
+            plot; rewritten otherwise.
     
     Returns:
         List of tile feature dictionaries that intersect the AOI
@@ -145,20 +154,56 @@ def icgc_tiles_from_geojson(
     
     # Convert AOI to Shapely geometry
     aoi_geom = _to_shapely(aoi)
-    
-    # Load tiles from ICGC
-    features, tiles_epsg = _load_featurecollection(BASE_JSON)
-    
-    # Filter tiles
-    matching = _filter_tiles(
-        features=features,
-        aoi=aoi_geom,
-        aoi_epsg=aoi_epsg,
-        target_epsg=tiles_epsg,
-        aoi_buffer_in_meters=aoi_buffer_in_meters,
-        centroid_only=centroid_only
-    )
-    
+
+    # The selection depends on nothing else, so it identifies the cache.
+    key = hashlib.sha1(json.dumps([
+        BASE_JSON, aoi_geom.wkb_hex, aoi_epsg, float(aoi_buffer_in_meters), bool(centroid_only)
+    ]).encode()).hexdigest()
+
+    matching = None
+    if cache_path and os.path.exists(cache_path):
+        try:
+            with open(cache_path) as f:
+                cached = json.load(f)
+            if cached.get("greenshadow_key") == key:
+                matching, tiles_epsg = cached["features"], cached["epsg"]
+        except (OSError, ValueError, KeyError):
+            pass  # unreadable cache: compute again
+
+    from_cache = matching is not None
+    if from_cache:
+        info(f"Using cached tile selection: {cache_path}")
+    else:
+        # Load tiles from ICGC
+        features, tiles_epsg = _load_featurecollection(BASE_JSON)
+
+        # Filter tiles
+        matching = _filter_tiles(
+            features=features,
+            aoi=aoi_geom,
+            aoi_epsg=aoi_epsg,
+            target_epsg=tiles_epsg,
+            aoi_buffer_in_meters=aoi_buffer_in_meters,
+            centroid_only=centroid_only
+        )
+
+        if cache_path:
+            os.makedirs(os.path.dirname(os.path.abspath(cache_path)), exist_ok=True)
+            tmp = cache_path + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump({
+                    "type": "FeatureCollection",
+                    "crs": {"type": "name", "properties": {"name": f"urn:ogc:def:crs:EPSG::{tiles_epsg}"}},
+                    "features": matching,
+                    "epsg": tiles_epsg,
+                    "greenshadow_key": key,
+                }, f)
+            os.replace(tmp, cache_path)
+
+    # The plot only changes with the selection
+    if from_cache and pdf_plot_path and os.path.exists(pdf_plot_path):
+        pdf_plot_path = None
+
     # Create plot if requested
     if pdf_plot_path or show_plot:
         _plot_tiles_and_aoi(
@@ -203,12 +248,11 @@ def icgc_download_from_geojson(
         >>> print(f"Downloaded {len(paths)} files")
     """
     if not tiles:
-        tiles = gs.icgc_tiles_from_geojson(
+        tiles = icgc_tiles_from_geojson(
             aoi=aoi,
             aoi_epsg=aoi_epsg,
             aoi_buffer_in_meters=aoi_buffer_in_meters,
             centroid_only=False,
-            pdf_plot_path=f"{wd}/{municipality_name}/tiles.pdf"
         )
     
     urls = []
@@ -222,7 +266,16 @@ def icgc_download_from_geojson(
         if not id1k and not id10k:
             warning(f"Tile missing IDs: {props}")
             continue
-        
+
+        # Already downloaded: no need to ask the server whether it exists.
+        local = [
+            u for u in _candidate_urls(id1k, id10k)
+            if os.path.exists(_target_paths_for_url(u, out_dir)[0])
+        ]
+        if local:
+            urls.append(local[0])
+            continue
+
         url = _resolve_existing_url(s, id1k, id10k)
         if url:
             urls.append(url)
@@ -277,31 +330,27 @@ def _plot_tiles_and_aoi(
     # Plot tiles
     tiles_gdf.plot(ax=ax, facecolor='lightblue', edgecolor='blue', alpha=0.7, linewidth=1)
     
-    # Plot AOI
-    aoi_gdf.plot(ax=ax, facecolor='red', alpha=0.8, label='AOI')
+    # Plot AOI (translucent, so the basemap shows through)
+    aoi_gdf.plot(ax=ax, facecolor='red', edgecolor='red', alpha=0.35, linewidth=1.5, label='AOI')
     if aoi_buffer_in_meters > 0:
         aoi_buf_gdf.plot(ax=ax, facecolor='none', edgecolor='red', 
                         linestyle='--', alpha=0.8, label=f'AOI + {aoi_buffer_in_meters}m buffer')
     
-    # Add basemap
-    try:
-        # Convert to Web Mercator for basemap
-        tiles_web = tiles_gdf.to_crs(epsg=3857)
-        aoi_web = aoi_gdf.to_crs(epsg=3857)
-        
-        # Get bounds in Web Mercator
-        bounds = tiles_web.total_bounds
-        buffer = max(bounds[2] - bounds[0], bounds[3] - bounds[1]) * 0.1
-        
-        ctx.add_basemap(ax, crs=tiles_gdf.crs.to_string(), source=ctx.providers.OpenStreetMap.Mapnik, alpha=0.5)
-    except Exception as e:
-        warning(f"Could not add basemap: {e}")
+    # Add basemap: open, keyless tile servers. openstreetmap.org's own tiles
+    # come back as "Access blocked" images to contextily, and CARTO's now
+    # want an API key; HOT is the light one, OpenTopoMap the fallback.
+    for source in (ctx.providers.OpenStreetMap.HOT, ctx.providers.OpenTopoMap):
+        try:
+            ctx.add_basemap(ax, crs=tiles_gdf.crs.to_string(), source=source)
+            break
+        except Exception as e:
+            warning(f"Could not add basemap {source.name}: {e}")
     
     # Formatting
     ax.set_title(f'ICGC LiDAR Tiles and AOI\n{len(tiles)} tiles found', fontsize=14, fontweight='bold')
     legend_elements = [
-        Patch(facecolor='blue', alpha=0.5, label='AOI'),
-        Patch(facecolor='red', alpha=0.5, label='Tiles')
+        Patch(facecolor='red', edgecolor='red', alpha=0.35, label='AOI'),
+        Patch(facecolor='lightblue', edgecolor='blue', alpha=0.7, label='Tiles')
     ]
     ax.legend(handles=legend_elements)
     ax.grid(True, alpha=0.3)
@@ -309,7 +358,7 @@ def _plot_tiles_and_aoi(
     # Add tile labels
     for idx, row in tiles_gdf.iterrows():
         centroid = row.geometry.centroid
-        tile_id = row.get('id1k', row.get('id10k', f'tile_{idx}'))
+        tile_id = row.get('ID1K') or row.get('ID10K') or f'tile_{idx}'
         ax.annotate(tile_id, (centroid.x, centroid.y), 
                    ha='center', va='center', fontsize=8, 
                    bbox=dict(boxstyle="round,pad=0.3", facecolor='white', alpha=0.8))

@@ -1,4 +1,5 @@
 # -*- coding: utf-8 -*-
+import calendar
 import fnmatch
 import math
 from typing import List, Dict, NamedTuple, Optional, Tuple, Any, Sequence
@@ -8,15 +9,14 @@ from rasterio.warp import reproject
 from osgeo import gdal
 import datetime as dt
 from .utils import _parse_iso8601_duration, _date_range_local_to_utc, has_cuda, rasterize_polygon_mask
-from .logging_utils import info
-from numba import njit, prange, cuda
+from .logging_utils import info, warning, tqdm
+from numba import njit, prange, cuda, float32, float64
 import scipy.ndimage as ndi
 import sys
 import os
 import rasterio
 import multiprocessing as mp
 import concurrent.futures
-from tqdm import tqdm
 from shapely.ops import transform
 import pyproj
 from concurrent.futures import ThreadPoolExecutor
@@ -56,7 +56,7 @@ def rasterize_aoi_mask(aoi, reference_path: str) -> np.ndarray:
     return mask.astype(bool)
 
 
-@njit(parallel=True, fastmath=True)
+@njit(parallel=True, fastmath=True, cache=True)
 def _shadow_scan(z_rot, nodata_rot, dz_per_px):
     H, W = z_rot.shape
     lit = np.zeros((H, W), dtype=np.uint8)
@@ -212,6 +212,67 @@ CANOPY_BAND_NAMES = (
 # Stamped on canopy hillshades so readers cannot mistake one for a plain hillshade
 # and silently drop the vegetation attenuation.
 CANOPY_RASTER_TAGS = {"GREENSHADOW_CANOPY": "path_lengths_m"}
+
+# How hillshades are written. Their values sit on a few levels - k/255 for the
+# hillshade, whole ray steps for the canopy path lengths - which the floating-point
+# predictor scrambles into noise. ZSTD on the raw floats writes a full-grid canopy
+# hillshade 7x faster than DEFLATE with PREDICTOR=3 (0.8 s against 4.4 s) and
+# makes it half the size, which also halves the disk reads that bound
+# compute_surface_solar_energies. Lossless either way.
+HILLSHADE_COMPRESSION = {"compress": "zstd", "zstd_level": 6, "predictor": 1}
+
+
+def geotiff_is_complete(path) -> bool:
+    """
+    Whether a GeoTIFF was written out in full: it opens, and every block has
+    been written and lies inside the file.
+
+    rasterio does not raise when GDAL fails to write - on a full disk, say,
+    the file is closed with blocks missing or empty - so such a file would
+    be taken as finished by every later run. Only the TIFF directory is
+    read, not the pixels: ~0.1 s for a canopy hillshade.
+    """
+    path = str(path)
+    if not os.path.isfile(path) or os.path.getsize(path) == 0:
+        return False
+
+    gdal.PushErrorHandler("CPLQuietErrorHandler")
+    try:
+        ds = gdal.Open(path)
+        if ds is None or ds.GetDriver().ShortName != "GTiff":
+            return ds is not None
+        size = os.path.getsize(path)
+        # pixel interleaving keeps all the bands in one set of blocks
+        separate = ds.GetMetadataItem("INTERLEAVE", "IMAGE_STRUCTURE") == "BAND"
+        for b in range(1, (ds.RasterCount if separate else 1) + 1):
+            band = ds.GetRasterBand(b)
+            bx, by = band.GetBlockSize()
+            for y in range((ds.RasterYSize + by - 1) // by):
+                for x in range((ds.RasterXSize + bx - 1) // bx):
+                    offset = band.GetMetadataItem(f"BLOCK_OFFSET_{x}_{y}", "TIFF")
+                    nbytes = band.GetMetadataItem(f"BLOCK_SIZE_{x}_{y}", "TIFF")
+                    if not offset or not nbytes or int(nbytes) == 0:
+                        return False
+                    if int(offset) + int(nbytes) > size:
+                        return False
+        return True
+    finally:
+        ds = None
+        gdal.PopErrorHandler()
+
+
+def _finish_geotiff(tmp_path, path):
+    """Move a GeoTIFF written under ``tmp_path`` to ``path``, if it was written in full."""
+    if not geotiff_is_complete(tmp_path):
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
+        raise OSError(
+            f"Writing {path} failed: the file came out incomplete "
+            "(disk full, or a write error)"
+        )
+    os.replace(tmp_path, path)
 
 
 class CanopyModel(NamedTuple):
@@ -1367,11 +1428,18 @@ def generate_multiple_hillshades_gdal(
     aoi_crs: str = "EPSG:4326",
     nodata_value: float = -9999.0,
     canopy: Optional[CanopyModel] = None,
+    cuda: bool | None = None,
 ) -> list[str]:
     """
     Generate hillshades normalized to [0,1], AOI-masked.
 
     Args:
+        cuda: Run on the GPU. ``None`` uses it when CUDA (driver + libNVVM) is
+            usable. The GPU path keeps the rasters on the device for every sun
+            position and marches each ray straight towards the sun on the DSM
+            grid, instead of rotating the grid, so it differs from the CPU path
+            by a few nearest-neighbour pixels along shadow edges. ``max_workers``
+            then sets the number of writer threads.
         canopy: Optional semi-transparent vegetation model from
             ``build_canopy_model_from_rasters``. When given, trees stop being
             opaque walls: each output gains three bands holding the metres of
@@ -1383,6 +1451,41 @@ def generate_multiple_hillshades_gdal(
     """
 
     os.makedirs(raster_dir, exist_ok=True)
+
+    valid_positions = []
+    for i, (az, alt) in enumerate(azimuth_altitude):
+        if alt > 0:
+            when = related_datetimes[i] if related_datetimes else None
+            valid_positions.append((i, az, alt, when))
+
+    if not valid_positions:
+        return []
+
+    if cuda is None:
+        cuda = has_cuda()
+    elif cuda and not has_cuda():
+        warning(
+            "CUDA requested but not usable (no GPU, driver or libNVVM); "
+            "falling back to the CPU hillshades."
+        )
+        cuda = False
+
+    if cuda:
+        return _generate_hillshades_cuda(
+            raster_dir,
+            dsm_path,
+            valid_positions,
+            zFactor=zFactor,
+            compute_edges=compute_edges,
+            creation_options=creation_options,
+            qgis_temporal=qgis_temporal,
+            max_workers=max_workers,
+            overwrite=overwrite,
+            aoi=aoi,
+            aoi_crs=aoi_crs,
+            nodata_value=nodata_value,
+            canopy=canopy,
+        )
 
     # The local hillshade wants the crown envelope, not the raw LiDAR canopy top.
     shading_dsm_path = dsm_path
@@ -1400,15 +1503,6 @@ def generate_multiple_hillshades_gdal(
             dst.write(canopy.render_surface.astype(np.float32), 1)
         shading_dsm_path = render_tmp
 
-    valid_positions = []
-    for i, (az, alt) in enumerate(azimuth_altitude):
-        if alt > 0:
-            when = related_datetimes[i] if related_datetimes else None
-            valid_positions.append((i, az, alt, when))
-
-    if not valid_positions:
-        return []
-
     max_workers = min(max_workers, len(valid_positions), mp.cpu_count())
 
     def process_single(args):
@@ -1419,7 +1513,7 @@ def generate_multiple_hillshades_gdal(
             base += "_" + (when.strftime("%Y-%m-%dT%H:%M:%S") if hasattr(when, "strftime") else str(when))
         out_path = os.path.join(raster_dir, f"{base}.tif")
 
-        if os.path.exists(out_path) and not overwrite:
+        if not overwrite and geotiff_is_complete(out_path):
             return out_path
 
         try:
@@ -1473,11 +1567,11 @@ def generate_multiple_hillshades_gdal(
             profile.update(
                 dtype="float32",
                 nodata=nodata_value,
-                compress="deflate",
-                predictor=3,
+                **HILLSHADE_COMPRESSION,
             )
 
-            with rasterio.open(out_path, "w", **profile) as dst:
+            tmp_path = out_path + ".part"
+            with rasterio.open(tmp_path, "w", **profile) as dst:
                 dst.write(hs, 1)
                 if path_lengths is not None:
                     dst.set_band_description(1, "hillshade_opaque")
@@ -1485,6 +1579,7 @@ def generate_multiple_hillshades_gdal(
                         dst.write(path_lengths[band - 2], band)
                         dst.set_band_description(band, name)
                     dst.update_tags(**tags)
+            _finish_geotiff(tmp_path, out_path)
 
             if hs_raw != final_path and os.path.exists(hs_raw):
                 os.remove(hs_raw)
@@ -1492,7 +1587,7 @@ def generate_multiple_hillshades_gdal(
             return out_path
 
         except Exception as e:
-            print(f"Error az={az} alt={alt}: {e}")
+            warning(f"Error az={az} alt={alt}: {e}")
             return None
 
     results = []
@@ -1506,6 +1601,406 @@ def generate_multiple_hillshades_gdal(
     finally:
         if render_tmp and os.path.exists(render_tmp):
             os.remove(render_tmp)
+
+    return results
+
+
+# ======================================================================================
+# CUDA HILLSHADES
+#
+# The same rasters as the CPU path above, without its two costs. The CPU path rotates
+# the grid so the sun comes from the left, scans the rows and rotates back: twelve
+# ``ndi.rotate`` calls per sun position with the canopy. And it reads the DSM, fills
+# its holes, writes the raw GDAL hillshade and reads it back for every position.
+# Here the DSM, canopy and AOI go to the device once for the whole run, the Horn
+# hillshade is computed in place, and each thread marches its own ray straight towards
+# the sun on the DSM grid, so nothing is rotated and nothing is lost in the corners
+# that a same-shape rotation cuts off.
+# ======================================================================================
+
+# Rows per kernel launch. Keeps every launch short on a GPU that also drives a
+# display, where one long kernel would trip the driver watchdog.
+_HILLSHADE_ROWS_PER_LAUNCH = 256
+_HILLSHADE_THREADS = (32, 8)
+
+
+@cuda.jit(cache=True)
+def _horn_hillshade_kernel(
+    z, nodata, out, r0,
+    inv_ewres, inv_nsres, sin_alt_254, cos_az_254, sin_az_254, square_z,
+    compute_edges,
+):
+    """
+    GDAL's Horn hillshade, as ``gdaldem hillshade`` writes it: 0 = nodata, 1..255.
+    In float64 on purpose: it is cheap next to the ray-march and keeps the rounding
+    identical to GDAL's.
+    """
+    j, i = cuda.grid(2)
+    i += r0
+    rows, cols = z.shape
+    if i >= rows or j >= cols:
+        return
+
+    out[i, j] = 0.0
+    if nodata[i, j]:
+        return
+
+    zc = z[i, j]
+    w = cuda.local.array(9, float64)
+    k = 0
+    for di in range(-1, 2):
+        for dj in range(-1, 2):
+            ii = i + di
+            jj = j + dj
+            if ii < 0 or ii >= rows or jj < 0 or jj >= cols or nodata[ii, jj]:
+                # GDAL leaves the pixel nodata, or with -compute_edges
+                # stands the centre in for the missing neighbour
+                if not compute_edges:
+                    return
+                w[k] = zc
+            else:
+                w[k] = z[ii, jj]
+            k += 1
+
+    x = ((w[0] + w[3] + w[3] + w[6]) - (w[2] + w[5] + w[5] + w[8])) * inv_ewres
+    y = ((w[6] + w[7] + w[7] + w[8]) - (w[0] + w[1] + w[1] + w[2])) * inv_nsres
+    cang = (sin_alt_254 - (y * cos_az_254 - x * sin_az_254)) / math.sqrt(
+        1.0 + square_z * (x * x + y * y)
+    )
+    out[i, j] = math.floor((1.0 if cang <= 0.0 else 1.0 + cang) + 0.5)
+
+
+@cuda.jit(cache=True)
+def _opaque_shadow_kernel(
+    z, nodata, aoi, hs, r0,
+    dx, dy, dz, zmax, max_steps, shadow, c255, nodata_value,
+):
+    """
+    GPU twin of ``_shadow_scan``: shadowed when any DSM pixel along the ray rises
+    above it. Turns the raw 0..255 hillshade in ``hs`` into the final 0..1 band.
+    """
+    j, i = cuda.grid(2)
+    i += r0
+    rows, cols = z.shape
+    if i >= rows or j >= cols:
+        return
+
+    if not aoi[i, j]:
+        hs[i, j] = nodata_value
+        return
+    if nodata[i, j]:
+        hs[i, j] = 0.0
+        return
+
+    fi = float32(i)
+    fj = float32(j)
+    last_row = float32(rows - 1)
+    last_col = float32(cols - 1)
+    z0 = z[i, j]
+    lit = True
+    for s in range(1, max_steps + 1):
+        # from the start every step, so float32 rounding does not drift the ray
+        fs = float32(s)
+        ri = fi + fs * dy
+        rj = fj + fs * dx
+        if ri < 0 or ri > last_row or rj < 0 or rj > last_col:
+            break
+        ray = z0 + fs * dz
+        if ray > zmax:
+            break
+        ii = int(ri + float32(0.5))
+        jj = int(rj + float32(0.5))
+        if nodata[ii, jj]:
+            continue
+        if z[ii, jj] > ray:
+            lit = False
+            break
+
+    if lit:
+        hs[i, j] = min(max(hs[i, j] / c255, float32(0.0)), float32(1.0))
+    else:
+        hs[i, j] = shadow
+
+
+@cuda.jit(cache=True)
+def _canopy_shadow_kernel(
+    render, opaque, ctop, cbase, cidx, nodata, aoi, hs, path, r0,
+    dx, dy, dz, ds, zmax, max_steps, shadow, c255, nodata_value,
+):
+    """
+    GPU twin of ``_canopy_path_scan``: metres of canopy crossed per height class,
+    stopping dead at the first opaque hit.
+    """
+    j, i = cuda.grid(2)
+    i += r0
+    rows, cols = render.shape
+    if i >= rows or j >= cols:
+        return
+
+    if not aoi[i, j]:
+        hs[i, j] = nodata_value
+        path[0, i, j] = nodata_value
+        path[1, i, j] = nodata_value
+        path[2, i, j] = nodata_value
+        return
+    if nodata[i, j]:
+        hs[i, j] = 0.0
+        path[0, i, j] = 0.0
+        path[1, i, j] = 0.0
+        path[2, i, j] = 0.0
+        return
+
+    fi = float32(i)
+    fj = float32(j)
+    last_row = float32(rows - 1)
+    last_col = float32(cols - 1)
+    z0 = render[i, j]
+    lit = True
+    p0 = float32(0.0)
+    p1 = float32(0.0)
+    p2 = float32(0.0)
+    for s in range(1, max_steps + 1):
+        fs = float32(s)
+        ri = fi + fs * dy
+        rj = fj + fs * dx
+        if ri < 0 or ri > last_row or rj < 0 or rj > last_col:
+            break
+        ray = z0 + fs * dz
+        if ray > zmax:
+            break
+        ii = int(ri + float32(0.5))
+        jj = int(rj + float32(0.5))
+        if nodata[ii, jj]:
+            continue
+        if opaque[ii, jj] >= ray:
+            # fully dark already: the path lengths would never be used
+            lit = False
+            p0 = float32(0.0)
+            p1 = float32(0.0)
+            p2 = float32(0.0)
+            break
+        ci = cidx[ii, jj]
+        if ci >= 0 and cbase[ii, jj] <= ray and ray <= ctop[ii, jj]:
+            if ci == 0:
+                p0 += ds
+            elif ci == 1:
+                p1 += ds
+            else:
+                p2 += ds
+
+    path[0, i, j] = p0
+    path[1, i, j] = p1
+    path[2, i, j] = p2
+    if lit:
+        hs[i, j] = min(max(hs[i, j] / c255, float32(0.0)), float32(1.0))
+    else:
+        hs[i, j] = shadow
+
+
+def _write_hillshade(out_path, hs, path_lengths, profile):
+    # via a temporary name, so an interrupted or failed write never leaves a
+    # truncated file that the next run would skip as already done
+    tmp_path = out_path + ".part"
+    with rasterio.open(tmp_path, "w", **profile) as dst:
+        dst.write(hs, 1)
+        if path_lengths is not None:
+            dst.set_band_description(1, "hillshade_opaque")
+            for band, name in enumerate(CANOPY_BAND_NAMES, start=2):
+                dst.write(path_lengths[band - 2], band)
+                dst.set_band_description(band, name)
+            dst.update_tags(**CANOPY_RASTER_TAGS)
+    _finish_geotiff(tmp_path, out_path)
+    return out_path
+
+
+def _generate_hillshades_cuda(
+    raster_dir: str,
+    dsm_path: str,
+    positions: list,
+    *,
+    zFactor: float,
+    compute_edges: bool,
+    creation_options: Optional[Dict[str, str]],
+    qgis_temporal: bool,
+    max_workers: int,
+    overwrite: bool,
+    aoi,
+    aoi_crs: str,
+    nodata_value: float,
+    canopy: Optional[CanopyModel],
+    shadow_value: float = 1.0,
+    canopy_max_steps: int = 20000,
+) -> list[str]:
+    """
+    CUDA path of ``generate_multiple_hillshades_gdal``, same file names and bands.
+    """
+    results = []
+    jobs = []
+    queued = set()
+    for _, az, alt, when in positions:
+        base = f"{int(az):03}_{int(alt):02}"
+        if when and qgis_temporal:
+            base += "_" + (when.strftime("%Y-%m-%dT%H:%M:%S") if hasattr(when, "strftime") else str(when))
+        out_path = os.path.join(raster_dir, f"{base}.tif")
+        results.append(out_path)
+        # positions that round to one file name are computed once
+        if out_path in queued or (not overwrite and geotiff_is_complete(out_path)):
+            continue
+        queued.add(out_path)
+        jobs.append((out_path, float(az), float(alt)))
+
+    if not jobs:
+        return results
+
+    with rasterio.open(dsm_path) as src:
+        dsm = src.read(1).astype(np.float32)
+        dsm_nodata = src.nodata
+        geotransform = src.transform
+        raster_crs = src.crs
+
+    shape = dsm.shape
+    rows, cols = shape
+    pixel_size = abs(geotransform.a)
+
+    nodata_mask = ~np.isfinite(dsm)
+    if dsm_nodata is not None:
+        nodata_mask |= dsm == dsm_nodata
+    inside = ~nodata_mask
+
+    # The local hillshade wants the crown envelope, not the raw LiDAR canopy top.
+    if canopy is not None:
+        if canopy.opaque.shape != shape:
+            raise ValueError(
+                f"canopy model shape {canopy.opaque.shape} does not match the "
+                f"DSM grid {shape}; build it from this DSM"
+            )
+        shade = canopy.render_surface.astype(np.float32)
+        shade_nodata = ~np.isfinite(shade)
+        if dsm_nodata is not None:
+            shade_nodata |= shade == dsm_nodata
+        zmax = max(
+            float(canopy.opaque[inside].max()) if inside.any() else 0.0,
+            float(canopy.crown_top.max()),
+        )
+    else:
+        shade = dsm
+        shade_nodata = nodata_mask
+        zmax = float(dsm[inside].max()) if inside.any() else 0.0
+
+    if aoi is not None:
+        transformer = pyproj.Transformer.from_crs(aoi_crs, raster_crs, always_xy=True).transform
+        aoi_mask = rasterize_aoi_mask(transform(transformer, aoi), dsm_path)
+    else:
+        aoi_mask = np.ones(shape, dtype=bool)
+
+    profile = {
+        "driver": "GTiff",
+        "width": cols,
+        "height": rows,
+        "crs": raster_crs,
+        "transform": geotransform,
+        "tiled": True,
+        "blockxsize": 256,
+        "blockysize": 256,
+        "bigtiff": "IF_SAFER",
+        **{k.lower(): v for k, v in (creation_options or {}).items()},
+    }
+    profile.update(
+        dtype="float32",
+        count=1 + (N_VEGETATION_CLASSES if canopy is not None else 0),
+        nodata=nodata_value,
+        num_threads="ALL_CPUS",
+        **HILLSHADE_COMPRESSION,
+    )
+
+    info(
+        f"Hillshades on GPU ({cuda.get_current_device().name}): "
+        f"{len(jobs)} sun positions, {cols} × {rows} px"
+    )
+
+    d_shade = cuda.to_device(np.ascontiguousarray(shade, dtype=np.float32))
+    d_shade_nodata = cuda.to_device(shade_nodata.astype(np.uint8))
+    d_nodata = cuda.to_device(nodata_mask.astype(np.uint8))
+    d_aoi = cuda.to_device(aoi_mask.astype(np.uint8))
+    d_hs = cuda.device_array(shape, dtype=np.float32)
+    if canopy is not None:
+        d_opaque = cuda.to_device(canopy.opaque.astype(np.float32))
+        d_ctop = cuda.to_device(canopy.crown_top.astype(np.float32))
+        d_cbase = cuda.to_device(canopy.crown_base.astype(np.float32))
+        d_cidx = cuda.to_device(canopy.class_index.astype(np.int8))
+        d_path = cuda.device_array((N_VEGETATION_CLASSES,) + shape, dtype=np.float32)
+    del shade, shade_nodata, nodata_mask, aoi_mask
+
+    inv_ewres = 1.0 / geotransform.a
+    inv_nsres = 1.0 / geotransform.e
+    z_scaled = zFactor / 8.0  # Horn's 8 * scale, with gdaldem's scale = 1
+    opaque_max_steps = rows + cols
+    band_rows = _HILLSHADE_ROWS_PER_LAUNCH
+    grid_x = (cols + _HILLSHADE_THREADS[0] - 1) // _HILLSHADE_THREADS[0]
+
+    def launches():
+        for r0 in range(0, rows, band_rows):
+            n = min(band_rows, rows - r0)
+            yield (grid_x, (n + _HILLSHADE_THREADS[1] - 1) // _HILLSHADE_THREADS[1]), r0
+
+    # Writing the deflated GeoTIFF is now the slow part, so it runs in the
+    # background while the GPU moves on; bounded so the host keeps at most
+    # max_workers finished rasters waiting in memory.
+    n_writers = max(1, max_workers)
+    pending = set()
+    with ThreadPoolExecutor(max_workers=n_writers) as writer:
+        for out_path, az, alt in tqdm(jobs, desc="Generating hillshades (CUDA)"):
+            az_rad = math.radians(az)
+            alt_rad = math.radians(alt)
+            cos_alt_z_254 = 254.0 * math.cos(alt_rad) * z_scaled
+            for grid, r0 in launches():
+                _horn_hillshade_kernel[grid, _HILLSHADE_THREADS](
+                    d_shade, d_shade_nodata, d_hs, r0,
+                    inv_ewres, inv_nsres,
+                    254.0 * math.sin(alt_rad),
+                    math.cos(az_rad) * cos_alt_z_254,
+                    math.sin(az_rad) * cos_alt_z_254,
+                    z_scaled * z_scaled,
+                    bool(compute_edges),
+                )
+
+            # unit step towards the sun, in (row, col); rows grow southwards
+            dx = np.float32(math.sin(az_rad))
+            dy = np.float32(-math.cos(az_rad))
+            dz = np.float32(math.tan(alt_rad) * pixel_size)
+            common = (
+                np.float32(shadow_value / 255.0),
+                np.float32(255.0),
+                np.float32(nodata_value),
+            )
+            for grid, r0 in launches():
+                if canopy is None:
+                    _opaque_shadow_kernel[grid, _HILLSHADE_THREADS](
+                        d_shade, d_nodata, d_aoi, d_hs, r0,
+                        dx, dy, dz, np.float32(zmax), opaque_max_steps, *common,
+                    )
+                else:
+                    _canopy_shadow_kernel[grid, _HILLSHADE_THREADS](
+                        d_shade, d_opaque, d_ctop, d_cbase, d_cidx, d_nodata,
+                        d_aoi, d_hs, d_path, r0,
+                        dx, dy, dz,
+                        np.float32(pixel_size / max(math.cos(alt_rad), 1e-3)),
+                        np.float32(zmax), int(canopy_max_steps), *common,
+                    )
+
+            hs = d_hs.copy_to_host()
+            path_lengths = d_path.copy_to_host() if canopy is not None else None
+
+            if len(pending) >= n_writers:
+                done, pending = concurrent.futures.wait(
+                    pending, return_when=concurrent.futures.FIRST_COMPLETED
+                )
+                for f in done:
+                    f.result()
+            pending.add(writer.submit(_write_hillshade, out_path, hs, path_lengths, profile))
+
+        for f in concurrent.futures.as_completed(pending):
+            f.result()
 
     return results
 
@@ -2163,7 +2658,7 @@ def apply_height_shadow_to_hillshades(
             out_path = out_dir / path.relative_to(hillshade_dir)
             out_path.parent.mkdir(parents=True, exist_ok=True)
 
-            if os.path.exists(out_path) and not overwrite:
+            if not overwrite and geotiff_is_complete(out_path):
                 return str(out_path)
 
             with rasterio.open(path) as src:
@@ -2171,7 +2666,7 @@ def apply_height_shadow_to_hillshades(
                 profile = src.profile.copy()
 
             if hs.shape != obstacle_mask.shape:
-                warnings.warn(f"Shape mismatch: {path}")
+                failed.append(f"{path.name}: shape {hs.shape}, DSM {obstacle_mask.shape}")
                 return None
 
             hs[obstacle_mask] = 0.0
@@ -2181,24 +2676,35 @@ def apply_height_shadow_to_hillshades(
             profile.update(
                 dtype="float32",
                 nodata=nodata_value,
-                compress="deflate",
-                predictor=3,
+                **HILLSHADE_COMPRESSION,
             )
 
-            with rasterio.open(out_path, "w", **profile) as dst:
+            tmp_path = f"{out_path}.part"
+            with rasterio.open(tmp_path, "w", **profile) as dst:
                 dst.write(hs, 1)
+            _finish_geotiff(tmp_path, out_path)
 
             return str(out_path)
 
         except Exception as e:
-            warnings.warn(str(e))
+            failed.append(f"{path.name}: {e}")
             return None
+
+    failed = []
 
     if parallel:
         with ThreadPoolExecutor(max_workers=max_workers) as ex:
             res = list(tqdm(ex.map(process, files), total=len(files)))
     else:
         res = [process(f) for f in tqdm(files)]
+
+    # A missing elevated hillshade would only surface later, in whatever
+    # reads the set; say which ones and why here instead.
+    if failed:
+        raise RuntimeError(
+            f"{len(failed)} of {len(files)} elevated-shadow hillshades failed:\n  "
+            + "\n  ".join(sorted(failed))
+        )
 
     return [r for r in res if r]
 
@@ -2246,23 +2752,25 @@ def _read_hillshade_bands(path: Path):
     opaque shadows applied and nodata zeroed, and ``path_lengths`` is the
     (3, H, W) canopy path length in metres, or None for a plain hillshade.
     """
-    with rasterio.open(path) as ds:
-        hs = ds.read(1).astype(np.float32)
+    # Deflate decoding is the slow part of a hillshade, not the disk: on a
+    # 10k x 11k canopy hillshade one thread takes ~10 s, all cores ~0.6 s.
+    with rasterio.Env(GDAL_NUM_THREADS="ALL_CPUS"), rasterio.open(path) as ds:
+        hs = ds.read(1).astype(np.float32, copy=False)
         nodata = ds.nodata
         has_canopy = (
             "GREENSHADOW_CANOPY" in ds.tags()
             and ds.count >= 1 + N_VEGETATION_CLASSES
         )
         path_lengths = (
-            ds.read(list(range(2, 2 + N_VEGETATION_CLASSES))).astype(np.float32)
+            ds.read(list(range(2, 2 + N_VEGETATION_CLASSES))).astype(np.float32, copy=False)
             if has_canopy
             else None
         )
 
     if nodata is not None:
-        hs = np.where(hs == nodata, 0.0, hs)
+        hs[hs == nodata] = 0.0
         if path_lengths is not None:
-            path_lengths = np.where(path_lengths == nodata, 0.0, path_lengths)
+            path_lengths[path_lengths == nodata] = 0.0
 
     return hs, path_lengths
 
@@ -2319,57 +2827,375 @@ def load_hillshade(
 
     return np.clip(hs, 0.0, 1.0).astype(np.float32)
 
-def _hillshade_energy_variants(
-    group,
-    hillshade_dir: Path,
-    azimuth: int,
-    altitude: int,
-    *,
-    leaf_type: Optional[int] = None,
-    reference_thickness_m: Optional[Sequence[float]] = None,
-):
-    """
-    Yield ``(beam, dni_energy, dhi_energy)`` for one (azimuth, altitude) bin.
+SOLAR_ENERGY_MODES = (
+    "total", "monthly", "fourier_decomposition", "fourier_poa",
+    "vertical_basis", "tracking_basis",
+)
 
-    Without a canopy this is a single item, exactly as before. With one it is a
-    item per month present in the bin, because the same sun position attenuates
-    differently in February and in July. The raster is read once either way and
-    only the cheap exponential is repeated.
-    """
-    def _energies(g):
+# Bands each mode accumulates. Monthly keeps 12 direct and 12 diffuse; its
+# two annual bands are their sums, added when the raster is written.
+_ACCUMULATOR_BANDS = {
+    "total": 2,
+    "monthly": 24,
+    "fourier_decomposition": 6,
+    "fourier_poa": 5,
+    "vertical_basis": 4,
+    "tracking_basis": 6,
+}
+
+
+def _solar_energy_band_names(mode: str) -> tuple:
+    if mode == "total":
+        return ("Direct", "Diffuse")
+    if mode == "monthly":
+        months = calendar.month_name[1:]
         return (
-            np.sum(g.DNI.values * g.dt_hours.values).astype(np.float32),
-            np.sum(g.DHI.values * g.dt_hours.values).astype(np.float32),
+            tuple(f"Direct - {m}" for m in months)
+            + tuple(f"Diffuse - {m}" for m in months)
+            + ("Direct - Annual", "Diffuse - Annual")
         )
+    if mode == "fourier_decomposition":
+        return ("A0 direct", "A1c cos(az)", "A1s sin(az)", "A2 sin(alt)",
+                "D0 diffuse", "D1 sin(alt)")
+    if mode == "fourier_poa":
+        return ("B_z direct cos(tilt)", "B_east direct sin(tilt)sin(az)",
+                "B_north direct sin(tilt)cos(az)", "D_sky diffuse horizontal",
+                "GHI global horizontal")
+    if mode == "vertical_basis":
+        return VERTICAL_BASIS_BANDS
+    return TRACKING_BASIS_BANDS
 
-    dni_E, dhi_E = _energies(group)
-    if dni_E == 0 and dhi_E == 0:
-        return
 
-    fn = _resolve_hillshade_path(hillshade_dir, azimuth, altitude)
-    base, path_lengths = _read_hillshade_bands(fn)
+def _iter_hillshade_bands(files):
+    """
+    ``_read_hillshade_bands`` over ``files``, one file ahead in the background.
 
-    if path_lengths is None:
-        yield np.clip(base, 0.0, 1.0), dni_E, dhi_E
-        return
+    GDAL fetches a tiled GeoTIFF tile by tile, which on these rasters gets a
+    third of the disk's sequential speed (1.3 s against 0.45 s for a 350 MB
+    canopy hillshade). So while one file is decoded the next is pulled into
+    the page cache with a plain sequential read, and the caller sums the
+    previous one meanwhile.
+    """
+    def warm(path):
+        with open(path, "rb", buffering=0) as f:
+            while f.read(64 << 20):
+                pass
 
-    if leaf_type is None:
-        raise ValueError(
-            f"{fn.name} is a canopy hillshade: pass canopy_leaf_type=0 (deciduous) "
-            f"or 1 (evergreen) to compute_surface_solar_energy, or regenerate the "
-            f"hillshades with canopy=None"
-        )
+    def read(k):
+        if k + 1 < len(files):
+            warmer.submit(warm, files[k + 1])
+        return _read_hillshade_bands(files[k])
 
-    for month, g in group.groupby(group.datetime_utc.dt.month):
-        dni_E, dhi_E = _energies(g)
+    with ThreadPoolExecutor(max_workers=1) as warmer, \
+            ThreadPoolExecutor(max_workers=1) as reader:
+        pending = reader.submit(read, 0) if files else None
+        for k in range(len(files)):
+            bands = pending.result()
+            if k + 1 < len(files):
+                pending = reader.submit(read, k + 1)
+            yield bands
+            del bands
+
+
+def _solar_energy_bins(df: pd.DataFrame) -> list:
+    """
+    The (azimuth, altitude) bins of a solar table and the energy each brings.
+
+    Returns ``[(az, alt, whole, by_month)]``: ``whole`` is the bin's single
+    ``(None, dni_E, dhi_E)``, ``by_month`` the same split by month, which is
+    what a canopy hillshade (whose attenuation changes with the leaves) and
+    the monthly mode need. Bins and months without energy are left out, so
+    their hillshade is never read.
+    """
+    df = df.assign(
+        dni_wh=df.DNI * df.dt_hours,
+        dhi_wh=df.DHI * df.dt_hours,
+        month=df.datetime_utc.dt.month,
+    )
+    bins = []
+    for (az, alt), g in df.groupby(["az_bin", "alt_bin"]):
+        dni_E, dhi_E = np.float32(g.dni_wh.sum()), np.float32(g.dhi_wh.sum())
         if dni_E == 0 and dhi_E == 0:
             continue
-        beam = apply_canopy_transmittance(
-            base, path_lengths, int(month),
-            leaf_type=leaf_type,
-            reference_thickness_m=reference_thickness_m,
+        by_month = [
+            (int(month), np.float32(m.dni_wh.sum()), np.float32(m.dhi_wh.sum()))
+            for month, m in g.groupby("month")
+        ]
+        by_month = [v for v in by_month if v[1] != 0 or v[2] != 0]
+        bins.append((int(az), int(alt), [(None, dni_E, dhi_E)], by_month))
+    return bins
+
+
+def _single_axis_constants(theta: float, phi: float, max_rotation: float):
+    """``(cos AOI, cos tilt)`` of a horizontal N-S tracker, as ``_accumulate_tracking_basis``."""
+    s_e = math.cos(phi) * math.sin(theta)
+    s_up = math.sin(phi)
+    rotation = min(max(math.atan2(s_e, s_up), -max_rotation), max_rotation)
+    cos_aoi = max(s_e * math.sin(rotation) + s_up * math.cos(rotation), 0.0)
+    return cos_aoi, math.cos(rotation)
+
+
+class _CpuSolarAccumulator:
+    """The bands of every requested mode, accumulated with the Numba CPU kernels."""
+
+    def __init__(self, modes, svf, valid, pixel_area, max_rotation):
+        self.acc = {
+            m: np.zeros((_ACCUMULATOR_BANDS[m],) + svf.shape, np.float32) for m in modes
+        }
+        self.svf = svf
+        self.valid = valid
+        self.pixel_area = pixel_area
+        self.max_rotation = max_rotation
+        self.beam = np.empty(svf.shape, np.float32)
+
+    def load(self, base, path_lengths):
+        self.base, self.path_lengths = base, path_lengths
+        if path_lengths is None:
+            np.clip(base, 0.0, 1.0, out=self.beam)
+
+    def add(self, month, mu, dni_E, dhi_E, theta, phi):
+        if mu is not None:
+            _canopy_beam(self.base, self.path_lengths, mu, self.beam)
+        hill, svf, valid = self.beam, self.svf, self.valid
+
+        for mode, a in self.acc.items():
+            if mode == "total":
+                _accumulate_energy_split(a[0], a[1], svf, hill, dni_E, dhi_E,
+                                         valid, self.pixel_area)
+            elif mode == "monthly":
+                _accumulate_energy_split(a[month - 1], a[month + 11], svf, hill,
+                                         dni_E, dhi_E, valid, self.pixel_area)
+            elif mode == "fourier_decomposition":
+                _accumulate_fourier(*a, hill, svf, dni_E, dhi_E, theta, phi,
+                                    valid, self.pixel_area)
+            elif mode == "fourier_poa":
+                _accumulate_poa_basis(*a, hill, svf, dni_E, dhi_E, theta, phi, valid)
+            elif mode == "vertical_basis":
+                _accumulate_vertical_basis(*a, hill, dni_E, theta, phi, valid)
+            else:
+                _accumulate_tracking_basis(*a, hill, svf, dni_E, dhi_E, theta, phi,
+                                           self.max_rotation, valid)
+
+    def result(self):
+        return self.acc
+
+
+@njit(parallel=True, fastmath=True, cache=True)
+def _canopy_beam(base, path_lengths, mu, out):
+    """``apply_canopy_transmittance`` clipped to [0, 1], in one pass."""
+    H, W = base.shape
+    for i in prange(H):
+        for j in range(W):
+            b = base[i, j] * np.exp(-(
+                mu[0] * path_lengths[0, i, j]
+                + mu[1] * path_lengths[1, i, j]
+                + mu[2] * path_lengths[2, i, j]
+            ))
+            out[i, j] = min(max(b, 0.0), 1.0)
+
+
+# ======================================================================================
+# CUDA SOLAR ENERGY
+#
+# The same sums as the Numba accumulators. Each is a few multiply-adds per pixel, so
+# on the GPU they cost next to nothing; the accumulators stay on the device for the
+# whole year and each hillshade crosses the bus once, however many modes and months
+# it feeds.
+# ======================================================================================
+
+_ENERGY_THREADS = (32, 8)
+
+
+@cuda.jit(device=True, inline=True)
+def _lit_fraction_gpu(hill, s_phi):
+    if s_phi <= 1e-6:
+        return 0.0
+    return min(max(hill / s_phi, 0.0), 1.0)
+
+
+@cuda.jit(cache=True)
+def _canopy_beam_kernel(base, path_lengths, mu0, mu1, mu2, out):
+    j, i = cuda.grid(2)
+    if i >= out.shape[0] or j >= out.shape[1]:
+        return
+    b = base[i, j] * math.exp(-(
+        mu0 * path_lengths[0, i, j]
+        + mu1 * path_lengths[1, i, j]
+        + mu2 * path_lengths[2, i, j]
+    ))
+    out[i, j] = min(max(b, 0.0), 1.0)
+
+
+@cuda.jit(cache=True)
+def _energy_split_kernel(acc, k_dir, k_dif, hill, svf, valid, dir_scale, dif_scale):
+    j, i = cuda.grid(2)
+    if i >= hill.shape[0] or j >= hill.shape[1] or not valid[i, j]:
+        return
+    acc[k_dir, i, j] += dir_scale * hill[i, j]
+    acc[k_dif, i, j] += dif_scale * svf[i, j]
+
+
+@cuda.jit(cache=True)
+def _fourier_kernel(acc, hill, svf, valid, dir_scale, dif_scale, c_theta, s_theta, s_phi):
+    j, i = cuda.grid(2)
+    if i >= hill.shape[0] or j >= hill.shape[1] or not valid[i, j]:
+        return
+    e_dir = dir_scale * hill[i, j]
+    e_dif = dif_scale * svf[i, j]
+    acc[0, i, j] += e_dir
+    acc[1, i, j] += e_dir * c_theta
+    acc[2, i, j] += e_dir * s_theta
+    acc[3, i, j] += e_dir * s_phi
+    acc[4, i, j] += e_dif
+    acc[5, i, j] += e_dif * s_phi
+
+
+@cuda.jit(cache=True)
+def _poa_basis_kernel(acc, hill, svf, valid, dni_E, dhi_E, s_phi, s_east, s_north):
+    j, i = cuda.grid(2)
+    if i >= hill.shape[0] or j >= hill.shape[1] or not valid[i, j]:
+        return
+    e_dir = dni_E * _lit_fraction_gpu(hill[i, j], s_phi)
+    e_dif = dhi_E * svf[i, j]
+    acc[0, i, j] += e_dir * s_phi
+    acc[1, i, j] += e_dir * s_east
+    acc[2, i, j] += e_dir * s_north
+    acc[3, i, j] += e_dif
+    acc[4, i, j] += e_dir * s_phi + e_dif
+
+
+@cuda.jit(cache=True)
+def _vertical_basis_kernel(acc, hill, valid, dni_E, s_phi, east, west, north, south):
+    j, i = cuda.grid(2)
+    if i >= hill.shape[0] or j >= hill.shape[1] or not valid[i, j]:
+        return
+    e_dir = dni_E * _lit_fraction_gpu(hill[i, j], s_phi)
+    acc[0, i, j] += e_dir * east
+    acc[1, i, j] += e_dir * west
+    acc[2, i, j] += e_dir * north
+    acc[3, i, j] += e_dir * south
+
+
+@cuda.jit(cache=True)
+def _tracking_basis_kernel(acc, hill, svf, valid, dni_E, dhi_E, s_phi, cos_aoi_1, cos_tilt_1):
+    j, i = cuda.grid(2)
+    if i >= hill.shape[0] or j >= hill.shape[1] or not valid[i, j]:
+        return
+    e_dir = dni_E * _lit_fraction_gpu(hill[i, j], s_phi)
+    e_dif = dhi_E * svf[i, j]
+    g = e_dir * s_phi + e_dif
+    acc[0, i, j] += e_dir
+    acc[1, i, j] += e_dif * (1.0 + s_phi) * 0.5
+    acc[2, i, j] += g * (1.0 - s_phi) * 0.5
+    acc[3, i, j] += e_dir * cos_aoi_1
+    acc[4, i, j] += e_dif * (1.0 + cos_tilt_1) * 0.5
+    acc[5, i, j] += g * (1.0 - cos_tilt_1) * 0.5
+
+
+def _cuda_solar_bytes(modes, shape) -> int:
+    """Device memory ``_CudaSolarAccumulator`` needs: accumulators, hillshade, beam, SVF, mask."""
+    n = shape[0] * shape[1]
+    planes = sum(_ACCUMULATOR_BANDS[m] for m in modes) + 1 + N_VEGETATION_CLASSES + 1 + 1
+    return n * (4 * planes + 1)
+
+
+class _CudaSolarAccumulator:
+    """``_CpuSolarAccumulator`` on the GPU; same calls, same bands."""
+
+    def __init__(self, modes, svf, valid, pixel_area, max_rotation):
+        shape = svf.shape
+        self.acc = {}
+        for m in modes:
+            d = cuda.device_array((_ACCUMULATOR_BANDS[m],) + shape, dtype=np.float32)
+            cuda.driver.device_memset(d, 0, d.nbytes)
+            self.acc[m] = d
+        self.svf = cuda.to_device(np.ascontiguousarray(svf, dtype=np.float32))
+        self.valid = cuda.to_device(valid.astype(np.uint8))
+        self.base = cuda.device_array(shape, dtype=np.float32)
+        self.beam = cuda.device_array(shape, dtype=np.float32)
+        self.path_lengths = None
+        self.pixel_area = pixel_area
+        self.max_rotation = max_rotation
+        self.grid = (
+            (shape[1] + _ENERGY_THREADS[0] - 1) // _ENERGY_THREADS[0],
+            (shape[0] + _ENERGY_THREADS[1] - 1) // _ENERGY_THREADS[1],
         )
-        yield np.clip(beam, 0.0, 1.0), dni_E, dhi_E
+
+    def load(self, base, path_lengths):
+        if path_lengths is None:
+            self.beam.copy_to_device(np.clip(base, 0.0, 1.0))
+            return
+        self.base.copy_to_device(base)
+        if self.path_lengths is None:
+            self.path_lengths = cuda.device_array(path_lengths.shape, dtype=np.float32)
+        self.path_lengths.copy_to_device(np.ascontiguousarray(path_lengths))
+
+    def add(self, month, mu, dni_E, dhi_E, theta, phi):
+        launch = (self.grid, _ENERGY_THREADS)
+        if mu is not None:
+            _canopy_beam_kernel[launch](
+                self.base, self.path_lengths,
+                float(mu[0]), float(mu[1]), float(mu[2]), self.beam,
+            )
+        hill, svf, valid = self.beam, self.svf, self.valid
+        dni_E, dhi_E = float(dni_E), float(dhi_E)
+        s_phi, c_phi = math.sin(phi), math.cos(phi)
+        s_theta, c_theta = math.sin(theta), math.cos(theta)
+
+        for mode, a in self.acc.items():
+            if mode in ("total", "monthly"):
+                k = 0 if mode == "total" else month - 1
+                _energy_split_kernel[launch](
+                    a, k, k + (1 if mode == "total" else 12), hill, svf, valid,
+                    dni_E * self.pixel_area, dhi_E * self.pixel_area,
+                )
+            elif mode == "fourier_decomposition":
+                _fourier_kernel[launch](
+                    a, hill, svf, valid,
+                    dni_E * self.pixel_area, dhi_E * self.pixel_area,
+                    c_theta, s_theta, s_phi,
+                )
+            elif mode == "fourier_poa":
+                _poa_basis_kernel[launch](
+                    a, hill, svf, valid, dni_E, dhi_E,
+                    s_phi, c_phi * s_theta, c_phi * c_theta,
+                )
+            elif mode == "vertical_basis":
+                s_e, s_n = c_phi * s_theta, c_phi * c_theta
+                _vertical_basis_kernel[launch](
+                    a, hill, valid, dni_E, s_phi,
+                    max(s_e, 0.0), max(-s_e, 0.0), max(s_n, 0.0), max(-s_n, 0.0),
+                )
+            else:
+                cos_aoi_1, cos_tilt_1 = _single_axis_constants(theta, phi, self.max_rotation)
+                _tracking_basis_kernel[launch](
+                    a, hill, svf, valid, dni_E, dhi_E, s_phi, cos_aoi_1, cos_tilt_1,
+                )
+
+    def result(self):
+        cuda.synchronize()
+        return {m: d.copy_to_host() for m, d in self.acc.items()}
+
+
+def _write_solar_energy(path, mode, bands, profile, aoi_mask, nodata_value,
+                        tracker_max_rotation_deg):
+    if mode == "monthly":
+        bands = np.concatenate(
+            [bands, bands[:12].sum(axis=0)[None], bands[12:].sum(axis=0)[None]]
+        )
+    bands[:, ~aoi_mask] = nodata_value
+    names = _solar_energy_band_names(mode)
+
+    # via a temporary name, so an interrupted run never leaves a raster the
+    # next run would take as finished
+    tmp_path = f"{path}.part"
+    with rasterio.open(tmp_path, "w", **dict(profile, count=len(bands))) as dst:
+        for band, (arr, name) in enumerate(zip(bands, names), 1):
+            dst.write(arr, band)
+            dst.set_band_description(band, name)
+        if mode == "tracking_basis":
+            dst.update_tags(TRACKER_MAX_ROTATION_DEG=str(tracker_max_rotation_deg))
+    _finish_geotiff(tmp_path, path)
 
 
 def compute_surface_solar_energy(
@@ -2378,7 +3204,7 @@ def compute_surface_solar_energy(
     hillshade_dir,
     svf_path,
     out_path,
-    mode: str = "total",   # "total" | "monthly" | "fourier_decomposition"
+    mode: str = "total",   # "total" | "monthly" | "fourier_decomposition" | ...
     aoi=None,
     aoi_crs: str = "EPSG:4326",
     nodata_value: float = -9999.0,
@@ -2386,9 +3212,14 @@ def compute_surface_solar_energy(
     canopy_leaf_type: Optional[int] = None,
     canopy_reference_thickness_m: Optional[Sequence[float]] = None,
     tracker_max_rotation_deg: float = 60.0,
+    cuda: Optional[bool] = None,
 ) -> str:
     """
     Compute surface solar energy with different aggregation strategies.
+
+    For more than one mode use compute_surface_solar_energies, which reads
+    the hillshades once for all of them. cuda runs the sums on the GPU
+    (None: when usable and the accumulators fit).
 
     ``mode="vertical_basis"`` and ``mode="tracking_basis"`` extend
     ``"fourier_poa"`` to the panels it cannot represent: vertical panels,
@@ -2467,28 +3298,68 @@ def compute_surface_solar_energy(
         so for those the ``total`` mode raster *is* the POA and should be used
         instead.
     """
+    return compute_surface_solar_energies(
+        solar_df,
+        modes=(mode,),
+        hillshade_dir=hillshade_dir,
+        svf_path=svf_path,
+        out_path=out_path,
+        aoi=aoi,
+        aoi_crs=aoi_crs,
+        nodata_value=nodata_value,
+        overwrite=overwrite,
+        canopy_leaf_type=canopy_leaf_type,
+        canopy_reference_thickness_m=canopy_reference_thickness_m,
+        tracker_max_rotation_deg=tracker_max_rotation_deg,
+        cuda=cuda,
+    )[mode]
 
-    import numpy as np
-    import rasterio
-    import pyproj
-    from pathlib import Path
-    from tqdm import tqdm
+
+def compute_surface_solar_energies(
+    solar_df,
+    *,
+    modes: Sequence[str],
+    hillshade_dir,
+    svf_path,
+    out_path,
+    aoi=None,
+    aoi_crs: str = "EPSG:4326",
+    nodata_value: float = -9999.0,
+    overwrite: bool = False,
+    canopy_leaf_type: Optional[int] = None,
+    canopy_reference_thickness_m: Optional[Sequence[float]] = None,
+    tracker_max_rotation_deg: float = 60.0,
+    cuda: Optional[bool] = None,
+) -> Dict[str, str]:
+    """
+    ``compute_surface_solar_energy`` for several modes in one read of the hillshades.
+
+    Reading the hillshades is most of the cost, and every mode is a sum over
+    the same ones, so asking for ``("total", "fourier_poa",
+    "fourier_decomposition")`` here takes about as long as one of them alone.
+    Modes, bands and arguments are those of ``compute_surface_solar_energy``.
+
+    ``cuda`` runs the sums on the GPU: ``None`` uses it when CUDA is usable and
+    the accumulators fit in its free memory, ``False`` keeps them on the CPU.
+    The next hillshade is read in the background either way.
+
+    Returns ``{mode: path written}``. A mode whose raster already exists is
+    returned as is unless ``overwrite``.
+    """
     from shapely.ops import transform as shp_transform
 
-    if mode not in {"total", "monthly", "fourier_decomposition", "fourier_poa",
-                    "vertical_basis", "tracking_basis"}:
-        raise ValueError(
-            "mode must be 'total', 'monthly', 'fourier_decomposition', "
-            "'fourier_poa', 'vertical_basis' or 'tracking_basis'"
-        )
-    out_path = out_path.replace(".tif", f"_{mode}.tif")
+    modes = list(dict.fromkeys(modes))
+    unknown = [m for m in modes if m not in SOLAR_ENERGY_MODES]
+    if unknown or not modes:
+        raise ValueError(f"modes must be among {SOLAR_ENERGY_MODES}, got {unknown or modes}")
 
-    if os.path.exists(out_path) and not overwrite:
-        return out_path
+    out_path = str(out_path)
+    paths = {m: out_path.replace(".tif", f"_{m}.tif") for m in modes}
+    todo = [m for m in modes if overwrite or not geotiff_is_complete(paths[m])]
+    if not todo:
+        return paths
 
     hillshade_dir = Path(hillshade_dir)
-    svf_path = Path(svf_path)
-    out_path = Path(out_path)
 
     # ==========================================================
     # SOLAR DATA PREPARATION
@@ -2509,57 +3380,31 @@ def compute_surface_solar_energy(
     df["dt_hours"] = (float(steps.median()) / 3600.0) if len(steps) else 1.0
 
     df = df[df.elevation > 0]
-
-    if mode == "monthly":
-        df["month"] = df.datetime_utc.dt.month
-        month_groups = dict(tuple(df.groupby("month")))
-    else:
-        month_groups = {1: df}
+    bins = _solar_energy_bins(df)
+    # resolved up front, so a missing hillshade fails now and not hours in
+    files = [_resolve_hillshade_path(hillshade_dir, az, alt) for az, alt, _, _ in bins]
 
     # ==========================================================
-    # GRID & SVF
+    # GRID, SVF & AOI
     # ==========================================================
     with rasterio.open(svf_path) as src:
         profile = src.profile.copy()
         H, W = src.height, src.width
-        transform = src.transform
         raster_crs = src.crs
+        pixel_area = abs(src.transform.a * src.transform.e)
         svf = src.read(1).astype(np.float32)
 
-    pixel_area = abs(transform.a * transform.e)
-
-    # ==========================================================
-    # AOI MASK
-    # ==========================================================
     if aoi is not None:
         transformer = pyproj.Transformer.from_crs(
             aoi_crs, raster_crs, always_xy=True
         ).transform
-        aoi_proj = shp_transform(transformer, aoi)
-        aoi_mask = rasterize_aoi_mask(aoi_proj, svf_path)
+        aoi_mask = rasterize_aoi_mask(shp_transform(transformer, aoi), svf_path)
     else:
         aoi_mask = np.ones((H, W), dtype=bool)
-
-    # ==========================================================
-    # OUTPUT PROFILE
-    # ==========================================================
-    if mode == "total":
-        n_bands = 2
-    elif mode == "monthly":
-        n_bands = 26
-    elif mode == "fourier_poa":
-        n_bands = 5
-    elif mode == "vertical_basis":
-        n_bands = 4
-    elif mode == "tracking_basis":
-        n_bands = 6
-    else:  # fourier_decomposition
-        n_bands = 6
 
     profile.update(
         dtype="float32",
         nodata=nodata_value,
-        count=n_bands,
         compress="zstd",
         zstd_level=9,
         predictor=3,
@@ -2567,218 +3412,78 @@ def compute_surface_solar_energy(
         blockxsize=256,
         blockysize=256,
         BIGTIFF="IF_SAFER",
+        num_threads="ALL_CPUS",
     )
 
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    with rasterio.open(out_path, "w", **profile):
-        pass
+    # ==========================================================
+    # BACKEND
+    # ==========================================================
+    if cuda is None:
+        cuda = has_cuda()
+        if cuda:
+            from numba import cuda as _cuda
+            free = _cuda.current_context().get_memory_info().free
+            if _cuda_solar_bytes(todo, (H, W)) > 0.9 * free:
+                warning(
+                    f"Solar energy accumulators ({_cuda_solar_bytes(todo, (H, W)) / 1e9:.1f} GB) "
+                    f"do not fit in the GPU's {free / 1e9:.1f} GB free; summing on the CPU."
+                )
+                cuda = False
+    elif cuda and not has_cuda():
+        warning(
+            "CUDA requested but not usable (no GPU, driver or libNVVM); "
+            "summing the solar energy on the CPU."
+        )
+        cuda = False
 
-    # ==========================================================
-    # ACCUMULATORS
-    # ==========================================================
-    if mode == "fourier_decomposition":
-        A0  = np.zeros((H, W), np.float32)
-        A1c = np.zeros((H, W), np.float32)
-        A1s = np.zeros((H, W), np.float32)
-        A2  = np.zeros((H, W), np.float32)
-        D0  = np.zeros((H, W), np.float32)
-        D1  = np.zeros((H, W), np.float32)
-    elif mode == "fourier_poa":
-        B_z   = np.zeros((H, W), np.float32)
-        B_e   = np.zeros((H, W), np.float32)
-        B_n   = np.zeros((H, W), np.float32)
-        D_sky = np.zeros((H, W), np.float32)
-        GHI   = np.zeros((H, W), np.float32)
-    elif mode == "vertical_basis":
-        vertical = [np.zeros((H, W), np.float32) for _ in range(4)]
-    elif mode == "tracking_basis":
-        tracking = [np.zeros((H, W), np.float32) for _ in range(6)]
-    else:
-        direct_annual  = np.zeros((H, W), np.float32)
-        diffuse_annual = np.zeros((H, W), np.float32)
+    backend = _CudaSolarAccumulator if cuda else _CpuSolarAccumulator
+    acc = backend(todo, svf, aoi_mask, pixel_area, np.deg2rad(tracker_max_rotation_deg))
+    monthly = "monthly" in todo
 
     # ==========================================================
     # MAIN LOOP
     # ==========================================================
-    for month_key, df_month in month_groups.items():
-        if df_month.empty:
-            continue
+    hillshades = _iter_hillshade_bands(files)
+    for (az, alt, whole, by_month), fn, (base, path_lengths) in zip(tqdm(
+        bins,
+        desc=f"Solar energy ({', '.join(todo)}{', CUDA' if cuda else ''})",
+        unit="group",
+        dynamic_ncols=True,
+    ), files, hillshades):
+        canopy = path_lengths is not None
+        if canopy and canopy_leaf_type is None:
+            hillshades.close()
+            raise ValueError(
+                f"{fn.name} is a canopy hillshade: pass canopy_leaf_type=0 "
+                f"(deciduous) or 1 (evergreen) to compute_surface_solar_energy, "
+                f"or regenerate the hillshades with canopy=None"
+            )
 
-        if mode == "monthly":
-            direct_month  = np.zeros((H, W), np.float32)
-            diffuse_month = np.zeros((H, W), np.float32)
-
-        hill_groups = df_month.groupby(["az_bin", "alt_bin"])
-
-        for (az, alt), g in tqdm(
-            hill_groups,
-            desc=f"Solar energy ({mode})",
-            unit="group",
-            dynamic_ncols=True,
-        ):
-            for hill, dni_E, dhi_E in _hillshade_energy_variants(
-                g,
-                hillshade_dir,
-                az,
-                alt,
-                leaf_type=canopy_leaf_type,
-                reference_thickness_m=canopy_reference_thickness_m,
-            ):
-                hill = hill.astype(np.float32)
-
-                if mode == "fourier_decomposition":
-                    θ = np.deg2rad(az)
-                    φ = np.deg2rad(alt)
-
-                    _accumulate_fourier(
-                        A0, A1c, A1s, A2,
-                        D0, D1,
-                        hill, svf,
-                        dni_E, dhi_E,
-                        θ, φ,
-                        aoi_mask,
-                        pixel_area,
-                    )
-                elif mode == "fourier_poa":
-                    θ = np.deg2rad(az)
-                    φ = np.deg2rad(alt)
-
-                    _accumulate_poa_basis(
-                        B_z, B_e, B_n,
-                        D_sky, GHI,
-                        hill, svf,
-                        dni_E, dhi_E,
-                        θ, φ,
-                        aoi_mask,
-                    )
-                elif mode == "vertical_basis":
-                    _accumulate_vertical_basis(
-                        *vertical,
-                        hill,
-                        dni_E,
-                        np.deg2rad(az), np.deg2rad(alt),
-                        aoi_mask,
-                    )
-                elif mode == "tracking_basis":
-                    _accumulate_tracking_basis(
-                        *tracking,
-                        hill, svf,
-                        dni_E, dhi_E,
-                        np.deg2rad(az), np.deg2rad(alt),
-                        np.deg2rad(tracker_max_rotation_deg),
-                        aoi_mask,
-                    )
-                else:
-                    _accumulate_energy_split(
-                        direct_month if mode == "monthly" else direct_annual,
-                        diffuse_month if mode == "monthly" else diffuse_annual,
-                        svf,
-                        hill,
-                        dni_E,
-                        dhi_E,
-                        aoi_mask,
-                        pixel_area,
-                    )
-
-        if mode == "monthly":
-            direct_annual  += direct_month
-            diffuse_annual += diffuse_month
-
-            with rasterio.open(out_path, "r+") as dst:
-                direct_month[~aoi_mask]  = nodata_value
-                diffuse_month[~aoi_mask] = nodata_value
-                dst.write(direct_month,  month_key)
-                dst.write(diffuse_month, month_key + 12)
+        acc.load(base, path_lengths)
+        del base, path_lengths
+        # a canopy attenuates the same sun differently in February and July,
+        # so it is resolved per month like the monthly bands
+        for month, dni_E, dhi_E in (by_month if monthly or canopy else whole):
+            mu = (
+                vegetation_extinction(
+                    month, leaf_type=canopy_leaf_type,
+                    reference_thickness_m=canopy_reference_thickness_m,
+                )
+                if canopy else None
+            )
+            acc.add(month, mu, dni_E, dhi_E, np.deg2rad(az), np.deg2rad(alt))
 
     # ==========================================================
-    # FINAL WRITE
+    # WRITE
     # ==========================================================
-    with rasterio.open(out_path, "r+") as dst:
-        if mode == "fourier_decomposition":
-            for arr, band in zip(
-                (A0, A1c, A1s, A2, D0, D1),
-                range(1, 7),
-            ):
-                arr[~aoi_mask] = nodata_value
-                dst.write(arr, band)
+    for mode, bands in acc.result().items():
+        Path(paths[mode]).parent.mkdir(parents=True, exist_ok=True)
+        _write_solar_energy(paths[mode], mode, bands, profile, aoi_mask,
+                            nodata_value, tracker_max_rotation_deg)
+        if mode in ("vertical_basis", "tracking_basis"):
+            write_sun_table(df, sun_table_path(paths[mode]))
 
-            dst.set_band_description(1, "A0 direct")
-            dst.set_band_description(2, "A1c cos(az)")
-            dst.set_band_description(3, "A1s sin(az)")
-            dst.set_band_description(4, "A2 sin(alt)")
-            dst.set_band_description(5, "D0 diffuse")
-            dst.set_band_description(6, "D1 sin(alt)")
-
-        elif mode == "fourier_poa":
-            for arr, band in zip(
-                (B_z, B_e, B_n, D_sky, GHI),
-                range(1, 6),
-            ):
-                arr[~aoi_mask] = nodata_value
-                dst.write(arr, band)
-
-            dst.set_band_description(1, "B_z direct cos(tilt)")
-            dst.set_band_description(2, "B_east direct sin(tilt)sin(az)")
-            dst.set_band_description(3, "B_north direct sin(tilt)cos(az)")
-            dst.set_band_description(4, "D_sky diffuse horizontal")
-            dst.set_band_description(5, "GHI global horizontal")
-
-        elif mode == "vertical_basis":
-            for band, (arr, name) in enumerate(zip(vertical, VERTICAL_BASIS_BANDS), 1):
-                arr[~aoi_mask] = nodata_value
-                dst.write(arr, band)
-                dst.set_band_description(band, name)
-
-        elif mode == "tracking_basis":
-            for band, (arr, name) in enumerate(zip(tracking, TRACKING_BASIS_BANDS), 1):
-                arr[~aoi_mask] = nodata_value
-                dst.write(arr, band)
-                dst.set_band_description(band, name)
-            dst.update_tags(TRACKER_MAX_ROTATION_DEG=str(tracker_max_rotation_deg))
-
-        else:
-            direct_annual[~aoi_mask]  = nodata_value
-            diffuse_annual[~aoi_mask] = nodata_value
-
-            if mode == "monthly":
-                dst.write(direct_annual, 25)
-                dst.write(diffuse_annual, 26)
-                dst.set_band_description(1, "Direct - January")
-                dst.set_band_description(2, "Direct - February")
-                dst.set_band_description(3, "Direct - March")
-                dst.set_band_description(4, "Direct - April")
-                dst.set_band_description(5, "Direct - May")
-                dst.set_band_description(6, "Direct - June")
-                dst.set_band_description(7, "Direct - July")
-                dst.set_band_description(8, "Direct - August")
-                dst.set_band_description(9, "Direct - September")
-                dst.set_band_description(10, "Direct - October")
-                dst.set_band_description(11, "Direct - November")
-                dst.set_band_description(12, "Direct - December")
-                dst.set_band_description(13, "Diffuse - January")
-                dst.set_band_description(14, "Diffuse - February")
-                dst.set_band_description(15, "Diffuse - March")
-                dst.set_band_description(16, "Diffuse - April")
-                dst.set_band_description(17, "Diffuse - May")
-                dst.set_band_description(18, "Diffuse - June")
-                dst.set_band_description(19, "Diffuse - July")
-                dst.set_band_description(20, "Diffuse - August")
-                dst.set_band_description(21, "Diffuse - September")
-                dst.set_band_description(22, "Diffuse - October")
-                dst.set_band_description(23, "Diffuse - November")
-                dst.set_band_description(24, "Diffuse - December")
-                dst.set_band_description(25, "Direct - Annual")
-                dst.set_band_description(26, "Diffuse - Annual")
-            else:
-                dst.write(direct_annual, 1)
-                dst.write(diffuse_annual, 2)
-                dst.set_band_description(1, "Direct")
-                dst.set_band_description(2, "Diffuse")
-
-    if mode in ("vertical_basis", "tracking_basis"):
-        write_sun_table(df, sun_table_path(out_path))
-
-    return str(out_path)
+    return paths
 
 
 def sun_table_path(basis_path) -> str:
@@ -2920,7 +3625,7 @@ def reconstruct_poa_from_basis(
     return np.maximum(direct, 0.0) + diffuse + reflected
 
 
-@njit(parallel=True, fastmath=True)
+@njit(parallel=True, fastmath=True, cache=True)
 def _accumulate_energy_split(
     E_dir, E_dif,
     svf, hill,
@@ -2937,7 +3642,7 @@ def _accumulate_energy_split(
             E_dif[i, j] += dhi_E * svf[i, j] * pixel_area
 
 
-@njit(parallel=True, fastmath=True)
+@njit(parallel=True, fastmath=True, cache=True)
 def _accumulate_fourier(
     A0, A1c, A1s, A2,
     D0, D1,
@@ -2969,7 +3674,7 @@ def _accumulate_fourier(
             D1[i, j]  += E_dif * sφ
 
 
-@njit(parallel=True, fastmath=True)
+@njit(parallel=True, fastmath=True, cache=True)
 def _accumulate_poa_basis(
     B_z, B_e, B_n,
     D_sky, GHI,
@@ -3022,7 +3727,7 @@ def _accumulate_poa_basis(
             GHI[i, j]   += E_dir * sφ + E_dif
 
 
-@njit(parallel=True, fastmath=True)
+@njit(parallel=True, fastmath=True, cache=True)
 def _accumulate_vertical_basis(
     H_ep, H_em, H_np, H_nm,
     hill,
@@ -3072,7 +3777,7 @@ def _accumulate_vertical_basis(
             H_nm[i, j] += E_dir * south
 
 
-@njit(parallel=True, fastmath=True)
+@njit(parallel=True, fastmath=True, cache=True)
 def _accumulate_tracking_basis(
     T2_dir, T2_sky, T2_gnd,
     T1_dir, T1_sky, T1_gnd,
@@ -3154,8 +3859,20 @@ def calculate_sky_view_factor(
     vegetation_classes: Sequence[int] | None = None,
 ) -> str:
 
+    # The GPU path needs a working driver *and* libNVVM; if either is
+    # missing, numba only fails at the first kernel launch, so check first.
     if cuda is None:
         cuda = has_cuda()
+    elif cuda and not has_cuda():
+        warning(
+            "CUDA requested but not usable (no GPU, driver or libNVVM); "
+            "falling back to the CPU SVF. Install the toolkit with "
+            "`pip install \"numba-cuda[cu13]\"`."
+        )
+        cuda = False
+
+    if hybrid and not cuda:
+        info("Hybrid SVF is CUDA-only; computing full-resolution SVF on CPU")
 
     if cuda and hybrid:
         return _calculate_svf_cuda_hybrid(
@@ -3190,18 +3907,55 @@ def calculate_sky_view_factor(
     )
 
 
+@njit(parallel=True, cache=True)
+def _svf_kernel_rows(
+    dsm,
+    valid_mask,
+    svf_acc,
+    dxs,
+    dys,
+    pixel_size,
+    max_steps,
+    r0,
+    r1,
+):
+    """
+    CPU twin of ``svf_horizon_kernel``: accumulates cos² of the horizon
+    angle over every azimuth for rows ``r0:r1``.
+    """
+    rows, cols = dsm.shape
+    for i in prange(r0, r1):
+        for j in range(cols):
+            if not valid_mask[i, j]:
+                continue
+            z0 = dsm[i, j]
+            acc = 0.0
+            for a in range(dxs.size):
+                dx = dxs[a]
+                dy = dys[a]
+                max_angle = 0.0
+                for step in range(1, max_steps + 1):
+                    ii = int(i + step * dy)
+                    jj = int(j + step * dx)
+                    if ii < 0 or ii >= rows or jj < 0 or jj >= cols:
+                        break
+                    ang = math.atan2(dsm[ii, jj] - z0, step * pixel_size)
+                    if ang > max_angle:
+                        max_angle = ang
+                acc += math.cos(max_angle) ** 2
+            svf_acc[i, j] = acc
+
+
 def _calculate_svf_cpu(
     dsm_path: str,
     out_path: str,
     search_radius: float,
     angular_resolution: float,
-    max_height_angle: float,
     nodata_value: float,
-    creation_options: Optional[Dict[str, str]],
-    row_block_size: int,
+    row_block_size: int = 64,
 ) -> str:
     """
-    Existing CPU/Numba SVF (row-based kernel).
+    CPU/Numba SVF, same horizon model as ``_calculate_svf_cuda``.
     """
 
     info("Calculating Sky View Factor (CPU / Numba)")
@@ -3213,48 +3967,59 @@ def _calculate_svf_cpu(
         pixel_size = abs(src.transform[0])
 
     height, width = dsm.shape
+    info(f"DSM size: {width} × {height}, pixel size: {pixel_size:.2f} m")
 
     if nodata is not None:
         valid_mask = (dsm != nodata) & np.isfinite(dsm)
     else:
         valid_mask = np.isfinite(dsm)
 
-    svf = np.full(dsm.shape, nodata_value, dtype=np.float32)
+    # float32 angles like the CUDA path, so rays land on the same pixels
+    azimuths = np.deg2rad(
+        np.arange(0.0, 360.0, angular_resolution, dtype=np.float32)
+    ).astype(np.float64)
+    dxs = np.cos(azimuths)
+    dys = -np.sin(azimuths)
 
-    azimuth_angles = np.arange(0.0, 360.0, angular_resolution, dtype=np.float32)
-    azimuth_rad = np.deg2rad(azimuth_angles)
+    max_steps = int(search_radius / pixel_size)
+    if max_steps < 2:
+        raise ValueError("search_radius too small for DSM resolution")
 
-    search_radius_px = int(search_radius / pixel_size)
-    step_px = max(1, int(search_radius_px * 0.02))
-    max_height_angle_rad = np.deg2rad(max_height_angle)
+    info(f"Azimuth directions: {len(azimuths)}")
+    info(f"Ray steps: {max_steps}")
 
+    svf_acc = np.zeros(dsm.shape, dtype=np.float32)
     n_blocks = (height + row_block_size - 1) // row_block_size
 
-    with tqdm(total=n_blocks, desc="SVF CPU", unit="block") as pbar:
-        for i in range(n_blocks):
-            r0 = i * row_block_size
+    with tqdm(total=n_blocks, desc="SVF CPU", unit="block",
+              dynamic_ncols=True) as pbar:
+        for b in range(n_blocks):
+            r0 = b * row_block_size
             r1 = min(r0 + row_block_size, height)
-
             _svf_kernel_rows(
-                dsm,
-                valid_mask,
-                svf,
-                azimuth_rad,
-                pixel_size,
-                search_radius_px,
-                step_px,
-                max_height_angle_rad,
-                r0,
-                r1,
+                dsm, valid_mask, svf_acc, dxs, dys,
+                pixel_size, max_steps, r0, r1,
             )
             pbar.update(1)
 
-    profile.update(dtype="float32", count=1, nodata=nodata_value)
-    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    svf = np.where(
+        valid_mask, np.clip(svf_acc / len(azimuths), 0.0, 1.0), nodata_value
+    ).astype(np.float32)
+
+    profile.update(dtype="float32", count=1, nodata=nodata_value, driver="GTiff")
+    os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
 
     with rasterio.open(out_path, "w", **profile) as dst:
         dst.write(svf, 1)
+        dst.update_tags(
+            units="dimensionless",
+            description="Sky View Factor",
+            method="cpu_2d_angular_horizon",
+            angular_resolution=f"{angular_resolution}deg",
+            search_radius=f"{search_radius}m",
+        )
 
+    info(f"Output written to {out_path}")
     return out_path
 
 
@@ -3506,7 +4271,6 @@ def _calculate_svf_cuda_hybrid(
         azimuths,
         desc="SVF CUDA azimuths (masked)",
         dynamic_ncols=True,
-        file=sys.stdout,
     ) as pbar:
         for az in pbar:
             dx = math.cos(az)
@@ -3624,7 +4388,6 @@ def _calculate_svf_cuda(
         azimuths,
         desc="SVF CUDA azimuths",
         dynamic_ncols=True,
-        file=sys.stdout,
     ) as pbar:
         for az in pbar:
             dx = math.cos(az)
@@ -3826,8 +4589,11 @@ def generate_daily_shadow_mp4(
     # ----------------------------------------------------------
     # Video writer
     # ----------------------------------------------------------
+    # Written under a temporary name and renamed once complete: a video cut
+    # short by an error would otherwise be skipped as done by the next run.
+    tmp_mp4 = out_mp4.with_name(out_mp4.stem + ".part.mp4")
     with imageio.get_writer(
-        out_mp4,
+        tmp_mp4,
         fps=fps,
         codec="libx264",
         macro_block_size=16,
@@ -3959,7 +4725,8 @@ def generate_daily_shadow_mp4(
             del hs0, hs1, frame
             gc.collect()
 
-    print(f"Shadow MP4 written to: {out_mp4}")
+    os.replace(tmp_mp4, out_mp4)
+    info(f"Shadow MP4 written to: {out_mp4}")
 
 
 def resize_with_aspect_and_padding(
@@ -4090,7 +4857,7 @@ def pv_potential_from_fourier_raster(
 
     return out_raster_path
 
-@njit(parallel=True, fastmath=True)
+@njit(parallel=True, fastmath=True, cache=True)
 def pv_from_fourier_kernel_masked(
     A0, A1c, A1s, A2,
     D0, D1,
@@ -4142,7 +4909,7 @@ def pv_from_fourier_kernel_masked(
             )
 
 
-@njit(parallel=True)
+@njit(parallel=True, cache=True)
 def zonal_sum(values, zones, out):
     H, W = values.shape
     for i in prange(H):

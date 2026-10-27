@@ -1,16 +1,11 @@
 - [done] Reuse the functions of hypercadaster_ES (for each municipality: administrative layers gathering, building geometries gathering, weather data gathering...)
-- Refine the building roofs detection.
+- [done] Refine the building roofs detection.
 - [done] Create an algorithm to define the crops alignment in the parcel
   (greenshadow.crop_rows.detect_crop_rows): row azimuth, spacing, canopy width and
   alley width from the dsm - dsm_no_vegetation canopy model on woody crops; the
   parcel working axis on herbaceous ones
 - [done] Set and simulate the PV systems for building roofs (greenshadow.dimensionate.plan_pv_strings_in_buildings)
-- Set and simulate the m
-- Create the unary tests.
 - [done] Filter construction-crane outliers from the DSM (crane_removal=True)
-- _fill_gaps(method="smart_general") floods any hole larger than 200 px with the
-  MINIMUM boundary value, which would cut a trench for any feature that punches
-  big holes. Cap that rule by hole aspect ratio.
 - [done] Calculating the simulations for the maximum availability of POA strings for every building roof; aggregate results by building
 - [done] Report the PV results as one layer per mounting scenario (poa_coplanar, poa_south_05 ... poa_best) instead of only the optimum
 - [done, phase 1] PV fields and agrivoltaics over sigpac_parcels (greenshadow.parcel_pv.plan_parcel_pv_scenarios):
@@ -20,9 +15,7 @@
 - [done, phase 2] Single-axis and dual-axis trackers and vertical bifacial fences
   (compute_surface_solar_energy modes vertical_basis / tracking_basis, layout factors from the sun table;
   validated against pvlib - docs/pv_tracking_irradiance_plan.md)
-- Single-axis trackers on East-West axes and tilted axes; trackers over existing crop rows
-- Calibrate the parcel_pv defaults (capex, crop margins, SIGPAC_USE_MARGIN_EUR_HA, shade response) against
-  regional data; add grid-connection cost by distance to substation
+- [done] Single-axis trackers on East-West axes and tilted axes; trackers over existing crop rows
 - [done] Filter the shades in case of trees. Adapt the hillshades
   (greenshadow.shader.build_canopy_model_from_rasters + generate_multiple_hillshades_gdal(canopy=...)):
   high vegetation is resolved into ellipsoidal crowns sized from H = DSM - DEM,
@@ -30,7 +23,89 @@
   hillshades carry per-class canopy path lengths so one raster serves every month.
   gs.icgc_lidar_acquisition_date + gs.vegetation_growth age the canopy from the
   flight date to the simulated year. Pass canopy=None for the old opaque model.
-- Calibrate crown_ratio and the D = a*H^b allometry against Catalan urban species;
+- [done] Calibrate crown_ratio and the D = a*H^b allometry against Catalan urban species;
   the current defaults are literature values, not fitted.
+- Create the unary tests.
+- Calibrate the parcel_pv defaults (capex, crop margins, SIGPAC_USE_MARGIN_EUR_HA, shade response) against
+  regional data; add grid-connection cost by distance to substation
 - Derive leaf_type per tree (species layer or NDVI seasonality) instead of the
   single global deciduous/evergreen switch.
+
+== New regional pipelines (greenshadow.pipelines; see docs/pipelines.md "Adding a region") ==
+Goal: the same products as the Catalan case (DSM/DEM, roofs + rooftop PV, crop rows, parcel PV and
+agrivoltaics) in each region, so the results can be compared. For each one, gather the equivalents of what
+Catalonia uses: administrative limits (hypercadaster/INE), cadastral building footprints (Spanish cadastre)
+and agricultural parcels with their declared use (SIGPAC).
+
+- Generalise the Catalan-specific parts before adding regions:
+  - Parcel adapter: plan_parcel_pv_scenarios, detect_crop_rows and filter_agricultural_parcels key on
+    uso_sigpac and the SIGPAC 7-tuple id. Map each region's LPIS crop codes to the SIGPAC use groups (or to
+    the HCAT taxonomy that fiboa/EuroCrops already provide) so SIGPAC_USE_MARGIN_EUR_HA,
+    SIGPAC_SPACING_PRIORS and SIGPAC_USE_SHADE_RESPONSE keep working; per-region margins table.
+  - LiDAR class profile per provider (classification sets of the three digital models, building /
+    vegetation / bridge codes, crane removal and SVF class lists) instead of the ICGC codes hard-wired in
+    pipelines/catalonia.py.
+  - Per-region epsg and tz_local; acquisition date from each provider's metadata (vegetation growth).
+  - Building footprints from a generic source when there is no open cadastre: Overture Maps buildings
+    (pip install overturemaps) or EUBUCCO (https://eubucco.com/data/), for the classification correction.
+  - Administrative limits fallback for all three: Eurostat GISCO LAU (EU-wide municipalities, one source).
+
+- Pipeline: Alto Alentejo (Portugal), NUTS III, 15 municipalities (Portalegre district). tz Europe/Lisbon,
+  EPSG:3763 (PT-TM06/ETRS89).
+  - LiDAR: DGT national survey 2023-2025 (https://cdd.dgterritorio.gov.pt/dgt-fe, also via SNIG and
+    dados.gov.pt "Dados LiDAR de Portugal continental"). LAZ ~10 pts/m2, classes 1 other, 2 ground,
+    3/4/5 low (0-0.5 m) / medium (0.5-2 m) / high (>2 m) vegetation, 6 building, 7 noise, 9 water,
+    26 bridge (no 17/77; vegetation height bands differ from ICGC). Also ready-made MDT/MDS at 50 cm and
+    2 m. Downloads limited to ~200 km2 per request -> tile the requests; check whether registration is needed.
+  - Administrative limits: CAOP (Carta Administrativa Oficial de Portugal, DGT), GeoPackage, free;
+    NUTS III also on https://ogcapi.dgterritorio.gov.pt.
+  - Agricultural parcels: IFAP iSIP (Sistema de Identificacao Parcelar), INSPIRE WFS
+    https://www.ifap.pt/isip/ows/ (parcels, sub-parcels, declared crops since 2018). Mirror with crop codes
+    and HCAT: fiboa / Fields of the World, https://data.source.coop/ftw/harmonized-field-data/pt/
+    (GeoParquet, 2017-2025, ~3.6 M fields, free with attribution).
+  - Buildings: no open national building cadastre for rural Alentejo (BUPi holds rural property limits,
+    not buildings) -> Overture / EUBUCCO / OSM, plus the LiDAR building class 6.
+
+- Pipeline: Friuli-Venezia Giulia (Italy). tz Europe/Rome; LiDAR in RDN2008-TM33NE (confirm the EPSG code;
+  heights delivered both ellipsoidal and orthometric - use orthometric).
+  - LiDAR: "Nuvole di punti rilievo LIDAR RAFVG 2017-2020"
+    (https://irdat.regione.fvg.it/consultatore-dati-ambientali-territoriali/detail/irdat/dataset/11647),
+    download through Eagle.fvg (https://eaglefvg.regione.fvg.it/eagle/main.aspx?configuration=guest).
+    Helicopter RIEGL, 16 pts/m2 below 1000 m altitude (10 above), LAZ, classified (ground, vegetation by
+    height, buildings, water, wires, bridges - map the codes), tiles of 50 centesimal seconds. Flight
+    years 2017-2020 -> several years of vegetation growth to correct.
+  - Administrative limits: ISTAT "Confini delle unita amministrative a fini statistici" (yearly, shapefile).
+  - Buildings: IRDAT CTRN 5000 buildings with height and volume (shapefile, open, IODL 2.0); Agenzia delle
+    Entrate cadastral cartography (INSPIRE WMS https://wms.cartografia.agenziaentrate.gov.it/inspire/wms/ows01.php,
+    parcels also as open WFS) as the cadastre equivalent.
+  - Agricultural parcels: AGEA / SIAN LPIS (SIPA) is restricted, not openly downloadable for FVG (fiboa
+    only has Tuscany and South Tyrol). To find out: whether the Region (agriculture directorate / SIAGRI)
+    can provide declared parcels; whether the Open IACS project (AGEA, ISPRA, ENEA, CREA, 2019-2022;
+    https://ict.enea.it/openiacs, https://www.isprambiente.gov.it/en/projects/open-data-1/open-iacs) left a
+    usable LPIS/GSAA endpoint - it is a research project, no download confirmed.
+    Fallback: Agenzia delle Entrate cadastral parcels (CP.CadastralParcel), which are ownership parcels with
+    no declared crop - keep the agricultural ones with a land-use layer (IRDAT, Copernicus) and take the use
+    from it. Access, all open (CC BY 4.0, updated every six months, Trento/Bolzano excluded):
+      - bulk GML per region / municipality (CadastralParcel.gml + CadastralZoning.gml), also through the
+        QGIS plugin "Italy Inspire Cadastre Downloader"
+        (https://plugins.qgis.org/plugins/italy_inspire_cadastre_downloader/) - script the same download;
+      - INSPIRE WFS for a bounding box (QGIS plugin "WFS Catasto Download Particelle BBox" shows the calls);
+      - WMS for viewing only (address above).
+
+- Pipeline: Crete (Greece), simplified agrivoltaics without LiDAR. tz Europe/Athens, EPSG:2100 (GGRS87)
+  or 32635.
+  - Terrain: Copernicus DEM GLO-30 (public, COG tiles on AWS s3://copernicus-dem-30m, no account needed).
+    It is a surface model (buildings and trees included, smoothed at 30 m): use it as both dsm and dem
+    (TerrainModels(dsm=dem, dem=dem)); no canopy, crop rows, roofs or elevated shadows. Raise
+    svf_search_radius_m well above 250 m (it is only ~8 pixels at 30 m) and coarsen annual_solar_step_deg
+    if needed. Remember the total raster is Wh per pixel (x3600 vs 0.5 m); use the per-m2 bases.
+  - Administrative limits: Kallikratis municipalities (geodata.gov.gr / ELSTAT - check availability) or
+    GISCO LAU.
+  - Agricultural parcels: no open Greek LPIS found (OPEKEPE does not publish it; not in fiboa/EuroCrops).
+    Options to evaluate: Hellenic Cadastre parcels (INSPIRE geoportal, maps.ktimatologio.gr - check download
+    terms) filtered by land cover (CORINE / ESA WorldCover cropland), or a regular grid of candidate sites on
+    agricultural land cover. Crop and baseline margin from the land-cover class only.
+  - Buildings: only to exclude built-up land (no rooftop PV): Overture / EUBUCCO / OSM.
+  - Scope: PV fields (fixed, single- and dual-axis) and the simplest agrivoltaics (grazing, interspace,
+    vertical bifacial) per candidate area, annual energy and economics; validate the 30 m irradiation
+    against PVGIS at a few points.

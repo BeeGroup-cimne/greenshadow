@@ -29,7 +29,10 @@ from rasterio.transform import rowcol
 from shapely.geometry import Polygon, MultiPolygon
 from shapely.ops import triangulate
 from shapely.strtree import STRtree
-from tqdm import tqdm
+try:
+    from .logging_utils import tqdm
+except ImportError:
+    from greenshadow.logging_utils import tqdm
 
 try:
     from .buildings_infer import _plane_coefficients, _anchor_height

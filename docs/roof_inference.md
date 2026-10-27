@@ -14,8 +14,12 @@ gs.roof_planes_3d(roofs, dsm_path=..., laz_dir=...,
                   output_path="roofs.html")              # look at it
 ```
 
-A worked call with every tuned parameter is in
-[`example/get_solar_energy_from_municipality.py`](../example/get_solar_energy_from_municipality.py).
+A worked call with every tuned parameter is
+`CataloniaMunicipalityPipeline.roof_detection_options` in
+[`greenshadow/pipelines/catalonia.py`](../greenshadow/pipelines/catalonia.py),
+which the pipeline runs through `detect_roof_planes_tiled`
+([pipelines.md](pipelines.md)). The planes then feed the rooftop PV planner
+([rooftop_pv.md](rooftop_pv.md)).
 
 ---
 
@@ -106,7 +110,7 @@ step runs per part.
 ### 3.4 Three repairs that matter
 
 These were added after measuring where the roof was being lost. Each is off
-by default and switched on in the example.
+by default and switched on in the Catalan pipeline.
 
 **`recover_distance_m` — roof the region growing left behind.**
 7% of the real roof area sat inside the building mask but in no plane, often
@@ -367,8 +371,10 @@ accuracy goes.
 
 ## 5. Parameters that were tuned
 
-Defaults in the library are the historical ones; the example passes the
-tuned values. Everything below was measured against the digitised planes,
+Defaults in the library are the historical ones; the Catalan pipeline passes
+the tuned values (`roof_detection_options`). It does not run the
+regularizer: the rooftop planner works on the detected planes, and the
+regularizer's tuned values below are for calling it yourself. Everything below was measured against the digitised planes,
 averaged over three RANSAC seeds.
 
 ### Detector
@@ -402,13 +408,13 @@ averaged over three RANSAC seeds.
 
 | Parameter | Default | Note |
 |---|---|---|
-| `method` | `wireframe` (example: `intersections`) | `facet` for the old per-facet behaviour |
+| `method` | `wireframe` (tuned: `intersections`) | `facet` for the old per-facet behaviour |
 | `max_gap` | 0.3 m | wider gaps are a step or a light well, not a missed ridge |
 | `edge_tolerance` | 0.45 m | see §4.3 |
 | `node_merge_distance` | 0.6 m | also snaps a hip end onto the building corner |
 | `wall_step_m` | 0.3 m | 0.2 similar, 0.5 and 1.0 let real steps through |
-| `angle_snap_deg` | 12 (example: 8) | barely matters (0-25 within 0.001 IoU) |
-| `ridge_snap_tolerance` | 0.6 (example: 0.9) | how far a boundary may be from the plane-plane line |
+| `angle_snap_deg` | 12 (tuned: 8) | barely matters (0-25 within 0.001 IoU) |
+| `ridge_snap_tolerance` | 0.6 (tuned: 0.9) | how far a boundary may be from the plane-plane line |
 
 Both `wall_step_m` and the ridge snapping need `dsm_path`: a plane's height
 is not recoverable from tilt and azimuth alone.
@@ -556,6 +562,11 @@ values until recomputed.
 `regularize_roof_planes` scales the same way: it reads the DSM window by
 window under each facet instead of whole (11 GB in float64 at 0.2 m), and
 groups and rebuilds roofs over `n_workers` processes with the same result.
+
+`detect_roof_planes` itself takes `n_workers` too (default 1): building
+parts are smoothed and segmented in forked processes, largest first, with
+the same result. Inside `detect_roof_planes_tiled` each tile is already a
+process of its own.
 
 ## 9. Module layout
 

@@ -102,7 +102,10 @@ from shapely import STRtree
 from shapely.affinity import translate
 from shapely.geometry import LineString, Point
 from shapely.ops import substring, unary_union
-from tqdm import tqdm
+try:
+    from .logging_utils import tqdm
+except ImportError:
+    from greenshadow.logging_utils import tqdm
 
 try:
     from .dimensionate import _read_window, _pixel_centres, _polygon_pixel_mask

@@ -3,6 +3,8 @@ import sys
 from typing import Optional, Any
 from contextlib import contextmanager
 
+from tqdm import tqdm as _tqdm
+
 
 class StructuredLogger:
     """
@@ -15,10 +17,15 @@ class StructuredLogger:
         self.section_char = section_char
         self.verbose = True
     
+    def prefix(self) -> str:
+        """The current indentation."""
+        return self.indent_char * self.indent_level
+
     def _write(self, message: str, end: str = "\n"):
-        """Write message with current indentation."""
-        indent = self.indent_char * self.indent_level
-        sys.stderr.write(f"{indent}{message}{end}")
+        """Write message to stderr, every line at the current indentation."""
+        indent = self.prefix()
+        text = "\n".join(f"{indent}{line}" if line else line for line in str(message).split("\n"))
+        sys.stderr.write(f"{text}{end}")
         sys.stderr.flush()
     
     def section(self, title: str, level: int = 3):
@@ -93,6 +100,34 @@ class StructuredLogger:
 
 # Global logger instance
 logger = StructuredLogger()
+
+
+class tqdm(_tqdm):
+    """
+    ``tqdm`` that follows the logger: always on stderr, its bar and its
+    ``tqdm.write`` lines at the indentation current when it is created.
+    """
+
+    def __init__(self, *args, **kwargs):
+        self._indent = logger.prefix()
+        kwargs["file"] = sys.stderr
+        if len(args) > 1 and "desc" not in kwargs:   # tqdm(iterable, desc, ...)
+            kwargs["desc"], args = args[1], (args[0],) + args[2:]
+        kwargs["desc"] = self._indent + (kwargs.get("desc") or "")
+        super().__init__(*args, **kwargs)
+
+    def set_description(self, desc=None, refresh=True):
+        super().set_description(self._indent + (desc or ""), refresh)
+
+    def set_description_str(self, desc=None, refresh=True):
+        super().set_description_str(self._indent + (desc or ""), refresh)
+
+    @classmethod
+    def write(cls, s, file=None, end="\n", nolock=False):
+        indent = logger.prefix()
+        s = "\n".join(f"{indent}{line}" if line else line for line in str(s).split("\n"))
+        super().write(s, file=file or sys.stderr, end=end, nolock=nolock)
+
 
 # Convenience functions for common patterns
 def section(title: str, level: int = 3):

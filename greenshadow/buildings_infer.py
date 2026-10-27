@@ -51,7 +51,10 @@ from rasterio.windows import Window
 from scipy.ndimage import (sobel, label, gaussian_filter, generate_binary_structure, binary_dilation,
                            binary_closing, binary_erosion, binary_fill_holes, convolve,
                            distance_transform_edt, find_objects)
-from tqdm import tqdm
+try:
+    from .logging_utils import tqdm
+except ImportError:
+    from greenshadow.logging_utils import tqdm
 try:
     from .lidar import _read_laz
     from .dsm_dem_estimation import _aligned_grid, build_digital_model_from_lidar_pure
@@ -137,6 +140,7 @@ def detect_roof_planes(
     # Tiling: see detect_roof_planes_tiled
     building_owner_mask=None,
     refined_output_paths=None,
+    n_workers=1,
     debug_mode=False
 ):
     """
@@ -267,6 +271,9 @@ def detect_roof_planes(
     the refined one. ``refined_output_paths`` is (dsm, slope, aspect,
     class) for the refined rasters, which otherwise go next to the inputs
     with a ``_roofs`` suffix.
+
+    ``n_workers`` buildings are smoothed, and roof parts detected, at once
+    in forked processes; the result does not depend on it.
 
     See ``smooth_points_to_planes`` below for the smoother, and
     the remaining parameters' behaviour is unchanged.
@@ -471,7 +478,8 @@ def detect_roof_planes(
                 normal_tolerance_deg=delaunay_normal_tolerance_deg,
                 plane_offset_tolerance=delaunay_plane_offset_tolerance,
                 min_plane_points=delaunay_min_plane_points,
-                progress=True
+                progress=True,
+                n_workers=n_workers
             )
         
         #gpd.GeoDataFrame({"geometry":[building_geom]}, crs=f"EPSG:{crs.to_epsg()}").to_file("test.gpkg",driver="GPKG")
@@ -660,310 +668,36 @@ def detect_roof_planes(
     # against every label in turn grows with parts x pixels.
     part_slices = find_objects(labeled_buildings)
 
-    for part_id in tqdm(range(1, n_buildings + 1), desc="Processing building roof parts (only continuous)"):
+    # Parts are independent, so they are spread over forked processes,
+    # largest first so a big block is not the last one left running. Results
+    # are gathered in part order: the output does not depend on n_workers.
+    sizes = np.bincount(labeled_buildings.ravel(), minlength=n_buildings + 1)
+    order = sorted(range(1, n_buildings + 1), key=lambda k: -sizes[k])
 
-        if part_slices[part_id - 1] is None:
+    frame = locals()
+    job = {name: frame[name] for name in _PART_JOB_NAMES}
+    results = _fork_map(
+        _detect_part_planes, order, job, n_workers=n_workers, progress=True,
+        desc="Processing building roof parts (only continuous)", chunksize=1
+    )
+    by_part = dict(zip(order, results))
+
+    for part_id in range(1, n_buildings + 1):
+        result = by_part[part_id]
+        if result is None:
             continue
-
-        # --------------------------------------------
-        # Bounding box
-        # --------------------------------------------
+        gdf_planes, ridge, clusters, n_clusters, holes = result
         row_slice, col_slice = part_slices[part_id - 1]
-        min_row, min_col = row_slice.start, col_slice.start
 
-        local_mask = labeled_buildings[row_slice, col_slice] == part_id
-        local_dsm = dsm[row_slice, col_slice]
-        local_nx = nx[row_slice, col_slice]
-        local_ny = ny[row_slice, col_slice]
-        local_nz = nz[row_slice, col_slice]
-        local_svf = None if svf is None else svf[row_slice, col_slice]
-        local_transform = transform * rasterio.Affine.translation(min_col, min_row)
-
-        # --------------------------------------------
-        # Roof plane detection
-        # --------------------------------------------
-        # Roof segmentation
-        if ridge_splitting_roof_planes:
-
-            local_ridge_mask, normal_clusters_init = _ridge_mask_from_normal_clustering(
-                local_nx,
-                local_ny,
-                local_nz,
-                local_mask,
-                eps_deg=normal_tolerance_deg,
-                smooth_sigma=smooth_sigma
+        if debug_mode:
+            ridge_mask[row_slice, col_slice] |= ridge
+            inside = clusters > 0
+            clustering_mask[row_slice, col_slice][inside] = (
+                clusters[inside] + (cluster_global_id - 1)
             )
-            structure = generate_binary_structure(2, 2)
-            local_ridge_mask = binary_dilation(local_ridge_mask, structure=structure)
-            structure = generate_binary_structure(2, 1)
-            mask_eroded = binary_erosion(local_mask, structure=structure)
-            mask_contour = local_mask & (~mask_eroded)
-            local_ridge_mask |= mask_contour
-            local_ridge_mask &= local_mask
-            local_ridge_mask = skeletonize(local_ridge_mask)
-            # segmentation = connected components without ridges
-            split_mask = local_mask & (~local_ridge_mask)
-            segments, n_segments = label(split_mask, structure=structure)
-        else:
-            segments = np.zeros_like(local_mask, dtype=np.int32)
-            segments[local_mask] = 1
-            n_segments = 1
-            local_ridge_mask = np.zeros_like(local_mask, dtype=np.uint8)
-
-        ridge_mask[row_slice, col_slice] |= local_ridge_mask.astype(np.uint8)
-        building_planes_dsm = []
-
-        for sid in range(1, n_segments + 1):
-
-            segment_mask = segments == sid
-
-            if segment_mask.sum() < min_pixels:
-                continue
-
-            # ----------------------------------------
-            # OPTIONAL normal clustering
-            # ----------------------------------------
-            if preclustering_roof_planes:
-
-                normal_clusters = _cluster_normals(
-                    local_nx,
-                    local_ny,
-                    local_nz,
-                    segment_mask,
-                    ridge_mask=local_ridge_mask,
-                    eps_deg=normal_tolerance_deg,
-                    smooth_sigma=smooth_sigma
-                )
-
-                # filter debris clusters
-                normal_clusters = _filter_normal_clusters(
-                    normal_clusters,
-                    segment_mask,
-                    min_pixels
-                )
-                rejected = (normal_clusters < 0) & segment_mask
-                local_ridge_mask |= rejected
-                cluster_ids = np.unique(normal_clusters)
-
-            else:
-
-                normal_clusters = np.full(local_mask.shape, -1, dtype=np.int32)
-                normal_clusters[segment_mask] = 0
-                cluster_ids = [0]
-
-            valid_clusters = np.unique(normal_clusters)
-
-            for cid in valid_clusters:
-
-                if cid < 0:
-                    continue
-
-                cluster_pixels = (normal_clusters == cid) & segment_mask
-
-                if not np.any(cluster_pixels):
-                    continue
-
-                # write into global raster
-                clustering_mask[
-                    row_slice,
-                    col_slice
-                ][cluster_pixels] = cluster_global_id
-
-                cluster_global_id += 1
-
-            planes = []
-
-            for cid in cluster_ids:
-
-                if cid < 0:
-                    continue
-
-                cluster_mask = normal_clusters == cid
-
-                if cluster_mask.sum() < min_pixels:
-                    continue
-
-                cluster_planes = _detect_planes_from_dsm(
-                    building_mask=cluster_mask,
-                    nx=local_nx,
-                    ny=local_ny,
-                    nz=local_nz,
-                    dsm=local_dsm,
-                    transform=local_transform,
-                    normal_tolerance_deg=normal_tolerance_deg,
-                    ransac_threshold=ransac_threshold,
-                    min_pixels=min_pixels,
-                )
-
-                planes.extend(cluster_planes)
-
-            building_planes_dsm.extend(planes)
-            
-        polygons_gdf = _dsm_planes_to_buffered_polygons(
-            building_planes_dsm,
-            local_transform,
-            buffer_m=buffer_m
-        )
-        
-        plane_id_raster = _assign_pixels_to_planes_3d(
-            local_mask,
-            local_dsm,
-            building_planes_dsm,
-            polygons_gdf,
-            local_transform,
-            local_ridge_mask,
-            nx=local_nx,
-            ny=local_ny,
-            nz=local_nz,
-            distance_tolerance=ransac_threshold,
-            normal_tolerance_deg=normal_tolerance_deg,
-            normal_weight=assignment_normal_weight
-        )
-        
-        # Enforce continuity
-        plane_id_raster = _enforce_plane_continuity(
-            plane_id_raster,
-            local_mask
-        )
-
-        updated_planes = _refit_planes_from_assignment(
-            plane_id_raster,
-            local_dsm,
-            local_transform
-        )
-
-        plane_id_raster = _reassign_unassigned_pixels_local(
-            plane_id_raster,
-            local_mask,
-            local_dsm,
-            updated_planes,
-            local_transform,
-            ridge_mask=local_ridge_mask
-,
-            max_search_radius=1
-        )
-
-        updated_planes = _refit_planes_from_assignment(
-            plane_id_raster,
-            local_dsm,
-            local_transform
-        )
-
-        if recover_distance_m and recover_distance_m > 0:
-            plane_id_raster = _recover_unassigned_roof(
-                plane_id_raster,
-                local_mask,
-                local_dsm,
-                updated_planes,
-                local_transform,
-                distance_tolerance=recover_distance_m,
-                min_pixels=min_pixels,
-                max_tilt_deg=recover_max_tilt_deg
-            )
-
-            updated_planes = _refit_planes_from_assignment(
-                plane_id_raster,
-                local_dsm,
-                local_transform
-            )
-
-        # Graph-based planes merging
-        updated_planes, plane_id_raster = _merge_similar_adjacent_planes_graph(
-            plane_id_raster,
-            updated_planes,
-            local_dsm,
-            local_transform,
-            normal_angle_threshold_deg=merge_normal_angle_deg,
-            ridge_mask=local_ridge_mask,
-            max_offset_m=merge_max_offset_m
-        )
-
-        # Remove small planes and reassign them
-        plane_id_raster = _remove_small_planes(
-            plane_id_raster,
-            min_pixels=min_pixels
-        )
-
-        updated_planes = _refit_planes_from_assignment(
-            plane_id_raster,
-            local_dsm,
-            local_transform
-        )
-
-        plane_id_raster = _reassign_unassigned_pixels_local(
-            plane_id_raster,
-            local_mask,
-            local_dsm,
-            updated_planes,
-            local_transform,
-            ridge_mask=local_ridge_mask
-,
-            max_search_radius=1
-        )
-
-        updated_planes = _refit_planes_from_assignment(
-            plane_id_raster,
-            local_dsm,
-            local_transform
-        )
-
-        if coplanar_merge_angle_deg and coplanar_merge_angle_deg > 0:
-            updated_planes, plane_id_raster = _merge_coplanar_planes(
-                plane_id_raster,
-                updated_planes,
-                local_dsm,
-                local_transform,
-                max_angle_deg=coplanar_merge_angle_deg,
-                max_step_m=coplanar_merge_step_m
-            )
-
-        fit_mask = None
-
-        if skirt_assign_distance_m and skirt_assign_distance_m > 0:
-            fit_mask = plane_id_raster > 0
-            plane_id_raster = _assign_roof_skirts(
-                plane_id_raster,
-                local_mask,
-                max_distance_px=skirt_assign_distance_m / abs(local_transform.a)
-            )
-
-        # Chimneys, aerials and the rest of the clutter standing on the
-        # finished facets. Last, so it sees the planes the polygons will
-        # actually carry - skirts included, since clutter sits on those too.
-        hole_mask = None
-
-        if local_svf is not None:
-            hole_mask = _detect_roof_obstructions(
-                plane_id_raster,
-                updated_planes,
-                local_dsm,
-                local_svf,
-                local_transform,
-                svf_drop=svf_obstruction_drop,
-                min_height_m=svf_obstruction_min_height_m,
-                min_area_m2=svf_obstruction_min_area_m2,
-                max_area_m2=svf_obstruction_max_area_m2,
-                max_elongation=svf_obstruction_max_elongation,
-                max_planes=svf_obstruction_max_planes,
-                close_m=svf_obstruction_close_m,
-                buffer_m=svf_obstruction_buffer_m
-            )
-
-            if hole_mask is not None:
-                obstruction_mask[row_slice, col_slice] |= hole_mask
-
-        # Roof planes vectorisation
-        gdf_planes = _polygonize_and_compute_parameters(
-            plane_id_raster,
-            updated_planes,
-            local_dsm,
-            local_transform,
-            part_id,
-            crs,
-            simplify_tolerance=None,
-            fit_mask=fit_mask,
-            hole_mask=hole_mask
-        )
+            if holes is not None:
+                obstruction_mask[row_slice, col_slice] |= holes
+        cluster_global_id += n_clusters
 
         planes_list.append(gdf_planes)
 
@@ -1098,6 +832,8 @@ def detect_roof_planes_tiled(
         if p.default is not inspect.Parameter.empty
     }
     params = {**defaults, **detect_kwargs}
+    # How many processes a tile uses does not change what it finds.
+    params.pop("n_workers", None)
 
     # -----------------------------------------------------
     # Building clusters, on a coarse grid of cluster_gap_m
@@ -1426,6 +1162,378 @@ def _building_clusters(
     return clusters, n_clusters
 
 
+def _detect_part_planes(part_id):
+    """
+    One roof part's planes for ``detect_roof_planes``, as ``(gdf_planes,
+    ridge, clusters, n_clusters, holes)`` - the last four only feed the
+    debug rasters - or None when the part is empty.
+
+    Everything else comes from ``_FORK_JOB``, so forked workers inherit
+    the rasters instead of having them pickled per part.
+    """
+    job = _FORK_JOB
+    labeled_buildings = job["labeled_buildings"]
+    part_slices = job["part_slices"]
+    dsm = job["dsm"]
+    nx = job["nx"]
+    ny = job["ny"]
+    nz = job["nz"]
+    svf = job["svf"]
+    transform = job["transform"]
+    crs = job["crs"]
+    min_pixels = job["min_pixels"]
+    ridge_splitting_roof_planes = job["ridge_splitting_roof_planes"]
+    preclustering_roof_planes = job["preclustering_roof_planes"]
+    normal_tolerance_deg = job["normal_tolerance_deg"]
+    smooth_sigma = job["smooth_sigma"]
+    ransac_threshold = job["ransac_threshold"]
+    buffer_m = job["buffer_m"]
+    assignment_normal_weight = job["assignment_normal_weight"]
+    recover_distance_m = job["recover_distance_m"]
+    recover_max_tilt_deg = job["recover_max_tilt_deg"]
+    merge_normal_angle_deg = job["merge_normal_angle_deg"]
+    merge_max_offset_m = job["merge_max_offset_m"]
+    coplanar_merge_angle_deg = job["coplanar_merge_angle_deg"]
+    coplanar_merge_step_m = job["coplanar_merge_step_m"]
+    skirt_assign_distance_m = job["skirt_assign_distance_m"]
+    svf_obstruction_drop = job["svf_obstruction_drop"]
+    svf_obstruction_min_height_m = job["svf_obstruction_min_height_m"]
+    svf_obstruction_min_area_m2 = job["svf_obstruction_min_area_m2"]
+    svf_obstruction_max_area_m2 = job["svf_obstruction_max_area_m2"]
+    svf_obstruction_max_elongation = job["svf_obstruction_max_elongation"]
+    svf_obstruction_max_planes = job["svf_obstruction_max_planes"]
+    svf_obstruction_close_m = job["svf_obstruction_close_m"]
+    svf_obstruction_buffer_m = job["svf_obstruction_buffer_m"]
+    debug_mode = job["debug_mode"]
+
+
+    if part_slices[part_id - 1] is None:
+        return None
+
+    # --------------------------------------------
+    # Bounding box
+    # --------------------------------------------
+    row_slice, col_slice = part_slices[part_id - 1]
+    min_row, min_col = row_slice.start, col_slice.start
+
+    local_mask = labeled_buildings[row_slice, col_slice] == part_id
+    local_dsm = dsm[row_slice, col_slice]
+    local_nx = nx[row_slice, col_slice]
+    local_ny = ny[row_slice, col_slice]
+    local_nz = nz[row_slice, col_slice]
+    local_svf = None if svf is None else svf[row_slice, col_slice]
+    local_transform = transform * rasterio.Affine.translation(min_col, min_row)
+    local_clusters = np.zeros(local_mask.shape, dtype=np.uint32) if debug_mode else None
+    n_local_clusters = 0
+
+    # --------------------------------------------
+    # Roof plane detection
+    # --------------------------------------------
+    # Roof segmentation
+    if ridge_splitting_roof_planes:
+
+        local_ridge_mask, normal_clusters_init = _ridge_mask_from_normal_clustering(
+            local_nx,
+            local_ny,
+            local_nz,
+            local_mask,
+            eps_deg=normal_tolerance_deg,
+            smooth_sigma=smooth_sigma
+        )
+        structure = generate_binary_structure(2, 2)
+        local_ridge_mask = binary_dilation(local_ridge_mask, structure=structure)
+        structure = generate_binary_structure(2, 1)
+        mask_eroded = binary_erosion(local_mask, structure=structure)
+        mask_contour = local_mask & (~mask_eroded)
+        local_ridge_mask |= mask_contour
+        local_ridge_mask &= local_mask
+        local_ridge_mask = skeletonize(local_ridge_mask)
+        # segmentation = connected components without ridges
+        split_mask = local_mask & (~local_ridge_mask)
+        segments, n_segments = label(split_mask, structure=structure)
+    else:
+        segments = np.zeros_like(local_mask, dtype=np.int32)
+        segments[local_mask] = 1
+        n_segments = 1
+        local_ridge_mask = np.zeros_like(local_mask, dtype=np.uint8)
+
+    ridge_snapshot = local_ridge_mask.astype(np.uint8) if debug_mode else None
+    building_planes_dsm = []
+
+    for sid in range(1, n_segments + 1):
+
+        segment_mask = segments == sid
+
+        if segment_mask.sum() < min_pixels:
+            continue
+
+        # ----------------------------------------
+        # OPTIONAL normal clustering
+        # ----------------------------------------
+        if preclustering_roof_planes:
+
+            normal_clusters = _cluster_normals(
+                local_nx,
+                local_ny,
+                local_nz,
+                segment_mask,
+                ridge_mask=local_ridge_mask,
+                eps_deg=normal_tolerance_deg,
+                smooth_sigma=smooth_sigma
+            )
+
+            # filter debris clusters
+            normal_clusters = _filter_normal_clusters(
+                normal_clusters,
+                segment_mask,
+                min_pixels
+            )
+            rejected = (normal_clusters < 0) & segment_mask
+            local_ridge_mask |= rejected
+            cluster_ids = np.unique(normal_clusters)
+
+        else:
+
+            normal_clusters = np.full(local_mask.shape, -1, dtype=np.int32)
+            normal_clusters[segment_mask] = 0
+            cluster_ids = [0]
+
+        valid_clusters = np.unique(normal_clusters)
+
+        for cid in valid_clusters:
+
+            if cid < 0:
+                continue
+
+            cluster_pixels = (normal_clusters == cid) & segment_mask
+
+            if not np.any(cluster_pixels):
+                continue
+
+            # Numbered within the part; the caller offsets them into the
+            # global debug raster.
+            if debug_mode:
+                local_clusters[cluster_pixels] = n_local_clusters + 1
+            n_local_clusters += 1
+
+        planes = []
+
+        for cid in cluster_ids:
+
+            if cid < 0:
+                continue
+
+            cluster_mask = normal_clusters == cid
+
+            if cluster_mask.sum() < min_pixels:
+                continue
+
+            cluster_planes = _detect_planes_from_dsm(
+                building_mask=cluster_mask,
+                nx=local_nx,
+                ny=local_ny,
+                nz=local_nz,
+                dsm=local_dsm,
+                transform=local_transform,
+                normal_tolerance_deg=normal_tolerance_deg,
+                ransac_threshold=ransac_threshold,
+                min_pixels=min_pixels,
+            )
+
+            planes.extend(cluster_planes)
+
+        building_planes_dsm.extend(planes)
+        
+    polygons_gdf = _dsm_planes_to_buffered_polygons(
+        building_planes_dsm,
+        local_transform,
+        buffer_m=buffer_m
+    )
+    
+    plane_id_raster = _assign_pixels_to_planes_3d(
+        local_mask,
+        local_dsm,
+        building_planes_dsm,
+        polygons_gdf,
+        local_transform,
+        local_ridge_mask,
+        nx=local_nx,
+        ny=local_ny,
+        nz=local_nz,
+        distance_tolerance=ransac_threshold,
+        normal_tolerance_deg=normal_tolerance_deg,
+        normal_weight=assignment_normal_weight
+    )
+    
+    # Enforce continuity
+    plane_id_raster = _enforce_plane_continuity(
+        plane_id_raster,
+        local_mask
+    )
+
+    updated_planes = _refit_planes_from_assignment(
+        plane_id_raster,
+        local_dsm,
+        local_transform
+    )
+
+    plane_id_raster = _reassign_unassigned_pixels_local(
+        plane_id_raster,
+        local_mask,
+        local_dsm,
+        updated_planes,
+        local_transform,
+        ridge_mask=local_ridge_mask
+,
+        max_search_radius=1
+    )
+
+    updated_planes = _refit_planes_from_assignment(
+        plane_id_raster,
+        local_dsm,
+        local_transform
+    )
+
+    if recover_distance_m and recover_distance_m > 0:
+        plane_id_raster = _recover_unassigned_roof(
+            plane_id_raster,
+            local_mask,
+            local_dsm,
+            updated_planes,
+            local_transform,
+            distance_tolerance=recover_distance_m,
+            min_pixels=min_pixels,
+            max_tilt_deg=recover_max_tilt_deg
+        )
+
+        updated_planes = _refit_planes_from_assignment(
+            plane_id_raster,
+            local_dsm,
+            local_transform
+        )
+
+    # Graph-based planes merging
+    updated_planes, plane_id_raster = _merge_similar_adjacent_planes_graph(
+        plane_id_raster,
+        updated_planes,
+        local_dsm,
+        local_transform,
+        normal_angle_threshold_deg=merge_normal_angle_deg,
+        ridge_mask=local_ridge_mask,
+        max_offset_m=merge_max_offset_m
+    )
+
+    # Remove small planes and reassign them
+    plane_id_raster = _remove_small_planes(
+        plane_id_raster,
+        min_pixels=min_pixels
+    )
+
+    updated_planes = _refit_planes_from_assignment(
+        plane_id_raster,
+        local_dsm,
+        local_transform
+    )
+
+    plane_id_raster = _reassign_unassigned_pixels_local(
+        plane_id_raster,
+        local_mask,
+        local_dsm,
+        updated_planes,
+        local_transform,
+        ridge_mask=local_ridge_mask
+,
+        max_search_radius=1
+    )
+
+    updated_planes = _refit_planes_from_assignment(
+        plane_id_raster,
+        local_dsm,
+        local_transform
+    )
+
+    if coplanar_merge_angle_deg and coplanar_merge_angle_deg > 0:
+        updated_planes, plane_id_raster = _merge_coplanar_planes(
+            plane_id_raster,
+            updated_planes,
+            local_dsm,
+            local_transform,
+            max_angle_deg=coplanar_merge_angle_deg,
+            max_step_m=coplanar_merge_step_m
+        )
+
+    fit_mask = None
+
+    if skirt_assign_distance_m and skirt_assign_distance_m > 0:
+        fit_mask = plane_id_raster > 0
+        plane_id_raster = _assign_roof_skirts(
+            plane_id_raster,
+            local_mask,
+            max_distance_px=skirt_assign_distance_m / abs(local_transform.a)
+        )
+
+    # Chimneys, aerials and the rest of the clutter standing on the
+    # finished facets. Last, so it sees the planes the polygons will
+    # actually carry - skirts included, since clutter sits on those too.
+    hole_mask = None
+
+    if local_svf is not None:
+        hole_mask = _detect_roof_obstructions(
+            plane_id_raster,
+            updated_planes,
+            local_dsm,
+            local_svf,
+            local_transform,
+            svf_drop=svf_obstruction_drop,
+            min_height_m=svf_obstruction_min_height_m,
+            min_area_m2=svf_obstruction_min_area_m2,
+            max_area_m2=svf_obstruction_max_area_m2,
+            max_elongation=svf_obstruction_max_elongation,
+            max_planes=svf_obstruction_max_planes,
+            close_m=svf_obstruction_close_m,
+            buffer_m=svf_obstruction_buffer_m
+        )
+
+
+    # Roof planes vectorisation
+    gdf_planes = _polygonize_and_compute_parameters(
+        plane_id_raster,
+        updated_planes,
+        local_dsm,
+        local_transform,
+        part_id,
+        crs,
+        simplify_tolerance=None,
+        fit_mask=fit_mask,
+        hole_mask=hole_mask
+    )
+
+
+    return (
+        gdf_planes,
+        ridge_snapshot,
+        local_clusters,
+        n_local_clusters,
+        hole_mask if debug_mode else None,
+    )
+
+
+# What _detect_part_planes reads from detect_roof_planes' frame.
+_PART_JOB_NAMES = (
+    "labeled_buildings", "part_slices", "dsm", "nx", "ny", "nz", "svf",
+    "transform", "crs", "min_pixels", "ridge_splitting_roof_planes",
+    "preclustering_roof_planes", "normal_tolerance_deg", "smooth_sigma",
+    "ransac_threshold", "buffer_m", "assignment_normal_weight",
+    "recover_distance_m", "recover_max_tilt_deg", "merge_normal_angle_deg",
+    "merge_max_offset_m", "coplanar_merge_angle_deg", "coplanar_merge_step_m",
+    "skirt_assign_distance_m", "svf_obstruction_drop",
+    "svf_obstruction_min_height_m", "svf_obstruction_min_area_m2",
+    "svf_obstruction_max_area_m2", "svf_obstruction_max_elongation",
+    "svf_obstruction_max_planes", "svf_obstruction_close_m",
+    "svf_obstruction_buffer_m", "debug_mode",
+)
+
+
 def _memory_gb():
     """
     (available, total) memory in GB for this process: the machine's, or
@@ -1519,6 +1627,19 @@ def _run_roof_tiles_parallel(tasks, common, n_workers, worker_ram_gb, cpus,
         except psutil.Error:
             return 0.0
 
+    def kill_tree(proc):
+        # The tile's own workers first: killed alone they would be orphans
+        # waiting forever on a queue nobody writes to, holding their memory.
+        try:
+            children = psutil.Process(proc.pid).children(recursive=True)
+        except psutil.Error:
+            children = []
+        for p in [*children, proc]:
+            try:
+                os.kill(p.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+
     def can_start(limit):
         if len(running) >= limit:
             return False
@@ -1528,77 +1649,82 @@ def _run_roof_tiles_parallel(tasks, common, n_workers, worker_ram_gb, cpus,
         growth = sum(max(0.0, worker_ram_gb - rss_gb(p)) for p, _ in running.values())
         return free - growth - worker_ram_gb > reserve_gb
 
-    with tqdm(total=len(tasks), desc="Roof tiles", unit="tile") as bar:
-        while pending or deferred or running:
+    try:
+        with tqdm(total=len(tasks), desc="Roof tiles", unit="tile") as bar:
+            while pending or deferred or running:
 
-            # Deferred tiles go once the shared phase is over, one at a time.
-            queue, limit = (pending, n_workers) if pending else (deferred, 1)
-            while queue and can_start(limit):
-                task = queue.pop(0)
-                threads = max(1, cpus // max(1, min(limit, len(queue) + len(running) + 1)))
-                proc = ctx.Process(
-                    target=_roof_tile_process,
-                    args=(task, common, threads),
-                    daemon=True
-                )
-                proc._start_order = next(counter)
-                proc.start()
-                running[proc.sentinel] = (proc, task)
-
-            ready = wait(list(running), timeout=0.2)
-
-            for sentinel in ready:
-                proc, task = running.pop(sentinel)
-                proc.join()
-
-                if proc.pid in stopped:
-                    if task.get("_alone"):
-                        failed.append((task, "memory"))
-                        tqdm.write(
-                            f"Roof tile {task['tile_id']} needs more memory than "
-                            f"is free even on its own; stopped"
-                        )
-                        bar.update(1)
-                    else:
-                        task["_alone"] = True
-                        deferred.append(task)
-                        tqdm.write(
-                            f"Roof tile {task['tile_id']} stopped to keep "
-                            f"{reserve_gb:.0f} GB free; it will run on its own later"
-                        )
-                    continue
-
-                if proc.exitcode != 0 or not os.path.exists(task["result_path"]):
-                    failed.append((task, proc.exitcode))
-                    tqdm.write(
-                        f"Roof tile {task['tile_id']} failed "
-                        f"(exit code {proc.exitcode}): see {task['log_path']}"
+                # Deferred tiles go once the shared phase is over, one at a time.
+                queue, limit = (pending, n_workers) if pending else (deferred, 1)
+                while queue and can_start(limit):
+                    task = queue.pop(0)
+                    threads = max(1, cpus // max(1, min(limit, len(queue) + len(running) + 1)))
+                    # Not daemonic: a tile forks its own workers per building,
+                    # and daemonic processes may not have children. The
+                    # finally below stops them instead if this loop dies.
+                    proc = ctx.Process(
+                        target=_roof_tile_process,
+                        args=(task, common, threads)
                     )
-                bar.update(1)
+                    proc._start_order = next(counter)
+                    proc.start()
+                    running[proc.sentinel] = (proc, task)
 
-            # Watchdog: give memory back before the kernel takes it. As many
-            # tiles as it takes, youngest first, counting what the ones
-            # already killed but not yet reaped are about to return.
-            if running:
-                projected = _memory_gb()[0] + sum(
-                    rss_gb(p) for p, _ in running.values() if p.pid in stopped
-                )
-                victims = sorted(
-                    (p for p, _ in running.values() if p.pid not in stopped),
-                    key=lambda p: -p._start_order
-                )
-                for victim in victims:
-                    if projected >= reserve_gb:
-                        break
-                    projected += rss_gb(victim)
-                    stopped.add(victim.pid)
-                    try:
-                        os.kill(victim.pid, signal.SIGKILL)
-                    except ProcessLookupError:
-                        pass
-                    # A tile alone when killed was given the whole machine.
-                    if len(running) == 1:
-                        running[victim.sentinel][1]["_alone"] = True
+                ready = wait(list(running), timeout=0.2)
+
+                for sentinel in ready:
+                    proc, task = running.pop(sentinel)
+                    proc.join()
+
+                    if proc.pid in stopped:
+                        if task.get("_alone"):
+                            failed.append((task, "memory"))
+                            tqdm.write(
+                                f"Roof tile {task['tile_id']} needs more memory than "
+                                f"is free even on its own; stopped"
+                            )
+                            bar.update(1)
+                        else:
+                            task["_alone"] = True
+                            deferred.append(task)
+                            tqdm.write(
+                                f"Roof tile {task['tile_id']} stopped to keep "
+                                f"{reserve_gb:.0f} GB free; it will run on its own later"
+                            )
+                        continue
+
+                    if proc.exitcode != 0 or not os.path.exists(task["result_path"]):
+                        failed.append((task, proc.exitcode))
+                        tqdm.write(
+                            f"Roof tile {task['tile_id']} failed "
+                            f"(exit code {proc.exitcode}): see {task['log_path']}"
+                        )
+                    bar.update(1)
+
+                # Watchdog: give memory back before the kernel takes it. As many
+                # tiles as it takes, youngest first, counting what the ones
+                # already killed but not yet reaped are about to return.
+                if running:
+                    projected = _memory_gb()[0] + sum(
+                        rss_gb(p) for p, _ in running.values() if p.pid in stopped
+                    )
+                    victims = sorted(
+                        (p for p, _ in running.values() if p.pid not in stopped),
+                        key=lambda p: -p._start_order
+                    )
+                    for victim in victims:
+                        if projected >= reserve_gb:
+                            break
+                        projected += rss_gb(victim)
+                        stopped.add(victim.pid)
+                        kill_tree(victim)
+                        # A tile alone when killed was given the whole machine.
+                        if len(running) == 1:
+                            running[victim.sentinel][1]["_alone"] = True
+    finally:
+        # Interrupted or failed here: no tile, nor any of its workers,
+        # is left running on its own.
+        for proc, _ in running.values():
+            kill_tree(proc)
 
     for task in tasks:
         task.pop("_alone", None)
@@ -1673,6 +1799,7 @@ def _run_roof_tile(task, common, *, threads):
             building_owner_mask=owner,
             refined_output_paths=task["refined_paths"],
             output_path=None,
+            n_workers=threads,
             **common["detect_kwargs"]
         )
 
@@ -4590,6 +4717,7 @@ def smooth_roof_points_by_building(
     *,
     strength=0.7,
     progress=False,
+    n_workers=1,
     **kwargs
 ):
     """
@@ -4613,6 +4741,9 @@ def smooth_roof_points_by_building(
         As in ``smooth_points_to_planes``.
     progress : bool, default=False
         Show a progress bar over the buildings.
+    n_workers : int, default=1
+        Buildings smoothed at once, in forked processes. The result does
+        not depend on it.
     **kwargs
         Forwarded to ``smooth_points_to_planes``.
 
@@ -4636,28 +4767,35 @@ def smooth_roof_points_by_building(
     if building_ids.size == 0:
         return smoothed
 
-    iterator = building_ids
+    # Each building's points, in ascending order as np.where would give
+    # them, from one sort instead of a pass over the cloud per building.
+    order = np.argsort(labels, kind="stable")
+    sorted_labels = labels[order]
+    starts = np.searchsorted(sorted_labels, building_ids, side="left")
+    ends = np.searchsorted(sorted_labels, building_ids, side="right")
+    selections = [order[a:b] for a, b in zip(starts, ends)]
 
-    if progress:
-        iterator = tqdm(
-            building_ids,
-            desc="Delaunay-smoothing roof points",
-            unit="building"
-        )
+    # Largest first, so a big block is not the last one left running.
+    items = sorted(range(len(selections)), key=lambda k: -selections[k].size)
 
-    for building_id in iterator:
-        selection = np.where(labels == building_id)[0]
+    z = _fork_map(
+        _smooth_building_points, items, (pts, selections, strength, kwargs),
+        n_workers=n_workers, progress=progress,
+        desc="Delaunay-smoothing roof points", chunksize=1
+    )
 
-        if selection.size == 0:
-            continue
-
-        smoothed[selection] = smooth_points_to_planes(
-            pts[selection],
-            strength=strength,
-            **kwargs
-        )
+    for k, z_k in zip(items, z):
+        smoothed[selections[k], 2] = z_k
 
     return smoothed
+
+
+def _smooth_building_points(k):
+    """One building's smoothed z, for ``smooth_roof_points_by_building``."""
+    pts, selections, strength, kwargs = _FORK_JOB
+    return smooth_points_to_planes(
+        pts[selections[k]], strength=strength, **kwargs
+    )[:, 2]
 
 
 def _delaunay_adjacency(edges, n_points):
@@ -6178,7 +6316,8 @@ def _regularize_wireframe_faces(faces, *, progress, wall_step_m, n_workers=None,
 _FORK_JOB = None
 
 
-def _fork_map(func, items, job, *, n_workers=None, progress=False, desc=None):
+def _fork_map(func, items, job, *, n_workers=None, progress=False, desc=None,
+              chunksize=None):
     """
     ``[func(item) for item in items]``, spread over forked processes.
 
@@ -6204,15 +6343,42 @@ def _fork_map(func, items, job, *, n_workers=None, progress=False, desc=None):
                 results = tqdm(results, total=len(items), desc=desc)
             return list(results)
 
-        with ProcessPoolExecutor(n_workers, mp_context=mp.get_context("fork")) as pool:
-            results = pool.map(
-                func, items, chunksize=max(1, len(items) // (n_workers * 16))
-            )
+        # The workers share this process's threads: n_workers processes each
+        # with all of them would oversubscribe the cores n_workers times.
+        threads = max(1, _process_threads() // n_workers)
+        with ProcessPoolExecutor(n_workers, mp_context=mp.get_context("fork"),
+                                 initializer=_limit_worker_threads,
+                                 initargs=(threads,)) as pool:
+            if chunksize is None:
+                chunksize = max(1, len(items) // (n_workers * 16))
+            results = pool.map(func, items, chunksize=chunksize)
             if progress:
                 results = tqdm(results, total=len(items), desc=desc)
             return list(results)
     finally:
         _FORK_JOB = None
+
+
+def _process_threads():
+    """The threads this process may use: numba's setting, or the CPUs it may run on."""
+    try:
+        import numba
+        return numba.get_num_threads()
+    except ImportError:
+        return len(os.sched_getaffinity(0))
+
+
+def _limit_worker_threads(threads):
+    """Initializer of the _fork_map workers: numba and BLAS to ``threads``."""
+    try:
+        import numba
+        numba.set_num_threads(min(threads, numba.config.NUMBA_NUM_THREADS))
+    except ImportError:
+        pass
+    from threadpoolctl import threadpool_limits
+    # Kept for the worker's lifetime: the limits hold while the object lives.
+    global _WORKER_THREAD_LIMITS
+    _WORKER_THREAD_LIMITS = threadpool_limits(limits=threads)
 
 
 def _rebuild_roof_group(members):
@@ -6233,9 +6399,10 @@ class _WindowedBand:
     whole raster in memory.
     """
 
-    def __init__(self, source, band=1):
+    def __init__(self, source, band=1, dtype=np.float64):
         self.source = source
         self.band = band
+        self.dtype = dtype
         self.shape = (source.height, source.width)
 
     def __getitem__(self, key):
@@ -6243,7 +6410,7 @@ class _WindowedBand:
         window = Window(
             cols.start, rows.start, cols.stop - cols.start, rows.stop - rows.start
         )
-        return self.source.read(self.band, window=window).astype(np.float64)
+        return self.source.read(self.band, window=window).astype(self.dtype)
 
 
 def _roof_height(faces, rebuilt):

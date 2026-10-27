@@ -36,9 +36,9 @@ from shapely.geometry import Polygon, MultiPolygon
 import geopandas as gpd
 from rasterio.windows import Window
 try:
-    from .logging_utils import info, warning, error
+    from .logging_utils import info, warning, error, tqdm
 except ImportError:
-    from greenshadow.logging_utils import info, warning, error
+    from greenshadow.logging_utils import info, warning, error, tqdm
 
 # Constants
 BASE_JSON = "https://datacloud.icgc.cat/datacloud/lidar-territorial/json/lidar-territorial-tall.json"
@@ -168,7 +168,6 @@ def _target_paths_for_url(url: str, out_dir: str) -> tuple[str, str]:
 def _download_many(urls: List[str], out_dir: str, max_workers: int = 8) -> List[str]:
     """Download multiple files with progress tracking."""
     from concurrent.futures import ThreadPoolExecutor, as_completed
-    from tqdm import tqdm
     
     if not urls:
         return []
@@ -640,8 +639,8 @@ def radians_to_degrees(radians: float) -> float:
 # ---------------- Configuration and environment ----------------
 
 def hard_print(msg):
-    sys.stdout.write(msg)
-    sys.stdout.flush()
+    sys.stderr.write(msg)
+    sys.stderr.flush()
 
 def get_environment_info() -> Dict[str, Any]:
     """Get information about the current environment."""
@@ -816,7 +815,7 @@ def delete_all_files_in_directory(directory: str, delete_subdirectories: bool = 
                 elif os.path.isdir(file_path) and delete_subdirectories:
                     shutil.rmtree(file_path)  # Remove the directory and its contents if flag is set
             except Exception as e:
-                print(f'Failed to delete {file_path}. Reason: {e}')
+                warning(f'Failed to delete {file_path}. Reason: {e}')
 
 
 def _date_range_local_to_utc(
@@ -1512,7 +1511,7 @@ def _delete_all_files_in_directory(directory: str, delete_subdirectories: bool =
                 elif os.path.isdir(file_path) and delete_subdirectories:
                     shutil.rmtree(file_path)  # Remove the directory and its contents if flag is set
             except Exception as e:
-                print(f'Failed to delete {file_path}. Reason: {e}')
+                warning(f'Failed to delete {file_path}. Reason: {e}')
 
 def _validate_and_fix_geometries(gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
     """
@@ -1646,7 +1645,7 @@ def plot_plane_debug_pyvista(points3d, polygon, tilt, azimuth):
         raise ValueError("points3d must be (N,3)")
 
     if polygon is None or polygon.is_empty:
-        print("Polygon invalid.")
+        info("Polygon invalid.")
         return
 
     # -----------------------------------------
@@ -1759,7 +1758,7 @@ def analyze_polygon_vs_points(points3d, polygon):
         raise ValueError("points3d must be (N,3)")
 
     if polygon is None or polygon.is_empty:
-        print("Polygon is None or empty.")
+        info("Polygon is None or empty.")
         return
 
     # -------------------------------
@@ -1804,28 +1803,28 @@ def analyze_polygon_vs_points(points3d, polygon):
     # Report
     # -------------------------------
 
-    print("----- Point Cloud Extent -----")
-    print(f"X range: {x_min:.3f} → {x_max:.3f} ({pc_width:.3f} m)")
-    print(f"Y range: {y_min:.3f} → {y_max:.3f} ({pc_height:.3f} m)")
-    print(f"Bounding box area: {pc_area_bbox:.3f} m²")
+    info("----- Point Cloud Extent -----")
+    info(f"X range: {x_min:.3f} → {x_max:.3f} ({pc_width:.3f} m)")
+    info(f"Y range: {y_min:.3f} → {y_max:.3f} ({pc_height:.3f} m)")
+    info(f"Bounding box area: {pc_area_bbox:.3f} m²")
 
-    print("\n----- Polygon Extent -----")
-    print(f"X range: {p_minx:.3f} → {p_maxx:.3f} ({poly_width:.3f} m)")
-    print(f"Y range: {p_miny:.3f} → {p_maxy:.3f} ({poly_height:.3f} m)")
-    print(f"Polygon area: {poly_area:.3f} m²")
-    print(f"Polygon bbox area: {poly_bbox_area:.3f} m²")
+    info("\n----- Polygon Extent -----")
+    info(f"X range: {p_minx:.3f} → {p_maxx:.3f} ({poly_width:.3f} m)")
+    info(f"Y range: {p_miny:.3f} → {p_maxy:.3f} ({poly_height:.3f} m)")
+    info(f"Polygon area: {poly_area:.3f} m²")
+    info(f"Polygon bbox area: {poly_bbox_area:.3f} m²")
 
-    print("\n----- Overlap Check -----")
-    print("Overlaps point cloud XY:", overlaps)
+    info("\n----- Overlap Check -----")
+    info(f"Overlaps point cloud XY: {overlaps}")
 
-    print("\n----- Relative Size -----")
-    print(f"Polygon bbox / Point cloud bbox ratio: {ratio:.6f}")
+    info("\n----- Relative Size -----")
+    info(f"Polygon bbox / Point cloud bbox ratio: {ratio:.6f}")
 
     if ratio < 0.01:
-        print("⚠ Polygon is very small relative to scene → will look invisible in 3D.")
+        warning("Polygon is very small relative to scene → will look invisible in 3D.")
 
     if not overlaps:
-        print("❌ Polygon does NOT overlap point cloud in XY.")
+        warning("Polygon does NOT overlap point cloud in XY.")
 
 
 def _write_array_to_tiff(

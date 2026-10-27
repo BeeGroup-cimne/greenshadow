@@ -5,7 +5,8 @@ greenshadow: Environmental shading analysis using LiDAR data
 A Python library for analyzing environmental shading in rural and urban areas using
 high-resolution LiDAR data and custom hillshade algorithms.
 
-For detailed usage examples, see the README.md and example/get_solar_energy_from_municipality.py
+For detailed usage examples, see the README.md and example/get_solar_energy_from_municipality.py;
+the whole chain runs in one call through greenshadow.pipelines.
 """
 
 __version__ = "1.0.0"
@@ -26,6 +27,7 @@ from . import roofs_3d
 from . import dimensionate
 from . import crop_rows
 from . import parcel_pv
+from . import pipelines
 
 # Import commonly used functions for convenience
 from .lidar import (
@@ -48,6 +50,7 @@ from .shader import (
     generate_azimuth_altitude_pairs_by_year,
     apply_height_shadow_to_hillshades,
     compute_surface_solar_energy,
+    compute_surface_solar_energies,
     delete_matching_files,
     generate_daily_shadow_mp4,
     pv_potential_from_fourier_raster,
@@ -83,6 +86,12 @@ from .parcel_pv import (
     DEFAULT_CROPS,
     SIGPAC_USE_MARGIN_EUR_HA,
     SIGPAC_USE_SHADE_RESPONSE
+)
+
+from .pipelines import (
+    run_catalonia_municipalities,
+    CataloniaConfig,
+    CataloniaMunicipalityPipeline
 )
 
 from .rural_parcels import (
@@ -209,6 +218,7 @@ __all__ = [
     'generate_azimuth_altitude_pairs_by_year',
     'apply_height_shadow_to_hillshades',
     'compute_surface_solar_energy',
+    'compute_surface_solar_energies',
     'delete_matching_files',
     'generate_daily_shadow_mp4',
     'pv_potential_from_fourier_raster',
@@ -253,7 +263,13 @@ __all__ = [
     'write_scenario_layers',
     'PVModuleSpec',
     'DEFAULT_MODULES',
-    'solar_min_altitude'
+    'solar_min_altitude',
+
+    # Pipelines
+    'pipelines',
+    'run_catalonia_municipalities',
+    'CataloniaConfig',
+    'CataloniaMunicipalityPipeline'
 ]
 
 # Always add weather functions (either real or stub)

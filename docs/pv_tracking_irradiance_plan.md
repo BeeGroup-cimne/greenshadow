@@ -4,7 +4,9 @@
 solar aggregation was extended so that `greenshadow.parcel_pv` can cost
 single-axis trackers, dual-axis trackers and vertical bifacial fences, which
 the `fourier_poa` basis cannot represent. § 7 lists where the implementation
-departs from the original plan, and § 8 how it was validated.
+departs from the original plan, and § 8 how it was validated. The parcel
+planner as a whole is described in [parcel_pv.md](parcel_pv.md), and the
+other irradiation modes in [solar_energy.md](solar_energy.md).
 
 ## 1. Why the fixed basis is not enough
 
@@ -108,35 +110,47 @@ largest where both happen at low sun on a parcel with a high horizon.
 | Key | Kind | Geometry | Capex €/Wp | Opex €/kWp·yr |
 |---|---|---|---|---|
 | `pv_single_axis` | PV field | 1 portrait module across, GCR 0.35, N-S rows | 0.62 | 14 |
-| `pv_dual_axis` | PV field | 5 × 6 landscape (≈ 30 modules), 21 m E-W × 23 m N-S | 0.78 | 18 |
+| `pv_dual_axis` | PV field | 5 × 6 landscape (≈ 30 modules), at least 21 m E-W × 23 m N-S, more until shading ≤ 2 % | 0.78 | 18 |
 | `apv_single_axis` | agrivoltaic | axis 2.4 m, pitch 8–12 m set by the crop | 0.70 | 15 |
 | `apv_vertical_bifacial` | agrivoltaic | 2 landscape modules high, bifaciality 0.75, pitch 8–12 m | 0.75 | 13 |
 
-* Trackers are laid on North-South rows only. Vertical fences go both ways:
-  East/West faces on N-S rows, South/North faces on E-W rows.
+* Single-axis trackers are laid on North-South rows only. Dual-axis trackers
+  are not laid in rows: each stands on a point of a lattice, its swept circle
+  inside the setback, spaced at the least ground per tracker that keeps the
+  neighbours' shading within `tracker_max_shading_loss` (2 %). Vertical
+  fences go both ways: East/West faces on N-S rows, South/North faces on E-W
+  rows.
 * The crop under a vertical fence keeps `1 − 0.6 · height / pitch` of its
   light: about 75 % at 8 m and 80 % at 10 m, as in field trials.
 * `plan_parcel_pv_scenarios` takes `vertical_basis_path=` and
   `tracking_basis_path=`. A system whose basis is not given is skipped with a
   warning, never costed on the wrong basis.
 * The scenario table reports `mounting` and `row_shading_factor`.
-* The example builds both bases on the no-vegetation hillshades and passes
-  them in.
+* The pipeline ([pipelines.md](pipelines.md)) builds both bases on the
+  no-vegetation hillshades and passes them in.
 
 ## 5. Memory
 
 Each mode holds its own accumulators: 4 or 6 float32 rasters, against the 5 of
-`fourier_poa`. On Alpicat (11,169 × 10,265 px) that is about 1.8 and 2.8 GB,
-so the two passes run one after the other instead of in a single 15-band
-mode.
+`fourier_poa`. On Alpicat (11,169 × 10,265 px) that is about 1.8 and 2.8 GB.
+
+*Update 2026-10-20:* `compute_surface_solar_energies(modes=...)` now sums any
+set of modes in one read of the hillshades, so the pipeline computes
+`fourier_poa`, `vertical_basis` and `tracking_basis` together - 15 bands,
+about 6.9 GB on Alpicat - on the GPU when they fit in its free memory and on
+the CPU otherwise ([solar_energy.md](solar_energy.md#4-reading-the-hillshades-once)).
 
 ## 6. Elevation of the modules
 
 Tracker axes (2–2.5 m) and overhead agrivoltaics (4–5 m) sit above the ground
-the hillshades describe. `apply_height_shadow_to_hillshades(height_m=...)`
-produces hillshades for a raised surface, and the bases can be built on those
-instead. This is a parameter of the run, not new code; the example still
-uses ground level.
+the hillshades describe. The bases are built at ground level.
+
+`apply_height_shadow_to_hillshades(height_m=...)` is **not** a raised-surface
+hillshade: it blacks out every pixel standing more than `height_m` above the
+DEM and keeps the shadows cast at ground level
+([hillshades_and_sky_view.md](hillshades_and_sky_view.md#3-elevated-shadows-apply_height_shadow_to_hillshades)).
+Shading at module height would need the shadow march to start `height_m`
+above the ground, which is not implemented.
 
 ## 7. Departures from the original plan
 

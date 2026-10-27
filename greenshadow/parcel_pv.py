@@ -55,7 +55,17 @@ Shading of one row by the next depends on the layout, not the pixel, so it
 is worked out per layout over the sun table written beside those bases and
 applied as a factor: backtracking for single-axis trackers, the share of a
 dual-axis tracker its neighbours cover, the shadow a fence casts up the next.
-Single- and dual-axis trackers are laid on North-South rows only.
+Single-axis trackers are laid on North-South rows only. Dual-axis trackers
+are not laid in rows at all: each stands on its own point of a lattice spaced
+so that its neighbours barely shade it (``tracker_max_shading_loss``).
+
+What comes out
+--------------
+Like ``plan_pv_strings_in_buildings``, every scenario costed survives into
+the output with its panels: one polygon per table - each continuous stretch
+of modules down a row, at its plan width - or per dual-axis tracker, written
+one GeoPackage layer per scenario so they can be compared side by side, plus
+``best`` and the best of each kind, which take each parcel's own winner.
 
 Agronomy and economics
 ----------------------
@@ -76,7 +86,10 @@ import pandas as pd
 import geopandas as gpd
 import rasterio
 from shapely.geometry import LineString
-from tqdm import tqdm
+try:
+    from .logging_utils import tqdm
+except ImportError:
+    from greenshadow.logging_utils import tqdm
 
 try:
     from .dimensionate import (
@@ -85,6 +98,7 @@ try:
         _polygon_pixel_mask,
         _read_window,
         solar_min_altitude,
+        write_scenario_layers,
     )
     from .rural_parcels import filter_agricultural_parcels, sigpac_parcel_id
     from .shader import reconstruct_poa_from_basis, read_sun_table
@@ -95,6 +109,7 @@ except ImportError:  # running from a checkout without the package installed
         _polygon_pixel_mask,
         _read_window,
         solar_min_altitude,
+        write_scenario_layers,
     )
     from greenshadow.rural_parcels import filter_agricultural_parcels, sigpac_parcel_id
     from greenshadow.shader import reconstruct_poa_from_basis, read_sun_table
@@ -135,15 +150,25 @@ class MountingSystem:
     axis, ``modules_across`` portrait modules across, backtracking at
     ``ground_cover_ratio`` when no crop sets the pitch) or ``"dual_axis"``
     (trackers ``modules_across`` landscape modules high and ``modules_along``
-    wide, spaced ``tracker_spacing_m`` East-West and North-South). The last
-    three need the vertical or tracking basis.
+    wide, each on its own pole). The last three need the vertical or tracking
+    basis.
+
+    Dual-axis trackers are not laid in rows: each stands on a point of a
+    rectangular lattice, at least ``tracker_spacing_m`` (East-West,
+    North-South) apart and further if that is what it takes for its
+    neighbours to cost it no more than ``tracker_max_shading_loss`` of its
+    annual direct beam.
 
     ``layout`` says where the rows come from. ``"synthetic"`` systems are laid
     out from scratch, North-South and East-West. ``"rows_overhead"`` and
     ``"rows_alley"`` systems are built into a plantation that is already there,
     along the rows ``detect_crop_rows`` found: over every ``row_steps``-th crop
-    row, or down the middle of every ``row_steps``-th alley. They are always
-    agrivoltaic, and the crop they keep is the one already growing.
+    row, or down the middle of every ``row_steps``-th alley - every row by
+    default. They are always agrivoltaic, and the crop they keep is the one
+    already growing. The plantation's spacing is fixed, so the table is fitted
+    to it rather than the other way round: ``modules_across`` and the tilts are
+    the most the table may take, and it is narrowed, turned to landscape and
+    laid flatter until it fits (``_fit_table``).
     """
 
     key: str
@@ -167,6 +192,7 @@ class MountingSystem:
     modules_along: int = 0
     tracker_spacing_m: tuple = None
     tracker_max_rotation_deg: float = 60.0
+    tracker_max_shading_loss: float = 0.02
 
 
 @dataclass(frozen=True)
@@ -275,7 +301,11 @@ DEFAULT_SYSTEMS = (
     # more moving parts to maintain. Single-axis PV fields run at a ground
     # cover ratio of 0.35-0.45; agrivoltaic ones at 10-12 m pitch over a
     # 2.4 m axis (Rutgers agrivoltaic farms). Vertical bifacial fences stand
-    # 8-12 m apart (Next2Sun), two landscape modules high.
+    # 8-12 m apart (Next2Sun), two landscape modules high. Dual-axis
+    # trackers stand 21 x 23 m apart at least, and further where that still
+    # leaves their neighbours more than 2 % of their beam: at 21 x 23 m they
+    # take about 5 % under Lleida's sky, where a tenth of the beam comes
+    # from below 10 degrees, and holding them to 1 % takes 60 m.
     MountingSystem(
         key="pv_single_axis",
         kind="pv_field",
@@ -330,10 +360,12 @@ DEFAULT_SYSTEMS = (
         mounting="vertical",
         bifaciality=0.75,
     ),
-    # Over an existing plantation. The overhead structure is the same as on a
-    # new field and has to clear the canopy; the alley tables are the
-    # interspace ones, put in every second alley at most so that machinery
-    # still has a way down the plantation.
+    # Over an existing plantation, on every row: an orchard or a vineyard is
+    # planted 3.5-4 m apart because that is what its tractors need, so a PV
+    # row can go over each crop row - the posts stand in the tree line - or
+    # down an alley only where a tractor lane is left beside it. The overhead
+    # structure is the one of a new field and has to clear the canopy; the
+    # alley tables are the interspace ones.
     MountingSystem(
         key="apv_rows_overhead",
         kind="agrivoltaic",
@@ -348,7 +380,7 @@ DEFAULT_SYSTEMS = (
         under_panel_cropped=True,
         land_loss_frac=0.02,
         layout="rows_overhead",
-        row_steps=(1, 2, 3),
+        row_steps=(1,),
     ),
     MountingSystem(
         key="apv_rows_alley",
@@ -362,7 +394,7 @@ DEFAULT_SYSTEMS = (
         opex_eur_kwp_year=13.0,
         crop_buffer_m=0.5,
         layout="rows_alley",
-        row_steps=(2, 3, 4),
+        row_steps=(1,),
     ),
 )
 
@@ -490,6 +522,10 @@ _MODULE_GAP_M = 0.02
 #: maintenance needs anyway.
 _TENT_AISLE_M = 1.0
 
+#: Gap left between two overhead tables over neighbouring crop rows, so that
+#: rain and some light still reach the crop between them.
+_OVERHEAD_GAP_M = 0.5
+
 #: Row origin offsets tried per layout, as fractions of the pitch. The parcel
 #: edge decides how many rows fit, and a third of a pitch either way can be
 #: worth one.
@@ -553,8 +589,13 @@ _MOUNTING_BASIS = {"fixed": None, "vertical": "vertical",
 
 
 def _directions(system):
-    """Row directions a system is laid in: trackers turn on North-South rows."""
-    if system.mounting in ("single_axis", "dual_axis"):
+    """
+    How a system is laid: single-axis trackers turn on North-South rows,
+    dual-axis ones stand on the points of a lattice, the rest go either way.
+    """
+    if system.mounting == "dual_axis":
+        return ("points",)
+    if system.mounting == "single_axis":
         return ("NS",)
     return DIRECTIONS
 
@@ -567,8 +608,11 @@ def _cross_section(system, direction, module):
     ``faces`` (fixed: ``(azimuth, share)`` pairs; vertical: ``(front,
     rear)``), ``unit_length`` / ``step`` / ``per_unit`` (a row holds
     ``floor((length - unit_length) / step) + 1`` units of ``per_unit``
-    modules: modules for most, whole trackers for dual axis) and ``height``
-    (top of the structure above the ground).
+    modules), ``height`` (top of the structure above the ground) and
+    ``config`` (modules across and how they are turned, ``"2P"`` for two
+    portrait). A dual-axis tracker is a ``panel`` (East-West, North-South
+    size when stowed flat) of ``per_unit`` modules sweeping a circle of
+    ``radius`` round its pole.
     """
     gap_step = module.width_m + _MODULE_GAP_M
 
@@ -579,6 +623,7 @@ def _cross_section(system, direction, module):
             "unit_length": module.width_m, "step": gap_step,
             "per_unit": system.modules_across * (2 if direction == "NS" else 1),
             "height": system.clearance_m + slope_length * np.sin(np.radians(tilt)),
+            "config": f"{system.modules_across}P",
         }
 
     if system.mounting == "vertical":
@@ -588,6 +633,7 @@ def _cross_section(system, direction, module):
             "unit_length": module.length_m, "step": module.length_m + _MODULE_GAP_M,
             "per_unit": system.modules_across,
             "height": system.clearance_m + system.modules_across * module.width_m,
+            "config": f"{system.modules_across}L",
         }
 
     if system.mounting == "single_axis":
@@ -597,6 +643,7 @@ def _cross_section(system, direction, module):
             "unit_length": module.width_m, "step": gap_step,
             "per_unit": system.modules_across,
             "height": system.clearance_m + 0.5 * width,
+            "config": f"{system.modules_across}P",
         }
 
     if system.mounting == "dual_axis":
@@ -607,6 +654,8 @@ def _cross_section(system, direction, module):
             "unit_length": tall, "step": float(system.tracker_spacing_m[1]),
             "per_unit": system.modules_along * system.modules_across,
             "height": system.clearance_m + tall, "panel": (width, tall),
+            "radius": 0.5 * float(np.hypot(width, tall)),
+            "config": f"{system.modules_across}Lx{system.modules_along}",
         }
 
     raise ValueError(f"unknown mounting {system.mounting!r}")
@@ -617,16 +666,16 @@ def _default_pitch(system, direction, module, cross, latitude_deg):
     The pitch a system takes when no crop sets it.
 
     Fixed rows clear the solstice-noon shadow; single-axis trackers stand at
-    their ground cover ratio and backtrack; dual-axis trackers at their own
-    East-West spacing; a vertical fence, which only an agrivoltaic crop
-    places, at four times its height.
+    their ground cover ratio and backtrack; dual-axis trackers at the East-West
+    spacing ``_tracker_spacing`` found; a vertical fence, which only an
+    agrivoltaic crop places, at four times its height.
     """
     if system.mounting == "fixed":
         return _no_shading_pitch(system, direction, module, latitude_deg)
     if system.mounting == "single_axis":
         return cross["plan"] / (system.ground_cover_ratio or 0.35)
     if system.mounting == "dual_axis":
-        return float(system.tracker_spacing_m[0])
+        return float(cross["spacing"][0])
     return 4.0 * cross["height"]
 
 
@@ -639,6 +688,79 @@ def _sun_vectors(sun):
     up = np.sin(altitude)
     return (east, north, up,
             sun.dni_wh_m2.to_numpy(dtype=float), sun.dhi_wh_m2.to_numpy(dtype=float))
+
+
+def _dual_axis_lit(cross, dx, dy, vectors):
+    """
+    Share of each sun bin's beam that reaches a dual-axis tracker standing
+    ``dx`` East-West and ``dy`` North-South from its eight neighbours.
+
+    Every tracker faces the sun, so in the plane facing it each neighbour
+    sunward of this one is the same rectangle, shifted; the share it covers
+    is the overlap of the two.
+    """
+    east, north, up = vectors[:3]
+    width, tall = cross["panel"]
+
+    # In the plane facing the sun: across, horizontal; upwards, the rest.
+    horizontal = np.hypot(east, north)
+    across = np.stack([north / np.maximum(horizontal, 1e-9),
+                       -east / np.maximum(horizontal, 1e-9),
+                       np.zeros_like(east)])
+    sunward = np.stack([east, north, up])
+    upward = np.cross(sunward.T, across.T).T
+
+    lit = np.ones_like(east)
+    for ox in (-dx, 0.0, dx):
+        for oy in (-dy, 0.0, dy):
+            if ox == 0.0 and oy == 0.0:
+                continue
+            offset = np.array([ox, oy, 0.0])[:, None]
+            ahead = (offset * sunward).sum(axis=0) > 0.0
+            du = np.abs((offset * across).sum(axis=0))
+            dv = np.abs((offset * upward).sum(axis=0))
+            cover = (np.clip(1.0 - du / width, 0.0, 1.0)
+                     * np.clip(1.0 - dv / tall, 0.0, 1.0))
+            lit *= np.where(ahead, 1.0 - cover, 1.0)
+
+    return lit
+
+
+def _tracker_spacing(system, cross, sun, step_m=1.0):
+    """
+    East-West and North-South distance between dual-axis trackers.
+
+    The closest lattice - least ground per tracker - at which its neighbours
+    take no more than ``tracker_max_shading_loss`` of a tracker's annual
+    direct beam, searched from ``tracker_spacing_m`` up to three times it in
+    ``step_m`` steps. Never closer than the circles the panels sweep allow.
+    Without a sun table, ``tracker_spacing_m`` itself.
+    """
+    base_x, base_y = (float(value) for value in system.tracker_spacing_m)
+    clear = 2.0 * cross["radius"] + 1.0
+    base_x, base_y = max(base_x, clear), max(base_y, clear)
+
+    if sun is None or system.tracker_max_shading_loss is None:
+        return base_x, base_y
+
+    vectors = _sun_vectors(sun)
+    dni = vectors[3]
+    total = float(np.sum(dni))
+    if total <= 0:
+        return base_x, base_y
+
+    target = 1.0 - system.tracker_max_shading_loss
+    best, best_area = None, np.inf
+    for dx in np.arange(base_x, 3.0 * base_x + 1e-9, step_m):
+        for dy in np.arange(base_y, 3.0 * base_y + 1e-9, step_m):
+            if dx * dy >= best_area:
+                break
+            lit = float(np.sum(dni * _dual_axis_lit(cross, dx, dy, vectors))) / total
+            if lit >= target:
+                best, best_area = (float(dx), float(dy)), dx * dy
+                break
+
+    return best if best is not None else (3.0 * base_x, 3.0 * base_y)
 
 
 def _layout_factors(system, cross, direction, pitch, sun):
@@ -656,7 +778,8 @@ def _layout_factors(system, cross, direction, pitch, sun):
       ``singleaxis``); ``direct`` and ``sky`` are the ratios with backtracking
       to without.
     * Dual axis: the share of each tracker the trackers sunward of it cover,
-      its eight neighbours projected on the plane facing the sun.
+      its eight neighbours on the lattice (``cross["spacing"]``) projected
+      on the plane facing the sun.
     * Vertical: the shadow each fence casts up the face of the next one,
       per face.
 
@@ -694,29 +817,8 @@ def _layout_factors(system, cross, direction, pitch, sun):
         }
 
     if system.mounting == "dual_axis":
-        width, tall = cross["panel"]
-        dx, dy = (float(value) for value in system.tracker_spacing_m)
-        # In the plane facing the sun: across, horizontal; upwards, the rest.
-        horizontal = np.hypot(east, north)
-        across = np.stack([north / np.maximum(horizontal, 1e-9),
-                           -east / np.maximum(horizontal, 1e-9),
-                           np.zeros_like(east)])
-        sunward = np.stack([east, north, up])
-        upward = np.cross(sunward.T, across.T).T
-
-        lit = np.ones_like(east)
-        for ox in (-dx, 0.0, dx):
-            for oy in (-dy, 0.0, dy):
-                if ox == 0.0 and oy == 0.0:
-                    continue
-                offset = np.array([ox, oy, 0.0])[:, None]
-                ahead = (offset * sunward).sum(axis=0) > 0.0
-                du = np.abs((offset * across).sum(axis=0))
-                dv = np.abs((offset * upward).sum(axis=0))
-                cover = (np.clip(1.0 - du / width, 0.0, 1.0)
-                         * np.clip(1.0 - dv / tall, 0.0, 1.0))
-                lit *= np.where(ahead, 1.0 - cover, 1.0)
-
+        dx, dy = cross["spacing"]
+        lit = _dual_axis_lit(cross, dx, dy, (east, north, up))
         return {"direct": ratio(dni * lit, dni)}
 
     # Vertical fences.
@@ -854,6 +956,65 @@ def _lay_rows(buildable, values, *, resolution, pitch, plan_width, min_cells):
         laid.append((first, last, start, stop, block.mean(axis=1)))
 
     return laid
+
+
+def _lay_points(buildable_shape, valid, values, transform, *, spacing, cross):
+    """
+    Dual-axis trackers on the points of a lattice, each clear of the parcel.
+
+    A tracker stands wherever the whole circle its panel sweeps lies inside
+    the buildable shape and every pixel under the stowed panel has data. The
+    lattice is ``spacing`` (East-West, North-South) apart and its origin is
+    tried at a few offsets either way; the one that stands the most trackers
+    wins.
+
+    Returns ``[(x, y, means), ...]``, ``means`` holding the basis bands
+    averaged under the stowed panel.
+    """
+    inner = buildable_shape.buffer(-cross["radius"])
+    if inner.is_empty:
+        return []
+
+    dx, dy = spacing
+    width, tall = cross["panel"]
+    resolution = abs(transform.a)
+    half_cols = max(0, int(round(0.5 * width / resolution)))
+    half_rows = max(0, int(round(0.5 * tall / resolution)))
+    height_px, width_px = valid.shape
+    inverse = ~transform
+    minx, miny, maxx, maxy = inner.bounds
+
+    def window(x, y):
+        column, row = (int(np.floor(value)) for value in inverse * (x, y))
+        top, bottom = row - half_rows, row + half_rows + 1
+        left, right = column - half_cols, column + half_cols + 1
+        if top < 0 or left < 0 or bottom > height_px or right > width_px:
+            return None
+        if not valid[top:bottom, left:right].all():
+            return None
+        return slice(top, bottom), slice(left, right)
+
+    best = []
+    for phase_x in _PHASES:
+        for phase_y in _PHASES:
+            xs = np.arange(minx + phase_x * dx, maxx + 1e-9, dx)
+            ys = np.arange(miny + phase_y * dy, maxy + 1e-9, dy)
+            if not len(xs) or not len(ys):
+                continue
+            grid_x, grid_y = np.meshgrid(xs, ys)
+            inside = _polygon_pixel_mask(inner, grid_x, grid_y)
+            standing = []
+            for x, y in zip(grid_x[inside], grid_y[inside]):
+                rows, columns = window(x, y) or (None, None)
+                if rows is not None:
+                    standing.append((float(x), float(y), rows, columns))
+            if len(standing) > len(best):
+                best = standing
+
+    return [
+        (x, y, values[:, rows, columns].reshape(values.shape[0], -1).mean(axis=1))
+        for x, y, rows, columns in best
+    ]
 
 
 # ============================================================
@@ -1000,17 +1161,43 @@ def _run_line(transform, direction, first, last, start, stop):
     return LineString(points)
 
 
+def _trimmed(line, length):
+    """
+    The middle ``length`` metres of a line: where the modules of a run sit.
+    """
+    if length >= line.length:
+        return line
+    from shapely.ops import substring
+    margin = 0.5 * (line.length - length)
+    return substring(line, margin, line.length - margin)
+
+
+def _table_shape(line, plan_width):
+    """
+    Footprint of a table laid along ``line``: a rectangle ``plan_width`` wide.
+    """
+    return line.buffer(0.5 * max(plan_width, 0.01), cap_style=2, join_style=2)
+
+
+def _table_length(n_modules, cross):
+    """
+    Length a table of ``n_modules`` takes down its row.
+    """
+    units = n_modules // cross["per_unit"]
+    return cross["unit_length"] + (units - 1) * cross["step"] if units else 0.0
+
+
 def _evaluate_parcel(geometry, *, basis_src, scenarios, module, config):
     """
-    Every scenario on one parcel: its rows, energy and crop.
+    Every scenario on one parcel: its tables, energy and crop.
 
     The fourier_poa basis is stacked with the vertical and tracking bases
     when they were given (``config["sources"]``), so every row is sampled
     once for all of them; a system whose basis is missing is not laid out.
 
-    Returns ``(records, rows)``: one summary dict per scenario and direction,
-    and the row runs behind each, keyed by scenario id, for the caller to turn
-    into geometry once it knows which ones it wants.
+    Returns ``(records, layouts)``: one summary dict per scenario and
+    direction, and the tables behind each, keyed by scenario id, for the
+    caller to turn into geometry once it knows which ones it wants.
     """
     block = _read_window(basis_src, geometry, [1, 2, 3, 4, 5])
 
@@ -1049,7 +1236,7 @@ def _evaluate_parcel(geometry, *, basis_src, scenarios, module, config):
     module_area = module.area_m2
     module_kw = module.peak_kw(config["module_efficiency"])
 
-    records, rows = [], {}
+    records, out_layouts = [], {}
     layouts = {}
 
     for system, crop, pitch in scenarios:
@@ -1060,6 +1247,12 @@ def _evaluate_parcel(geometry, *, basis_src, scenarios, module, config):
         for direction in _directions(system):
 
             cross = _cross_section(system, direction, module)
+            if system.mounting == "dual_axis":
+                spacing_key = ("spacing", system.key)
+                if spacing_key not in config["factor_cache"]:
+                    config["factor_cache"][spacing_key] = _tracker_spacing(
+                        system, cross, config["sun"])
+                cross["spacing"] = config["factor_cache"][spacing_key]
             plan, tilt = cross["plan"], cross["tilt"]
 
             if pitch is None:
@@ -1072,49 +1265,59 @@ def _evaluate_parcel(geometry, *, basis_src, scenarios, module, config):
                 continue
 
             # A layout depends on the geometry alone, so crops that share a
-            # system, direction and pitch share its rows and its energy.
+            # system, direction and pitch share its tables and its energy.
             key = (system.key, direction, round(spacing, 3))
 
             if key not in layouts:
-                laid = _lay_rows(
-                    _orient(buildable, direction),
-                    _orient(values, direction),
-                    resolution=resolution,
-                    pitch=spacing,
-                    plan_width=plan,
-                    min_cells=min_cells,
-                )
-
-                cache_key = (system.key, direction, round(spacing, 3))
-                factors = config["factor_cache"].get(cache_key)
+                factors = config["factor_cache"].get(key)
                 if factors is None:
                     factors = _layout_factors(
                         system, cross, direction, spacing, config["sun"])
-                    config["factor_cache"][cache_key] = factors
+                    config["factor_cache"][key] = factors
 
-                n_modules, energy_kwh = 0, 0.0
-                for first, last, start, stop, means in laid:
-                    count = _units((stop - start) * resolution, cross)
+                if direction == "points":
+                    placed = [
+                        ((x, y), cross["per_unit"], means)
+                        for x, y, means in _lay_points(
+                            buildable_shape, buildable, values, transform,
+                            spacing=cross["spacing"], cross=cross)
+                    ]
+                else:
+                    placed = [
+                        ((first, last, start, stop),
+                         _units((stop - start) * resolution, cross), means)
+                        for first, last, start, stop, means in _lay_rows(
+                            _orient(buildable, direction),
+                            _orient(values, direction),
+                            resolution=resolution,
+                            pitch=spacing,
+                            plan_width=plan,
+                            min_cells=min_cells,
+                        )
+                    ]
+
+                tables = []
+                for where, count, means in placed:
                     if count == 0 or not np.all(np.isfinite(means[:5])):
                         continue
                     poa = _module_poa(system, cross, means, factors, config["albedo"])
                     if not np.isfinite(poa):
                         continue
-                    n_modules += count
-                    energy_kwh += (
-                        count * module_area * poa
-                        * config["module_efficiency"]
-                        * config["performance_ratio"]
-                        * (1.0 + system.bifacial_gain)
-                    )
+                    energy = (count * module_area * poa
+                              * config["module_efficiency"]
+                              * config["performance_ratio"]
+                              * (1.0 + system.bifacial_gain))
+                    tables.append((where, count, poa, energy))
 
                 layouts[key] = {
-                    "runs": laid,
+                    "tables": tables,
                     "factors": factors,
-                    "n_modules": n_modules,
-                    "energy_kwh": energy_kwh,
-                    "row_length_m": float(sum(
-                        (stop - start) for _, _, start, stop, _ in laid)) * resolution,
+                    "cross": cross,
+                    "n_modules": sum(count for _, count, _, _ in tables),
+                    "energy_kwh": sum(energy for _, _, _, energy in tables),
+                    "row_length_m": 0.0 if direction == "points" else float(sum(
+                        stop - start for (_, _, start, stop), _, _, _ in tables
+                    )) * resolution,
                 }
 
             layout = layouts[key]
@@ -1124,9 +1327,18 @@ def _evaluate_parcel(geometry, *, basis_src, scenarios, module, config):
 
             area, reduction, relative = _crop_effect(system, crop, cross, spacing)
 
-            scenario = f"{system.key}_{direction}_{spacing:.1f}m"
+            if direction == "points":
+                dx, dy = cross["spacing"]
+                scenario = f"{system.key}_points_{dx:.0f}x{dy:.0f}m"
+            else:
+                scenario = f"{system.key}_{direction}_{spacing:.1f}m"
             if crop is not None:
                 scenario += f"_{crop.key}"
+
+            if direction == "points":
+                cover = cross["panel"][0] * cross["panel"][1] / (dx * dy)
+            else:
+                cover = min(plan / spacing, 1.0)
 
             records.append({
                 "scenario": scenario,
@@ -1134,14 +1346,18 @@ def _evaluate_parcel(geometry, *, basis_src, scenarios, module, config):
                 "kind": system.kind,
                 "crop": crop.key if crop is not None else None,
                 "direction": direction,
+                "table_config": cross["config"],
                 "tilt_deg": float(tilt),
                 "pitch_m": float(spacing),
-                "n_rows": len(layout["runs"]),
+                "spacing_along_m": (float(cross["spacing"][1])
+                                    if direction == "points" else np.nan),
+                "n_rows": 0 if direction == "points" else len(layout["tables"]),
+                "n_trackers": len(layout["tables"]) if direction == "points" else 0,
                 "row_length_m": layout["row_length_m"],
                 "n_modules": layout["n_modules"],
                 "peak_kwp": layout["n_modules"] * module_kw,
                 "energy_mwh": layout["energy_kwh"] / 1000.0,
-                "ground_cover_ratio": min(plan / spacing, 1.0),
+                "ground_cover_ratio": cover,
                 "mounting": system.mounting,
                 "row_shading_factor": layout["factors"].get(
                     "direct", layout["factors"].get("front", 1.0)),
@@ -1154,35 +1370,152 @@ def _evaluate_parcel(geometry, *, basis_src, scenarios, module, config):
                 "_crop": crop,
             })
 
-            rows[scenario] = ("grid", direction, layout["runs"], transform)
+            out_layouts[scenario] = {
+                "shape": "points" if direction == "points" else "grid",
+                "direction": direction,
+                "tables": layout["tables"],
+                "cross": cross,
+                "pitch_m": float(spacing),
+                "transform": transform,
+            }
 
-    return records, rows
+    return records, out_layouts
 
 
-def _facing(row_azimuth_deg, system, module):
+def _layout_tables(layout, module_kw):
     """
-    How a table along rows of this bearing faces, and how wide it is.
+    The tables of one parcel's layout, as records with their footprints.
+
+    Grid runs are trimmed to the length their modules take and centred in
+    the run; a dual-axis tracker is drawn as its panel stowed flat, centred
+    on its pole. Existing-row layouts already carry their own lines.
+    """
+    out = []
+    shape = layout["shape"]
+
+    for number, table in enumerate(layout["tables"]):
+        if shape == "lines":
+            line, count, poa, energy, plan, tilt, faces, config = table
+            footprint = _table_shape(line, plan)
+            length = float(line.length)
+        elif shape == "points":
+            (x, y), count, poa, energy = table
+            width, tall = layout["cross"]["panel"]
+            from shapely.geometry import box
+            footprint = box(x - 0.5 * width, y - 0.5 * tall,
+                            x + 0.5 * width, y + 0.5 * tall)
+            length, plan = width, tall
+            tilt, faces, config = np.nan, None, layout["cross"]["config"]
+        else:
+            (first, last, start, stop), count, poa, energy = table
+            cross = layout["cross"]
+            line = _trimmed(
+                _run_line(layout["transform"], layout["direction"],
+                          first, last, start, stop),
+                _table_length(count, cross))
+            plan = cross["plan"]
+            footprint = _table_shape(line, plan)
+            length = float(line.length)
+            tilt, faces, config = cross["tilt"], cross["faces"], cross["config"]
+
+        azimuth = np.nan
+        if faces and isinstance(faces[0], tuple) and len(faces) == 1:
+            azimuth = float(faces[0][0])
+        elif faces and not isinstance(faces[0], tuple):
+            azimuth = float(faces[0])
+
+        out.append({
+            "table_index": number,
+            "table_config": config,
+            "n_modules": int(count),
+            "peak_kw": count * module_kw,
+            "length_m": length,
+            "width_m": float(plan),
+            "tilt_deg": float(tilt),
+            "azimuth_deg": azimuth,
+            "poa_kwh_m2": float(poa),
+            "energy_kwh": float(energy),
+            "geometry": footprint,
+        })
+
+    return out
+
+
+def _fit_table(row_azimuth_deg, system, module, *, pitch, max_plan, latitude_deg):
+    """
+    The largest table of ``system`` that fits rows of this bearing and pitch.
 
     The table faces whichever side of the row is nearer South. Rows running
     within 45 degrees of North-South would have it facing East or West at a
     tilt the annual basis cannot cost honestly - the sun spends half the day
     behind it - so those get the low East-West tent instead.
 
-    Returns ``(plan_width_m, tilt_deg, faces, per_side)``.
+    In a plantation the pitch is the crop's, not the table's, so the table is
+    fitted to it: from ``modules_across`` portrait modules down to one
+    landscape module, and on South-facing rows from the system's tilt down to
+    flat in 5 degree steps, the first that is at most ``max_plan`` wide and
+    clears the next table - the solstice-noon shadow for a South-facing
+    table, the maintenance aisle for a tent - is taken. Wider beats steeper:
+    the energy goes with the module area much more than with the tilt.
+
+    Returns a dict with ``plan``, ``tilt``, ``faces``, ``per_side`` (modules
+    across the row), ``step`` (one module's length down the row, gap
+    included) and ``config`` (``"1P"``, ``"2L"`` ...), or None when not even
+    one landscape module fits.
     """
     sides = ((row_azimuth_deg + 90.0) % 360.0, (row_azimuth_deg + 270.0) % 360.0)
     off_south = [min(abs(side - 180.0), 360.0 - abs(side - 180.0)) for side in sides]
-    slope_length = system.modules_across * module.length_m
+    south_facing = min(off_south) <= 45.0
+    altitude = np.radians(max(solar_min_altitude(latitude_deg), 5.0))
 
-    if min(off_south) <= 45.0:
-        tilt = system.tilt_south_deg
-        facing = sides[int(np.argmin(off_south))]
-        plan = slope_length * np.cos(np.radians(tilt))
-        return plan, tilt, ((facing, 1.0),), system.modules_across
+    sizes = sorted(
+        ((count * across, count, name, along)
+         for count in range(system.modules_across, 0, -1)
+         for name, across, along in (("P", module.length_m, module.width_m),
+                                     ("L", module.width_m, module.length_m))),
+        reverse=True,
+    )
 
-    tilt = system.tilt_east_west_deg
-    plan = 2.0 * slope_length * np.cos(np.radians(tilt)) + _MODULE_GAP_M
-    return plan, tilt, ((sides[0], 0.5), (sides[1], 0.5)), 2 * system.modules_across
+    for slope_length, count, name, along in sizes:
+        config = f"{count}{name}"
+        step = along + _MODULE_GAP_M
+
+        if south_facing:
+            facing = sides[int(np.argmin(off_south))]
+            for tilt in np.arange(system.tilt_south_deg, -1e-9, -5.0):
+                plan = slope_length * np.cos(np.radians(tilt))
+                shadow = slope_length * np.sin(np.radians(tilt)) / np.tan(altitude)
+                if plan <= max_plan and plan + shadow <= pitch:
+                    return {"plan": plan, "tilt": float(tilt),
+                            "faces": ((facing, 1.0),), "per_side": count,
+                            "step": step, "config": config}
+            continue
+
+        tilt = system.tilt_east_west_deg
+        plan = 2.0 * slope_length * np.cos(np.radians(tilt)) + _MODULE_GAP_M
+        if plan <= max_plan and plan + _TENT_AISLE_M <= pitch:
+            return {"plan": plan, "tilt": float(tilt),
+                    "faces": ((sides[0], 0.5), (sides[1], 0.5)),
+                    "per_side": 2 * count, "step": step,
+                    "config": f"tent {config}"}
+
+    return None
+
+
+def _clear_of(lines, keep_out, min_length):
+    """
+    The pieces of ``lines`` outside ``keep_out``, at least ``min_length`` long.
+    """
+    if keep_out is None or keep_out.is_empty:
+        return [line for line in lines if line.length >= min_length]
+
+    out = []
+    for line in lines:
+        rest = line.difference(keep_out)
+        for part in getattr(rest, "geoms", [rest]):
+            if part.geom_type == "LineString" and part.length >= min_length:
+                out.append(part)
+    return out
 
 
 def _lattice_rows(block_rows, azimuth_deg, spacing):
@@ -1198,9 +1531,10 @@ def _lattice_rows(block_rows, azimuth_deg, spacing):
     normal = np.array([np.cos(theta), -np.sin(theta)])
 
     pieces = sorted(
-        (float(np.dot(np.asarray(line.centroid.coords[0]), normal)), line)
-        for line in block_rows
-        if line is not None and not line.is_empty
+        ((float(np.dot(np.asarray(line.centroid.coords[0]), normal)), line)
+         for line in block_rows
+         if line is not None and not line.is_empty),
+        key=lambda item: item[0],
     )
 
     lattice = []
@@ -1261,11 +1595,18 @@ def _evaluate_existing_rows(geometry, parcel_rows, *, use, basis_src,
     Agrivoltaic scenarios built into the plantation already on a parcel.
 
     ``parcel_rows`` are this parcel's rows from ``detect_crop_rows``, one block
-    or several. An overhead system goes over every k-th crop row; an alley
-    system down the middle of every k-th alley wide enough to take its table
-    and buffers. Each block keeps its own direction, and the table on it faces
-    the side of its rows nearer South (``_facing``); the origin row is chosen
-    per block to lay the most length.
+    or several. An overhead system goes over every ``row_steps``-th crop row -
+    every one by default - with its posts in the tree line; an alley system
+    down the middle of every such alley that still leaves a tractor lane of
+    ``config["tractor_lane_m"]`` beside the table, its buffers and the canopy.
+    Each block keeps its own direction and spacing, and the table on it is
+    the largest that fits them (``_fit_table``): an overhead table at most
+    ``_OVERHEAD_GAP_M`` short of the pitch, an alley one at most what the
+    alley leaves. The origin row is chosen per block to lay the most length.
+
+    No PV row crosses another: a row is cut where it would run into a table
+    already laid, by its own block or another, and an alley table where it
+    would come within its buffer of a crop row.
 
     Overhead panels stand above the canopy, so they are costed on the basis
     without vegetation. Alley panels stand among the trees and are costed on
@@ -1276,14 +1617,15 @@ def _evaluate_existing_rows(geometry, parcel_rows, *, use, basis_src,
 
     Returns ``(records, layouts)`` like ``_evaluate_parcel``.
     """
+    from shapely.ops import unary_union
+
     buildable = geometry.buffer(-config["setback_m"])
     if buildable.is_empty or parcel_rows.empty:
         return [], {}
 
-    resolution = abs(basis_src.transform.a)
     buildable_area = float(buildable.area)
     module_kw = module.peak_kw(config["module_efficiency"])
-    module_step = module.width_m + _MODULE_GAP_M
+    min_length = config["min_row_length_m"]
     threshold, slope = SIGPAC_USE_SHADE_RESPONSE.get(use, DEFAULT_SHADE_RESPONSE)
     existing = CropProfile(
         key=f"existing_{use}",
@@ -1299,10 +1641,11 @@ def _evaluate_existing_rows(geometry, parcel_rows, *, use, basis_src,
         spacing = float(first["row_spacing_m"])
         if not np.isfinite(spacing) or spacing <= 0:
             continue
+        width = float(first.get("canopy_width_m", np.nan))
         blocks.append({
             "azimuth": float(first["row_azimuth_deg"]),
             "spacing": spacing,
-            "canopy_width": float(first.get("canopy_width_m", np.nan)),
+            "canopy_width": width if np.isfinite(width) else 0.0,
             "canopy_height": float(first.get("canopy_height_p90_m", np.nan)),
             "lattice": _lattice_rows(
                 list(block_rows.geometry), float(first["row_azimuth_deg"]), spacing),
@@ -1311,6 +1654,9 @@ def _evaluate_existing_rows(geometry, parcel_rows, *, use, basis_src,
     blocks = [block for block in blocks if block["lattice"]]
     if not blocks:
         return [], {}
+
+    crop_lines = unary_union([
+        line for block in blocks for _, pieces in block["lattice"] for line in pieces])
 
     records, layouts = [], {}
 
@@ -1324,14 +1670,26 @@ def _evaluate_existing_rows(geometry, parcel_rows, *, use, basis_src,
             continue
 
         for step in system.row_steps:
-            lines, energy_kwh, n_modules = [], 0.0, 0
-            covers, weights = [], []
+            tables = []
+            covers, weights, fitted = [], [], []
+            laid = []
 
             for block in blocks:
-                plan, tilt, faces, per_side = _facing(block["azimuth"], system, module)
                 pitch = step * block["spacing"]
-                if pitch < plan:
+                width = block["canopy_width"]
+                lane = config["tractor_lane_m"]
+
+                if alley:
+                    max_plan = (block["spacing"] - width - 2.0 * system.crop_buffer_m
+                                - lane)
+                else:
+                    max_plan = pitch - _OVERHEAD_GAP_M
+
+                fit = _fit_table(block["azimuth"], system, module, pitch=pitch,
+                                 max_plan=max_plan, latitude_deg=config["latitude_deg"])
+                if fit is None:
                     continue
+                plan = fit["plan"]
 
                 theta = np.radians(block["azimuth"])
                 normal = np.array([np.cos(theta), -np.sin(theta)])
@@ -1340,15 +1698,15 @@ def _evaluate_existing_rows(geometry, parcel_rows, *, use, basis_src,
                 if alley:
                     # An alley is the strip between two neighbouring rows, and
                     # it only takes the table where what the canopy leaves of
-                    # it is wide enough for the table and its buffers.
-                    width = block["canopy_width"] if np.isfinite(block["canopy_width"]) else 0.0
+                    # it is wide enough for the table, its buffers and a lane
+                    # for the tractor beside them.
                     candidates = []
                     for (left, pieces), (right, _) in zip(lattice[:-1], lattice[1:]):
                         gap = right - left
                         if not (0.6 * block["spacing"] <= gap <= 1.5 * block["spacing"]):
                             candidates.append(None)
                             continue
-                        if gap - width < plan + 2.0 * system.crop_buffer_m:
+                        if gap - width - 2.0 * system.crop_buffer_m - lane < plan:
                             candidates.append(None)
                             continue
                         shift = normal * (0.5 * gap)
@@ -1369,42 +1727,69 @@ def _evaluate_existing_rows(geometry, parcel_rows, *, use, basis_src,
                             clipped = piece.intersection(buildable)
                             for part in getattr(clipped, "geoms", [clipped]):
                                 if (part.geom_type == "LineString"
-                                        and part.length >= config["min_row_length_m"]):
+                                        and part.length >= min_length):
                                     chosen.append(part)
                     length = sum(part.length for part in chosen)
                     if length > best_length:
                         best, best_length = chosen, length
 
+                # Nothing may cross: down an alley, not the crop rows either
+                # side; and nowhere a table already laid, by this block - a
+                # detected row can come in overlapping pieces, or lean into
+                # its neighbour - or by another one. Longest first, so it is
+                # the stubs that give way.
+                if alley:
+                    best = _clear_of(best, crop_lines.buffer(
+                        0.5 * width + 0.5 * plan + system.crop_buffer_m), min_length)
+                clear = []
+                for line in sorted(best, key=lambda line: -line.length):
+                    near = [footprint for footprint in laid
+                            if footprint.distance(line) < 0.5 * plan + _MODULE_GAP_M]
+                    pieces = _clear_of(
+                        [line],
+                        unary_union(near).buffer(0.5 * plan + _MODULE_GAP_M) if near else None,
+                        min_length)
+                    clear += pieces
+                    laid += [_table_shape(piece, plan) for piece in pieces]
+                best = clear
+
                 if not best:
                     continue
 
                 means = _sample_lines(best, plan, src, geometry)
+                placed = 0
                 for line, band_means in zip(best, means):
-                    count = int(np.floor(line.length / module_step)) * per_side
+                    units = int(np.floor((line.length + _MODULE_GAP_M) / fit["step"]))
+                    count = units * fit["per_side"]
                     if count == 0 or not np.all(np.isfinite(band_means)):
                         continue
                     poa = sum(
                         share * reconstruct_poa_from_basis(
-                            *band_means, tilt_deg=tilt, azimuth_deg=azimuth,
+                            *band_means, tilt_deg=fit["tilt"], azimuth_deg=azimuth,
                             albedo=config["albedo"])
-                        for azimuth, share in faces
+                        for azimuth, share in fit["faces"]
                     ) / 1000.0
-                    n_modules += count
-                    energy_kwh += (
-                        count * module.area_m2 * poa
-                        * config["module_efficiency"]
-                        * config["performance_ratio"]
-                        * (1.0 + system.bifacial_gain)
-                    )
-                    lines.append(line)
+                    energy = (count * module.area_m2 * poa
+                              * config["module_efficiency"]
+                              * config["performance_ratio"]
+                              * (1.0 + system.bifacial_gain))
+                    line = _trimmed(line, units * fit["step"] - _MODULE_GAP_M)
+                    tables.append((line, count, poa, energy, plan, fit["tilt"],
+                                   fit["faces"], fit["config"]))
+                    placed += 1
+
+                if not placed:
+                    continue
 
                 covers.append(min(plan / pitch, 1.0))
                 weights.append(best_length)
-                block.setdefault("_laid", {})[(system.key, step)] = (tilt, pitch, plan)
+                fitted.append((len(lattice), fit, pitch))
 
+            n_modules = sum(table[1] for table in tables)
             if n_modules == 0:
                 continue
 
+            energy_kwh = sum(table[3] for table in tables)
             cover = float(np.average(covers, weights=weights))
 
             if alley:
@@ -1415,11 +1800,9 @@ def _evaluate_existing_rows(geometry, parcel_rows, *, use, basis_src,
             relative = float(np.clip(
                 1.0 - slope * max(0.0, reduction - threshold), 0.0, 1.0))
 
-            dominant = max(
-                (block for block in blocks if (system.key, step) in block.get("_laid", {})),
-                key=lambda block: len(block["lattice"]),
-            )
-            tilt, pitch, _ = dominant["_laid"][(system.key, step)]
+            # What the record reports is the table of the largest block.
+            _, fit, pitch = max(fitted, key=lambda item: item[0])
+            dominant = max(blocks, key=lambda block: len(block["lattice"]))
 
             required = (dominant["canopy_height"] + 1.0
                         if not alley and np.isfinite(dominant["canopy_height"]) else np.nan)
@@ -1432,14 +1815,19 @@ def _evaluate_existing_rows(geometry, parcel_rows, *, use, basis_src,
                 "kind": "agrivoltaic",
                 "crop": existing.key,
                 "direction": "rows",
-                "tilt_deg": float(tilt),
+                "table_config": fit["config"],
+                "tilt_deg": float(fit["tilt"]),
                 "pitch_m": float(pitch),
-                "n_rows": len(lines),
-                "row_length_m": float(sum(line.length for line in lines)),
+                "spacing_along_m": np.nan,
+                "n_rows": len(tables),
+                "n_trackers": 0,
+                "row_length_m": float(sum(table[0].length for table in tables)),
                 "n_modules": n_modules,
                 "peak_kwp": n_modules * module_kw,
                 "energy_mwh": energy_kwh / 1000.0,
                 "ground_cover_ratio": cover,
+                "mounting": system.mounting,
+                "row_shading_factor": 1.0,
                 "buildable_area_m2": buildable_area,
                 "crop_area_frac": area,
                 "radiation_reduction": reduction,
@@ -1452,7 +1840,8 @@ def _evaluate_existing_rows(geometry, parcel_rows, *, use, basis_src,
                 "_crop": existing,
             })
 
-            layouts[scenario] = ("lines", "rows", lines, None)
+            layouts[scenario] = {"shape": "lines", "direction": "rows",
+                                 "tables": tables}
 
     return records, layouts
 
@@ -1551,9 +1940,11 @@ def plan_parcel_pv_scenarios(
     setback_m=5.0,
     min_row_length_m=20.0,
     min_parcel_area_m2=2000.0,
-    rows="best_per_kind",
+    tractor_lane_m=2.0,
+    tables="all",
     output_path=None,
     output_summary_path=None,
+    layer_prefix="ppv_",
     progress=False,
 ):
     """
@@ -1562,8 +1953,18 @@ def plan_parcel_pv_scenarios(
     Each agricultural parcel gets every scenario the catalogue allows - each
     system, each crop it suits, each pitch that crop allows, in both row
     directions - laid out on synthetic rows from one side of the parcel to the
-    other. Each is costed over the project's life against what the parcel
-    earns today, and the best is chosen by ``criterion``.
+    other, or, for dual-axis trackers, on a lattice of separate points. Each
+    is costed over the project's life against what the parcel earns today,
+    and the best is chosen by ``criterion``.
+
+    As in ``plan_pv_strings_in_buildings``, every scenario costed survives
+    into the output with its panels, one GeoPackage layer per scenario -
+    ``ppv_pv_fixed_EW_8.9m``, ``ppv_apv_overhead_NS_6.0m_forage``,
+    ``ppv_apv_rows_overhead_k1`` ... - plus ``ppv_best`` and the best of each
+    kind, which take each parcel's own winner. The panels come as tables:
+    one polygon per continuous stretch of modules down a row, at its plan
+    width and as long as its modules, or per dual-axis tracker. A scenario's
+    name is the same on every parcel, so its layer compares them directly.
 
     Parameters
     ----------
@@ -1616,32 +2017,44 @@ def plan_parcel_pv_scenarios(
         Shorter pieces of row are dropped.
     min_parcel_area_m2 : float, default=2000.0
         Smaller parcels are not laid out.
-    rows : {"best", "best_per_kind", "all", None}, default="best_per_kind"
-        Which scenarios' rows come back as geometry: the parcel's overall best,
-        its best PV field and best agrivoltaic scenario, every scenario, or
-        none. ``"best_per_kind"`` adds the best scenario built into the
-        existing rows, where there is one. Every scenario is in the summary
-        table regardless.
+    tractor_lane_m : float, default=2.0
+        Free width a tractor needs down an alley of an existing plantation -
+        what an orchard or a vineyard planted 3.5-4 m apart leaves between
+        its canopies. A table goes down an alley only where this is left
+        beside it, its buffers and the canopy.
+    tables : {"all", "best_per_kind", "best", None}, default="all"
+        Which scenarios' tables come back as geometry. ``"all"``: every
+        scenario, plus ``best``, ``best_pv_field``, ``best_agrivoltaic`` and
+        ``best_existing_rows``; ``"best_per_kind"``: only those four;
+        ``"best"``: only ``best``; None: none. Every scenario is in the
+        summary table regardless.
     output_path : str, optional
-        GeoPackage with two layers: ``parcel_pv_best`` - the parcels with
-        their best scenarios - and ``parcel_pv_rows``.
+        GeoPackage with the parcels and their best scenarios
+        (``parcel_pv_best``) and one layer of tables per scenario
+        (``<layer_prefix><scenario>``).
     output_summary_path : str, optional
         CSV of every scenario on every parcel.
+    layer_prefix : str, default="ppv_"
+        Prefix of the scenario layers, so that they sort together.
 
     Returns
     -------
     tuple
-        ``(scenarios_df, parcels_gdf, rows_gdf)``. ``scenarios_df`` is long:
+        ``(scenarios_df, parcels_gdf, tables_gdf)``. ``scenarios_df`` is long:
         one row per parcel and scenario. ``parcels_gdf`` holds one row per
         parcel laid out, with the best scenario overall and the best of each
         kind; ``best_viable`` says whether the best one actually beats leaving
         the parcel as it is (positive NPV), since a ranking names a winner
-        even among losers. ``rows_gdf`` holds the rows as centrelines.
+        even among losers. ``tables_gdf`` is long too: one polygon per table
+        and scenario, ``scenario`` naming the layer it belongs to and
+        ``source_scenario`` the scenario it was laid out for - the same, but
+        on the ``best*`` layers. Summing it across scenarios counts a parcel
+        several times; filter to one first.
     """
     if criterion not in CRITERIA:
         raise ValueError(f"criterion must be one of {sorted(CRITERIA)}")
-    if rows not in {"best", "best_per_kind", "all", None}:
-        raise ValueError("rows must be 'best', 'best_per_kind', 'all' or None")
+    if tables not in {"best", "best_per_kind", "all", None}:
+        raise ValueError("tables must be 'all', 'best_per_kind', 'best' or None")
 
     economics = economics or Economics()
     margins = (SIGPAC_USE_MARGIN_EUR_HA if baseline_margin_eur_ha is None
@@ -1717,12 +2130,14 @@ def plan_parcel_pv_scenarios(
             "performance_ratio": performance_ratio,
             "albedo": albedo,
             "latitude_deg": latitude_deg,
+            "tractor_lane_m": tractor_lane_m,
             "sources": sources,
             "sun": sun,
             "factor_cache": {},
         }
 
-        all_records, best_rows, row_records = [], [], []
+        all_records, best_rows, table_records = [], [], []
+        module_kw = module.peak_kw(module_efficiency)
 
         iterator = parcels.iterrows()
         if progress:
@@ -1815,39 +2230,35 @@ def plan_parcel_pv_scenarios(
             best_rows.append(summary)
             all_records.append(table)
 
-            if rows is None:
+            if tables is None:
                 continue
 
-            if rows == "all":
-                wanted = {index: "all" for index in table.index}
-            elif rows == "best":
-                wanted = {chosen["best"]: "best"} if "best" in chosen else {}
-            else:
-                wanted = {}
-                for role in ("best", "pv_field", "agrivoltaic", "existing_rows"):
-                    if role in chosen:
-                        wanted.setdefault(chosen[role], role)
+            # layer name -> scenario it shows on this parcel.
+            wanted = {}
+            if tables == "all":
+                wanted.update({scenario: scenario for scenario in table.scenario})
+            for role in (("best",) if tables == "best" else
+                         ("best", "pv_field", "agrivoltaic", "existing_rows")):
+                if role in chosen:
+                    layer = "best" if role == "best" else f"best_{role}"
+                    wanted[layer] = table.at[chosen[role], "scenario"]
 
-            for index, role in wanted.items():
-                scenario = table.at[index, "scenario"]
-                shape, direction, runs, transform = layouts[scenario]
-                if shape == "grid":
-                    lines = [
-                        _run_line(transform, direction, first, last, start, stop)
-                        for first, last, start, stop, _ in runs
-                    ]
-                else:
-                    lines = runs
-                for number, line in enumerate(lines):
-                    row_records.append({
+            details = table.set_index("scenario")
+            for layer, scenario in wanted.items():
+                row = details.loc[scenario]
+                for record in _layout_tables(layouts[scenario], module_kw):
+                    record.update({
+                        "scenario": layer,
+                        "source_scenario": scenario,
                         parcel_id_column: parcel[parcel_id_column],
-                        "scenario": scenario,
-                        "role": role,
-                        "row_index": number,
-                        "direction": direction,
-                        "length_m": float(line.length),
-                        "geometry": line,
+                        "system": row["system"],
+                        "kind": row["kind"],
+                        "crop": row["crop"],
+                        "mounting": row["mounting"],
+                        "direction": row["direction"],
+                        "pitch_m": row["pitch_m"],
                     })
+                    table_records.append(record)
 
         crs = parcels.crs
 
@@ -1864,20 +2275,24 @@ def plan_parcel_pv_scenarios(
         best_rows, geometry="geometry", crs=crs) if best_rows else \
         gpd.GeoDataFrame({parcel_id_column: []}, geometry=[], crs=crs)
 
-    rows_gdf = gpd.GeoDataFrame(
-        row_records, geometry="geometry", crs=crs) if row_records else \
-        gpd.GeoDataFrame({parcel_id_column: []}, geometry=[], crs=crs)
+    table_columns = ["scenario", "source_scenario", parcel_id_column, "system",
+                     "kind", "crop", "mounting", "direction", "table_index",
+                     "table_config", "n_modules", "peak_kw", "length_m",
+                     "width_m", "tilt_deg", "azimuth_deg", "pitch_m",
+                     "poa_kwh_m2", "energy_kwh"]
+    if table_records:
+        tables_gdf = gpd.GeoDataFrame(
+            table_records, geometry="geometry", crs=crs)[table_columns + ["geometry"]]
+    else:
+        tables_gdf = gpd.GeoDataFrame(
+            {column: [] for column in table_columns}, geometry=[], crs=crs)
 
     if output_path is not None:
-        import os
-        if os.path.exists(output_path):
-            os.remove(output_path)
-        parcels_gdf.to_file(output_path, driver="GPKG", layer="parcel_pv_best")
-        if len(rows_gdf):
-            rows_gdf.to_file(output_path, driver="GPKG",
-                             layer="parcel_pv_rows", mode="a")
+        write_scenario_layers(tables_gdf, output_path, layer_prefix=layer_prefix)
+        parcels_gdf.to_file(output_path, driver="GPKG", layer="parcel_pv_best",
+                            mode="a")
 
     if output_summary_path is not None:
         scenarios_df.to_csv(output_summary_path, index=False)
 
-    return scenarios_df, parcels_gdf, rows_gdf
+    return scenarios_df, parcels_gdf, tables_gdf
