@@ -4,7 +4,31 @@ What changed in greenshadow, newest first. Dates are those of the commits;
 "Unreleased" is the working tree on top of the last one. The documents in
 [docs/](docs/README.md) describe the current behaviour in detail.
 
-## Unreleased (2026-10-19 → 2026-10-22)
+## Unreleased (2026-10-27)
+
+### Added
+- **Roof obstacles** (`greenshadow.roof_obstacles`): chimneys, vents, AC
+  units, parapets, skylights and light wells, found per roof plane in the
+  LiDAR returns (signed residual to the plane refitted on them, MAD
+  threshold, DBSCAN, concave hulls), in the LiDAR DSM where the returns are
+  sparse, and in the sky view factor; fused, then cut out of each plane with
+  an obstacle setback, a roof-edge setback and a module-width opening.
+  `planes_qc` flags planes that need review. A pipeline stage between the
+  roof planes and the rooftop PV, `roof_obstacles.gpkg`, configured by
+  `PipelineConfig.roof_obstacles` (`ObstacleConfig`); new hook
+  `SolarPipeline.roof_lidar()`. ([docs/roof_obstacles.md](docs/roof_obstacles.md))
+- `plan_pv_strings_in_buildings(buildable_areas=...)` packs a usable area
+  computed upstream instead of applying its own setback and DSM residual
+  cut; `obstacle_residual_m=None` switches that cut off.
+- Tests: `test_roof_obstacles.py`.
+
+### Changed
+- The Catalan pipeline's rooftop PV packs the usable area of the roof
+  obstacle stage: fewer modules than before, where the obstacles and the
+  0.3 m roof-edge setback are (`--no-roof-obstacles` restores the previous
+  layout).
+
+## 2026-10-27 - Pipelines, CUDA hillshades, one-pass irradiation and documentation (`6584fa3`)
 
 ### Added
 - **Pipelines** (`greenshadow.pipelines`): the whole chain in one call per

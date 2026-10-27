@@ -244,6 +244,11 @@ knocked out of the plane raster first — that is what lets an obstruction on
 the facet edge be measured as a notch, and one that severs a facet keep both
 halves as separate records instead of losing the smaller one.
 
+The roof obstacle stage ([roof_obstacles.md](roof_obstacles.md)) runs this
+same detector on the finished planes, as one of its sources next to the
+LiDAR returns; the pipeline leaves `svf_path` off here and cuts the
+obstacles there instead.
+
 Off unless `svf_path` is given. Pass the raster
 `calculate_sky_view_factor` writes, in the detection CRS; it is resampled
 onto whichever grid detection ended up on, refined or not. Note that an SVF

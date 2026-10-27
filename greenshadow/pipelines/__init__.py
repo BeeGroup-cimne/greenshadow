@@ -9,14 +9,15 @@ where the area, the terrain, the parcels and the roofs come from.
 - ``CataloniaMunicipalityPipeline``: ICGC LiDAR, Spanish cadastre and SIGPAC.
 """
 
-from .base import (PipelineConfig, PipelineResult, RoofPlanes, SolarPipeline,
-                   TerrainModels, run_pipelines)
+from .base import (PipelineConfig, PipelineResult, RoofLidar, RoofPlanes,
+                   SolarPipeline, TerrainModels, run_pipelines)
 from .catalonia import (CataloniaConfig, CataloniaMunicipalityPipeline,
                         run_catalonia_municipalities)
 
 __all__ = [
     "PipelineConfig",
     "PipelineResult",
+    "RoofLidar",
     "RoofPlanes",
     "SolarPipeline",
     "TerrainModels",

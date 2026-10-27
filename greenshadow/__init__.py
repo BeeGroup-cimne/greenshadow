@@ -25,6 +25,7 @@ from . import rural_parcels
 from . import buildings_infer
 from . import roofs_3d
 from . import dimensionate
+from . import roof_obstacles
 from . import crop_rows
 from . import parcel_pv
 from . import pipelines
@@ -122,6 +123,14 @@ from .dimensionate import (
     PVModuleSpec,
     DEFAULT_MODULES,
     solar_min_altitude
+)
+
+from .roof_obstacles import (
+    ObstacleConfig,
+    detect_lidar_obstacles,
+    detect_svf_obstacles,
+    fuse_obstacles,
+    write_obstacle_layers
 )
 
 # Import weather module if it exists and dependencies are available

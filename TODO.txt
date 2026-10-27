@@ -26,6 +26,16 @@
 - [done] Calibrate crown_ratio and the D = a*H^b allometry against Catalan urban species;
   the current defaults are literature values, not fitted.
 - Create the unary tests.
+- Roof obstacles (greenshadow.roof_obstacles; docs/roof_obstacles.md). Done: LiDAR residual detector,
+  plane QC, SVF source, fusion, setbacks, usable area into the PV planner. Next:
+  - Orthophoto loading (ICGC native tiles for Catalonia, PNOA from CNIG elsewhere; no WMS), reprojection,
+    flight date vs LiDAR date warning, per-building co-registration (gradient vs plane-boundary / nDSM
+    hillshade, phase correlation within +-5 m, shift + score into a coreg_log layer).
+  - SAM3 on the orthophoto crops (check the facebookresearch/sam3 API and licence first): text prompts,
+    score/area/in-roof filters, polygonize, undo the shift, cache per building, GPU with CPU fallback.
+  - Validation: hand-label obstacles with classes on several windows (the 48 digitised Alpicat obstacles,
+    real_roof_obstacles_9000_9500_4000_5000_Alpicat.gpkg, are lost); precision / recall / IoU per source
+    and fused; debug PNGs per building.
 - Calibrate the parcel_pv defaults (capex, crop margins, SIGPAC_USE_MARGIN_EUR_HA, shade response) against
   regional data; add grid-connection cost by distance to substation
 - Derive leaf_type per tree (species layer or NDVI seasonality) instead of the

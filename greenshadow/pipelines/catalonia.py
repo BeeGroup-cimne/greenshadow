@@ -39,12 +39,17 @@ from ..roofs_3d import roof_planes_3d
 from ..rural_parcels import (load_spanish_preserved_regions,
                              load_spanish_sigpac_parcels,
                              tag_parcels_with_preserved_areas)
-from .base import (PipelineConfig, PipelineResult, RoofPlanes, SolarPipeline,
-                   TerrainModels, run_pipelines)
+from .base import (PipelineConfig, PipelineResult, RoofLidar, RoofPlanes,
+                   SolarPipeline, TerrainModels, run_pipelines)
 
 # LiDAR classes of the ICGC territorial LiDAR v3r1:
 # https://datacloud.ide.cat/especificacions/lidar-territorial-v3r1-20250905.pdf
 BUILDING_CLASSES = (6, 17, 77)
+# Returns read for the roof obstacles: unclassified plus the building classes.
+# Class 77, "other constructions", is where most rooftop structures are: on
+# the Alpicat test window its returns inside the roof planes stand a median
+# 0.95 m above them, against 0.00 m for class 6.
+ROOF_OBSTACLE_CLASSES = (1,) + BUILDING_CLASSES
 
 
 @dataclass
@@ -339,6 +344,9 @@ class CataloniaMunicipalityPipeline(SolarPipeline):
                                   roof_planes_path.replace(".gpkg", "_3d.html"))
         return RoofPlanes(planes=planes, dsm_path=roof_dsm_path)
 
+    def roof_lidar(self, aoi) -> Optional[RoofLidar]:
+        return RoofLidar(paths=self.laz_paths, classes=ROOF_OBSTACLE_CLASSES)
+
     def roof_detection_options(self, aoi, terrain: TerrainModels, output_path) -> dict:
         """
         Arguments of ``detect_roof_planes_tiled``, tuned on the digitised
@@ -497,6 +505,9 @@ def main(argv=None, prog=None):
     parser.add_argument("--day", action="append", default=[], type=dt.date.fromisoformat,
                         help="day of a daily analysis, YYYY-MM-DD (repeatable)")
     parser.add_argument("--no-roofs", action="store_true")
+    parser.add_argument("--no-roof-obstacles", action="store_true",
+                        help="skip the roof obstacle stage; the PV planner then uses "
+                             "its own setback and DSM residual cut")
     parser.add_argument("--no-parcels", action="store_true")
     parser.add_argument("--no-weather", action="store_true")
     parser.add_argument("--no-videos", action="store_true")
@@ -514,6 +525,7 @@ def main(argv=None, prog=None):
         year=args.year,
         days=args.day,
         roofs=not args.no_roofs,
+        **({"roof_obstacles": None} if args.no_roof_obstacles else {}),
         parcels=not args.no_parcels,
         include_weather=not args.no_weather,
         daily_videos=not args.no_videos,

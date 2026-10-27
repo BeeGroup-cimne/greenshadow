@@ -39,9 +39,15 @@ skipped; None keeps every orientation.
 
 ## 2. Packing
 
-* The plane polygon is shrunk by `setback_m` (access, wind uplift), and
-  DSM pixels more than `obstacle_residual_m` (0.15 m) off the fitted plane
-  are cut out as clutter (chimneys, aerials) when `dsm_path` is given.
+* **What may be packed.** With `buildable_areas` - the `usable_area` of
+  [roof_obstacles.md](roof_obstacles.md), which the pipeline passes - each
+  plane's usable area is packed as it is: obstacles found in the LiDAR
+  returns and the sky view factor, their setback, the roof-edge setback and
+  the fragments too small for a module are already out. Without it the
+  plane polygon is shrunk by `setback_m` (access, wind uplift), and DSM
+  pixels more than `obstacle_residual_m` (0.15 m; None skips this) off the
+  fitted plane are cut out as clutter when `dsm_path` is given - on the
+  refined roof DSM, which has flattened most of it.
 * A grid of module cells, oriented along the plane's aspect (coplanar) or
   due South (racks), is laid fully inside the polygon. Its origin is swept
   over `phase_steps × phase_steps` sub-pitch offsets and the arrangement with
@@ -71,8 +77,9 @@ skipped; None keeps every orientation.
 
 The Catalan pipeline asks for **roof capacity**, not a wiring design:
 `string_size=None`, `min_poa_ratio=None`, `allowed_azimuth_range=None`,
-`setback_m=0.05`, `phase_steps=5`. Override them with
-`PipelineConfig.roof_pv_options`.
+`setback_m=0.05`, `phase_steps=5`, and the usable area of the roof obstacle
+stage as `buildable_areas` (its setbacks then replace `setback_m`). Override
+them with `PipelineConfig.roof_pv_options`.
 
 ## 4. Scenarios and outputs
 
@@ -109,5 +116,6 @@ depend on it.
 * Racks face South only; East-West racks on flat roofs are not costed.
 * No economics: this is a capacity and yield estimate. Parcels get NPV and
   the rest ([parcel_pv.md](parcel_pv.md)).
-* Clutter removal depends on the refined roof DSM; regularized facets
+* Without `buildable_areas`, clutter removal depends on the refined roof
+  DSM, which has flattened most of it; regularized facets
   (`regularize_roof_planes`) are optional and not used by the pipeline.

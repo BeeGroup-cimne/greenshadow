@@ -829,6 +829,7 @@ def plan_pv_strings_in_buildings(
     module_gap_m=0.02,
     row_gap_m=0.02,
     obstacle_residual_m=0.15,
+    buildable_areas=None,
     phase_steps=3,
     string_size=18,
     min_string_size=1,
@@ -912,10 +913,17 @@ def plan_pv_strings_in_buildings(
         i.e. winter-solstice noon, the standard no-shading design case.
     setback_m : float, default=0.3
         Margin kept clear inside every roof edge, for access and wind uplift.
-    obstacle_residual_m : float, default=0.15
+    obstacle_residual_m : float or None, default=0.15
         A DSM pixel this far from the fitted plane is treated as clutter and
         excluded. Loose enough to tolerate the detector's own planarity error,
-        tight enough to catch a chimney.
+        tight enough to catch a chimney. None skips this cut.
+    buildable_areas : GeoDataFrame, optional
+        The area each plane may hold modules on, already net of obstacles and
+        setbacks - the ``usable_area`` of ``roof_obstacles.fuse_obstacles`` -
+        keyed by ``building_id_column`` and ``plane_id_column``. When given,
+        it replaces ``setback_m`` and the ``obstacle_residual_m`` cut, and a
+        plane without a row in it gets no modules. The roof area reported
+        is still the whole plane's.
     string_size : int or None, default=18
         Modules per string. The number of strings is not capped: the roof takes
         as many as its surviving modules fill. None wires each plane as a
@@ -1124,6 +1132,7 @@ def plan_pv_strings_in_buildings(
         "building_id_column": building_id_column,
         "setback_m": setback_m,
         "obstacle_residual_m": obstacle_residual_m,
+        "buildable": _buildable_lookup(buildable_areas, building_id_column, plane_id_column),
         "dsm_path": dsm_path,
         "dsm_transform": dsm_transform,
         "dsm_nodata": dsm_nodata,
@@ -1211,6 +1220,7 @@ def _plan_building(k):
     building_id_column = job["building_id_column"]
     setback_m = job["setback_m"]
     obstacle_residual_m = job["obstacle_residual_m"]
+    buildable_lookup = job["buildable"]
     dsm_transform, dsm_nodata = job["dsm_transform"], job["dsm_nodata"]
     total_pixel_area = job["total_pixel_area"]
     modules = job["modules"]
@@ -1233,6 +1243,9 @@ def _plan_building(k):
             plane_id_column=plane_id_column,
             setback_m=setback_m,
             obstacle_residual_m=obstacle_residual_m,
+            buildable=(None if buildable_lookup is None else
+                       buildable_lookup.get(_id_key(building_id, plane[plane_id_column]),
+                                            _NOTHING_BUILDABLE)),
             dsm=dsm,
             dsm_transform=dsm_transform,
             dsm_nodata=dsm_nodata,
@@ -1409,6 +1422,36 @@ _PLAN_JOB = None
 _PLAN_SOURCES = None
 
 
+_NOTHING_BUILDABLE = shapely.Polygon()
+
+
+def _id_key(building_id, plane_id):
+    """A (building, plane) key that matches whether ids were read as int or float."""
+    def norm(value):
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return value
+    return norm(building_id), norm(plane_id)
+
+
+def _buildable_lookup(buildable_areas, building_id_column, plane_id_column):
+    """{(building, plane): usable geometry}, or None when no areas were given."""
+    if buildable_areas is None:
+        return None
+    if isinstance(buildable_areas, str):
+        buildable_areas = gpd.read_file(buildable_areas, layer="usable_area")
+    if buildable_areas.empty:
+        return {}
+    return {
+        _id_key(b, p): g
+        for b, p, g in zip(buildable_areas[building_id_column],
+                           buildable_areas[plane_id_column],
+                           buildable_areas.geometry)
+        if g is not None
+    }
+
+
 def _plan_sources(job):
     """
     The (basis, total) raster sources and the DSM, read window by window,
@@ -1449,6 +1492,7 @@ def _plane_context(
     basis_src,
     total_src,
     total_pixel_area,
+    buildable=None,
 ):
     """
     Everything about one plane that does not depend on the module size.
@@ -1456,29 +1500,30 @@ def _plane_context(
     The setback, the obstacle subtraction and the raster block read are all
     module-independent, so they are done once per plane and shared across the
     three candidate sizes rather than repeated for each.
+
+    ``buildable``, when given, is the plane's usable area worked out
+    upstream; it replaces both the setback and the obstacle cut.
     """
     geometry = plane.geometry
 
     if geometry is None or geometry.is_empty:
         return None
 
-    buildable = geometry.buffer(-setback_m)
+    if buildable is None:
+        buildable = geometry.buffer(-setback_m)
 
-    if buildable.is_empty:
-        return None
-
-    if dsm is not None:
-        obstacles = _obstacle_geometry(
-            geometry,
-            plane[tilt_column],
-            plane[azimuth_column],
-            dsm,
-            dsm_transform,
-            dsm_nodata,
-            obstacle_residual_m,
-        )
-        if obstacles is not None:
-            buildable = buildable.difference(obstacles)
+        if dsm is not None and obstacle_residual_m is not None and not buildable.is_empty:
+            obstacles = _obstacle_geometry(
+                geometry,
+                plane[tilt_column],
+                plane[azimuth_column],
+                dsm,
+                dsm_transform,
+                dsm_nodata,
+                obstacle_residual_m,
+            )
+            if obstacles is not None:
+                buildable = buildable.difference(obstacles)
 
     if buildable.is_empty:
         return None

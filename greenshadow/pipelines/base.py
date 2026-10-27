@@ -16,6 +16,7 @@ hook                        returns
 ``build_terrain(aoi)``      a ``TerrainModels`` with the rasters (required)
 ``load_parcels(aoi)``       parcels to lay PV fields and agrivoltaics on, or None
 ``detect_roofs(aoi, t)``    a ``RoofPlanes`` to lay PV on, or None
+``roof_lidar(aoi)``         the LiDAR tiles and classes the roof obstacles are read from
 ``acquisition_date(aoi)``   when the terrain was surveyed, to age the canopy
 ``svf_options(...)``        extra arguments for ``calculate_sky_view_factor``
 ``load_weather(aoi)``       hourly weather; ERA5-Land by default, which is global
@@ -25,12 +26,21 @@ A pipeline built on a bare DEM (no LiDAR) fills only ``dsm`` and ``dem`` - the
 same raster in both - and the stages that need more simply do not run: no
 canopy, no crop rows, no elevated shadows, no hillshades "without vegetation"
 (the terrain has none), and no roofs.
+
+Between the roof planes and the rooftop PV, the roof obstacles
+(``greenshadow.roof_obstacles``) cut each plane down to the area a module
+may stand on. They are found in the LiDAR returns when ``roof_lidar`` gives
+them, in the DSM otherwise, and in the sky view factor; the DSMs keep them,
+since they still cast shade.
 """
 
 from __future__ import annotations
 
 import datetime as dt
 import os
+
+import geopandas as gpd
+import pandas as pd
 from dataclasses import dataclass, field
 from typing import Any, Dict, Optional, Sequence
 
@@ -38,6 +48,9 @@ from ..logging_utils import (error, indent, info, section, section_context,
                              success, summary, warning)
 from ..parcel_pv import Economics, plan_parcel_pv_scenarios
 from ..dimensionate import plan_pv_strings_in_buildings
+from ..roof_obstacles import (ObstacleConfig, detect_lidar_obstacles,
+                              detect_svf_obstacles, fuse_obstacles,
+                              write_obstacle_layers)
 from ..crop_rows import detect_crop_rows
 from ..shader import (NO_GROWTH, apply_height_shadow_to_hillshades,
                       build_canopy_model_from_rasters,
@@ -115,6 +128,11 @@ class PipelineConfig:
     # over the defaults the pipeline sets.
     roof_pv_options: Dict[str, Any] = field(default_factory=dict)
     parcel_pv_options: Dict[str, Any] = field(default_factory=dict)
+    # Roof obstacles and the usable area of each plane, between the roof
+    # planes and the rooftop PV; every threshold and setback is a field of
+    # ObstacleConfig. None skips the stage, and the PV planner falls back to
+    # its own setback and DSM residual cut.
+    roof_obstacles: Optional[ObstacleConfig] = field(default_factory=ObstacleConfig)
 
     # Caching: every product on disk is reused unless one of these says not to.
     recalculate_digital_models: bool = False
@@ -182,6 +200,19 @@ class RoofPlanes:
     """Roof facets to lay PV on, and the DSM their heights are read from."""
     planes: Any                 # GeoDataFrame from detect_roof_planes(_tiled)
     dsm_path: str
+    # Filled by the roof obstacle stage (roof_obstacles.gpkg).
+    obstacles: Any = None       # fused obstacles, all sources
+    usable: Any = None          # usable area per plane, what the PV planner packs
+    qc: Any = None              # per-plane fit quality, needs_review
+
+
+@dataclass
+class RoofLidar:
+    """The LiDAR the roof obstacles are read from: LAZ files and the classes kept."""
+    paths: Sequence[str]
+    # ASPRS unclassified and building; a region adds its own codes for
+    # rooftop structures.
+    classes: Sequence[int] = (1, 6)
 
 
 @dataclass
@@ -254,6 +285,13 @@ class SolarPipeline:
         """Roof facets for rooftop PV, or None."""
         return None
 
+    def roof_lidar(self, aoi) -> Optional[RoofLidar]:
+        """
+        The LAZ files over the roofs, for the roof obstacles; None finds them
+        in the DSM alone (``ObstacleConfig.raster_mode``).
+        """
+        return None
+
     def acquisition_date(self, aoi) -> Optional[dt.date]:
         """When the terrain was surveyed; None leaves the canopy as surveyed."""
         return None
@@ -321,6 +359,8 @@ class SolarPipeline:
 
                 if cfg.roofs:
                     result.roofs = self.detect_roofs(aoi, terrain)
+                    if result.roofs is not None and cfg.roof_obstacles is not None:
+                        self._roof_obstacles(aoi, terrain, result.roofs)
 
             result.canopy = self._canopy(aoi, terrain)
 
@@ -378,6 +418,58 @@ class SolarPipeline:
                     **self.svf_options(class_path),
                 )
                 success(f"{label} calculated: {out_path}")
+
+    def _roof_obstacles(self, aoi, terrain: TerrainModels, roofs: RoofPlanes):
+        """
+        Obstacles on the roof planes and the usable area left on each, into
+        ``roofs`` and ``roof_obstacles.gpkg``.
+        """
+        cfg = self.config
+        ocfg = cfg.roof_obstacles
+        path = self.path("roof_obstacles.gpkg")
+
+        if os.path.exists(path) and not (ocfg.recalculate or cfg.recalculate_digital_models):
+            roofs.obstacles = _read_layer(path, "obstacles", roofs.planes.crs)
+            roofs.usable = _read_layer(path, "usable_area", roofs.planes.crs)
+            roofs.qc = _read_layer(path, "planes_qc", roofs.planes.crs)
+            info(f"Using existing roof obstacles: {path}")
+            return
+
+        lidar = self.roof_lidar(aoi)
+        with indent("Detecting roof obstacles"):
+            lidar_obstacles, qc = detect_lidar_obstacles(
+                roofs.planes,
+                lidar.paths if lidar is not None else None,
+                ocfg,
+                # The LiDAR DSM still holds the clutter the refined roof DSM
+                # smoothed away; it stands in where the returns are sparse.
+                dsm_path=terrain.bare_dsm,
+                lidar_classes=(ocfg.lidar_classes if ocfg.lidar_classes is not None
+                               else (lidar.classes if lidar is not None else None)),
+                progress=True,
+            )
+            detections = [lidar_obstacles]
+            info(f"LiDAR: {len(lidar_obstacles)} obstacles; "
+                 f"{int(qc.needs_review.sum())} of {len(qc)} planes need review")
+
+            # The SVF the roof detector was tuned with (docs/roof_inference.md).
+            if ocfg.svf and terrain.svf and os.path.exists(terrain.svf):
+                svf_obstacles = detect_svf_obstacles(roofs.planes, terrain.svf, ocfg,
+                                                     progress=True)
+                detections.append(svf_obstacles)
+                info(f"Sky view factor: {len(svf_obstacles)} obstacles")
+
+            obstacles, usable = fuse_obstacles(
+                roofs.planes, detections, ocfg, planes_qc=qc,
+                modules=cfg.roof_pv_options.get("modules"))
+            write_obstacle_layers(
+                path, obstacles=obstacles, usable_area=usable, planes_qc=qc,
+                detections=gpd.GeoDataFrame(pd.concat(detections, ignore_index=True),
+                                            geometry="geometry", crs=roofs.planes.crs))
+            roofs.obstacles, roofs.usable, roofs.qc = obstacles, usable, qc
+            roof_area = roofs.planes.area.sum() if "area" in roofs.planes else float("nan")
+            success(f"{len(obstacles)} roof obstacles; usable area "
+                    f"{usable.usable_area_m2.sum():,.0f} of {roof_area:,.0f} m2: {path}")
 
     def _crop_rows(self, parcels, terrain: TerrainModels):
         # How each rural parcel is planted. On a woody crop the canopy height
@@ -663,8 +755,10 @@ class SolarPipeline:
         with indent("Planning the PV strings"):
             options = dict(
                 # Roof capacity, not a wiring design: no electrical grouping,
-                # no shading filter, no orientation refused, and the array
-                # packed to 5 cm of the plane contour.
+                # no shading filter, no orientation refused, and - when the
+                # roof obstacle stage is off - the array packed to 5 cm of
+                # the plane contour. With it, its usable area and setbacks
+                # replace setback_m.
                 string_size=None,
                 min_poa_ratio=None,
                 allowed_azimuth_range=None,
@@ -674,6 +768,9 @@ class SolarPipeline:
                 output_summary_path=self.path("pv_building_summary.csv"),
                 progress=True,
             )
+            if result.roofs.usable is not None:
+                # Setbacks and obstacles are already out of the usable area.
+                options["buildable_areas"] = result.roofs.usable
             options.update(cfg.roof_pv_options)
             modules, pv_summary = plan_pv_strings_in_buildings(
                 result.roofs.planes,
@@ -751,6 +848,14 @@ class SolarPipeline:
                 success(f"Cleaned up {len(deleted)} temporary files")
             if errors:
                 error(f"Errors during cleanup: {len(errors)}")
+
+
+def _read_layer(path, layer, crs):
+    """A layer of a GeoPackage, or an empty frame when it was never written."""
+    import pyogrio
+    if layer not in pyogrio.list_layers(path)[:, 0]:
+        return gpd.GeoDataFrame(geometry=[], crs=crs)
+    return gpd.read_file(path, layer=layer)
 
 
 def run_pipelines(pipelines: Sequence[SolarPipeline]) -> Dict[str, PipelineResult]:

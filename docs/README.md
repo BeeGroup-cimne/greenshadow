@@ -20,6 +20,9 @@ flowchart TD
     DM --> CR[Crop rows]
     P --> CR
     DM --> RF[Roof planes]
+    RF --> OB[Roof obstacles<br/>usable area]
+    L --> OB
+    SVF --> OB
     W --> SUN[Sun table<br/>positions + DNI/DHI]
     DM --> HS[Hillshades<br/>cast shadows]
     CAN --> HS
@@ -28,7 +31,7 @@ flowchart TD
     SVF --> E
     SUN --> E
     E --> RPV[Rooftop PV]
-    RF --> RPV
+    OB --> RPV
     E --> PPV[PV fields and agrivoltaics]
     CR --> PPV
     P --> PPV
@@ -50,6 +53,7 @@ box above is also a public function that can be called on its own.
 | [solar_energy.md](solar_energy.md) | Irradiation rasters: modes, units, the one-pass reader, the POA bases | `shader` |
 | [pv_tracking_irradiance_plan.md](pv_tracking_irradiance_plan.md) | Vertical and tracking bases, shading between rows, validation against pvlib | `shader`, `parcel_pv` |
 | [roof_inference.md](roof_inference.md) | Roof planes from LiDAR and regularized facets | `buildings_infer`, `roofs_3d` |
+| [roof_obstacles.md](roof_obstacles.md) | Chimneys, parapets, skylights ... from the LiDAR returns and the sky view factor; the usable area of each plane | `roof_obstacles` |
 | [rooftop_pv.md](rooftop_pv.md) | Modules and strings on the roof planes, per-building scenarios | `dimensionate` |
 | [crop_rows.md](crop_rows.md) | Plantation rows and working axes of the rural parcels | `crop_rows` |
 | [parcel_pv.md](parcel_pv.md) | PV fields and agrivoltaics on the parcels, costed and ranked | `parcel_pv` |
@@ -87,6 +91,7 @@ All at the repository root, runnable as `python <script>`:
 | `test_crop_rows.py` | Crop-row detection on synthetic canopies |
 | `test_parcel_pv.py` | Parcel PV and agrivoltaic scenarios on a synthetic basis |
 | `test_pipelines.py` | The region-agnostic pipeline on a synthetic DEM, offline |
+| `test_roof_obstacles.py` | Residuals, clusters, raster and SVF detectors, fusion and setbacks, CRS round trip, PV planner on the usable area |
 | `eval_irradiance_pvgis.py` | Beam/sky split against PVGIS-SARAH3 for any point and year |
 | `eval_crop_rows.py` | Detected crop rows against hand-drawn ones |
 | `diagnose_crane.py` | Why each thin tall object was removed or kept |

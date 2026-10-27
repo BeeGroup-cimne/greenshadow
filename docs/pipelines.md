@@ -26,7 +26,7 @@ python -m greenshadow.pipelines catalonia 25023 --name Alpicat \
     --wd /mnt/data/greenshadow --year 2023 --day 2023-12-22
 ```
 
-`--no-roofs`, `--no-parcels`, `--no-weather`, `--no-videos`,
+`--no-roofs`, `--no-roof-obstacles`, `--no-parcels`, `--no-weather`, `--no-videos`,
 `--opaque-vegetation`, `--recalculate-digital-models` and
 `--recalculate-solar-exposure` switch the corresponding parts off or force
 them; everything else is a field of the configuration below.
@@ -48,6 +48,7 @@ A region subclasses `SolarPipeline` and implements its hooks:
 | `build_terrain(aoi)` | `TerrainModels` (paths of the rasters) | required |
 | `load_parcels(aoi)` | parcels for PV fields and agrivoltaics | None |
 | `detect_roofs(aoi, terrain)` | `RoofPlanes` (facets + their DSM) | None |
+| `roof_lidar(aoi)` | `RoofLidar` (LAZ paths + classes) for the roof obstacles | None (DSM residual and SVF only) |
 | `acquisition_date(aoi)` | survey date, to age the canopy | None |
 | `svf_options(class_path)` | extra `calculate_sky_view_factor` arguments | `{}` |
 | `load_weather(aoi)` | hourly weather (GHI, DHI, DNI ...) | ERA5-Land + ERA5 `fdir` at the centroid |
@@ -67,7 +68,10 @@ A region subclasses `SolarPipeline` and implements its hooks:
 5. **Crop rows**, when there are parcels, `crop_rows=True` and the terrain
    has a separate surface without vegetation (the canopy is their
    difference).
-6. **Roof planes** (`roofs`).
+6. **Roof planes** (`roofs`), then the **roof obstacles** and the usable
+   area of each plane (`roof_obstacles`, [roof_obstacles.md](roof_obstacles.md)):
+   from the LAZ files of `roof_lidar()`, the LiDAR DSM where the returns are
+   sparse, and the sky view factor.
 7. **Canopy**, when `semitransparent_vegetation` and the terrain carries a
    class raster and a surface without vegetation; aged from
    `acquisition_date()` to the simulated year when
@@ -111,6 +115,7 @@ A terrain without a separate surface without vegetation (a bare DEM in both
 | `roofs`, `parcels`, `crop_rows` | True | Which plans to make |
 | `economics`, `criterion` | `Economics()`, `"npv"` | Parcel scenario valuation and ranking |
 | `roof_pv_options`, `parcel_pv_options` | `{}` | Passed to the planners over the pipeline's defaults |
+| `roof_obstacles` | `ObstacleConfig()` | Roof obstacles, setbacks and usable area ([roof_obstacles.md](roof_obstacles.md)); None skips them and the PV planner uses its own setback |
 | `recalculate_digital_models` | False | Rebuild DSMs, DEM, SVF, crop rows and roofs |
 | `recalculate_solar_exposure` | False | Rebuild the irradiation rasters from the existing hillshades |
 | `cleanup_xml` | True | Remove `*.xml` side files at the end |
@@ -135,6 +140,7 @@ Under `{wd}/{name}/`:
 | `rural_parcels/` | SIGPAC download cache |
 | `crop_rows.gpkg` | Layers `crop_rows` and `crop_row_parcels` |
 | `roofs_rasterised.gpkg`, `roofs_3d.html` | Roof facets; optional 3D view |
+| `roof_obstacles.gpkg` | Layers `obstacles`, `usable_area`, `planes_qc`, `detections` |
 | `YYYYMMDD/hillshades*/`, `YYYYMMDD/*.mp4` | Daily hillshades and videos |
 | `YYYYMMDD/daily_solar_energy_total.tif` | Daily irradiation |
 | `YYYY/hillshades/`, `YYYY/hillshades_no_vegetation/` | Annual hillshades |

@@ -26,8 +26,10 @@ cadastre, SIGPAC), and the solar part is region-agnostic.
 - **Irradiation rasters**: on the surface itself, or as exact bases for any
   fixed panel orientation, vertical bifacial fences and single- and
   dual-axis trackers (validated against pvlib).
-- **Roof planes** segmented from the LiDAR, and **rooftop PV**: modules and
-  strings per building, one scenario per mounting.
+- **Roof planes** segmented from the LiDAR, their **obstacles** (chimneys,
+  parapets, skylights ... from the LiDAR returns and the sky view factor)
+  and **rooftop PV** on what is left: modules and strings per building, one
+  scenario per mounting.
 - **Crop rows**: direction, spacing, canopy and alley of every plantation.
 - **PV fields and agrivoltaics** on every agricultural parcel - fixed,
   trackers, solar grazing, overhead, interspace, vertical bifacial, and
@@ -79,6 +81,7 @@ One document per computation, in [docs/](docs/README.md):
 | [Irradiation rasters](docs/solar_energy.md) | Modes, units, POA bases, the one-pass reader |
 | [Trackers and vertical PV](docs/pv_tracking_irradiance_plan.md) | Vertical and tracking bases, shading between rows, pvlib validation |
 | [Roof inference](docs/roof_inference.md) | Roof planes from LiDAR, regularization, accuracy |
+| [Roof obstacles](docs/roof_obstacles.md) | Chimneys, parapets, skylights; the usable area of each roof plane |
 | [Rooftop PV](docs/rooftop_pv.md) | Modules and strings on the roofs |
 | [Crop rows](docs/crop_rows.md) | Plantation geometry of the parcels |
 | [Parcel PV and agrivoltaics](docs/parcel_pv.md) | Scenarios, crops, economics, ranking |
@@ -97,6 +100,7 @@ One document per computation, in [docs/](docs/README.md):
 | `weather` | `load_ERA5Land`, `load_ERA5Land_with_direct_radiation`, `load_ERA5_radiation` |
 | `buildings_infer` | `detect_roof_planes`, `detect_roof_planes_tiled`, `filter_roof_planes_by_aoi`, `regularize_roof_planes` |
 | `roofs_3d` | `roof_planes_3d` (WebGL view of the planes over the LiDAR) |
+| `roof_obstacles` | `detect_lidar_obstacles`, `detect_svf_obstacles`, `fuse_obstacles`, `write_obstacle_layers`, `ObstacleConfig` |
 | `dimensionate` | `plan_pv_strings_in_buildings`, `PVModuleSpec`, `DEFAULT_MODULES` |
 | `rural_parcels` | `load_spanish_sigpac_parcels`, `filter_agricultural_parcels`, `sigpac_parcel_id`, `load_spanish_preserved_regions`, `tag_parcels_with_preserved_areas` |
 | `crop_rows` | `detect_crop_rows` |
