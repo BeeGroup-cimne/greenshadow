@@ -17,6 +17,7 @@ hook                        returns
 ``load_parcels(aoi)``       parcels to lay PV fields and agrivoltaics on, or None
 ``detect_roofs(aoi, t)``    a ``RoofPlanes`` to lay PV on, or None
 ``roof_lidar(aoi)``         the LiDAR tiles and classes the roof obstacles are read from
+``load_orthophoto(aoi, p)`` the orthophoto over the roof planes p, or None
 ``acquisition_date(aoi)``   when the terrain was surveyed, to age the canopy
 ``svf_options(...)``        extra arguments for ``calculate_sky_view_factor``
 ``load_weather(aoi)``       hourly weather; ERA5-Land by default, which is global
@@ -29,9 +30,16 @@ canopy, no crop rows, no elevated shadows, no hillshades "without vegetation"
 
 Between the roof planes and the rooftop PV, the roof obstacles
 (``greenshadow.roof_obstacles``) cut each plane down to the area a module
-may stand on. They are found in the LiDAR returns when ``roof_lidar`` gives
-them, in the DSM otherwise, and in the sky view factor; the DSMs keep them,
-since they still cast shade.
+may stand on. They are found in the sky view factor and, with
+``ObstacleConfig.lidar`` (off by default), in the LiDAR returns when
+``roof_lidar`` gives them and in the DSM otherwise; the DSMs keep them,
+since they still cast shade. With ``ObstacleConfig.imagery`` the orthophoto
+of ``load_orthophoto`` is registered on the LiDAR roof by roof
+(``coreg_log``), SAM 3 segments it (``ObstacleConfig.sam3``) and what
+stands on the roofs is found by its shadows (``ObstacleConfig.shadows``),
+under the sun estimated from them. Walkable
+terraces, balconies and patios (``ObstacleConfig.terraces``) leave whole flat
+planes out.
 """
 
 from __future__ import annotations
@@ -40,6 +48,7 @@ import datetime as dt
 import os
 
 import geopandas as gpd
+import numpy as np
 import pandas as pd
 from dataclasses import dataclass, field
 from typing import Any, Dict, Optional, Sequence
@@ -48,8 +57,10 @@ from ..logging_utils import (error, indent, info, section, section_context,
                              success, summary, warning)
 from ..parcel_pv import Economics, plan_parcel_pv_scenarios
 from ..dimensionate import plan_pv_strings_in_buildings
-from ..roof_obstacles import (ObstacleConfig, detect_lidar_obstacles,
-                              detect_svf_obstacles, fuse_obstacles,
+from ..roof_obstacles import (ObstacleConfig, Sam3Unavailable, coregister_orthophoto,
+                              detect_lidar_obstacles, detect_sam3_obstacles,
+                              detect_shadow_obstacles, detect_terraces, detect_svf_obstacles,
+                              fuse_obstacles, orthophoto_suns, planes_qc_without_lidar,
                               write_obstacle_layers)
 from ..crop_rows import detect_crop_rows
 from ..shader import (NO_GROWTH, apply_height_shadow_to_hillshades,
@@ -204,6 +215,7 @@ class RoofPlanes:
     obstacles: Any = None       # fused obstacles, all sources
     usable: Any = None          # usable area per plane, what the PV planner packs
     qc: Any = None              # per-plane fit quality, needs_review
+    coreg: Any = None           # orthophoto shift per roof (coreg_log), with imagery
 
 
 @dataclass
@@ -289,6 +301,15 @@ class SolarPipeline:
         """
         The LAZ files over the roofs, for the roof obstacles; None finds them
         in the DSM alone (``ObstacleConfig.raster_mode``).
+        """
+        return None
+
+    def load_orthophoto(self, aoi, planes):
+        """
+        The orthophoto over the roof ``planes``
+        (``greenshadow.orthophoto.Orthophoto``), read when
+        ``ObstacleConfig.imagery`` is set; None: no imagery for this region.
+        ``local_orthophoto`` wraps any GeoTIFF / VRT at hand.
         """
         return None
 
@@ -428,48 +449,193 @@ class SolarPipeline:
         ocfg = cfg.roof_obstacles
         path = self.path("roof_obstacles.gpkg")
 
-        if os.path.exists(path) and not (ocfg.recalculate or cfg.recalculate_digital_models):
+        if (os.path.exists(path) and not (ocfg.recalculate or cfg.recalculate_digital_models)
+                # A file written without imagery (or without SAM 3) is not
+                # reused once it is asked for.
+                and (not ocfg.imagery or "coreg_log" in _layers(path))
+                and (not ocfg.imagery
+                     or _imagery_log_matches(_read_layer(path, "coreg_log", roofs.planes.crs),
+                                             ocfg))
+                # ... nor one without the terraces, nor one with the LiDAR
+                # detector on when it is off now, or the other way round.
+                and _obstacle_qc_matches(_read_layer(path, "planes_qc", roofs.planes.crs),
+                                         ocfg)):
             roofs.obstacles = _read_layer(path, "obstacles", roofs.planes.crs)
             roofs.usable = _read_layer(path, "usable_area", roofs.planes.crs)
             roofs.qc = _read_layer(path, "planes_qc", roofs.planes.crs)
+            if ocfg.imagery:
+                roofs.coreg = _read_layer(path, "coreg_log", roofs.planes.crs)
             info(f"Using existing roof obstacles: {path}")
+            if ocfg.debug_pngs or ocfg.debug_part_ids:
+                ortho = self.load_orthophoto(aoi, roofs.planes) if ocfg.imagery else None
+                self._roof_obstacle_pngs(roofs, ortho,
+                                         _read_layer(path, "detections", roofs.planes.crs))
             return
 
-        lidar = self.roof_lidar(aoi)
+        ortho = None
         with indent("Detecting roof obstacles"):
-            lidar_obstacles, qc = detect_lidar_obstacles(
-                roofs.planes,
-                lidar.paths if lidar is not None else None,
-                ocfg,
-                # The LiDAR DSM still holds the clutter the refined roof DSM
-                # smoothed away; it stands in where the returns are sparse.
-                dsm_path=terrain.bare_dsm,
-                lidar_classes=(ocfg.lidar_classes if ocfg.lidar_classes is not None
-                               else (lidar.classes if lidar is not None else None)),
-                progress=True,
-            )
-            detections = [lidar_obstacles]
-            info(f"LiDAR: {len(lidar_obstacles)} obstacles; "
-                 f"{int(qc.needs_review.sum())} of {len(qc)} planes need review")
+            detections = []
+            if ocfg.lidar:
+                with indent("LiDAR residuals"):
+                    lidar = self.roof_lidar(aoi)
+                    lidar_obstacles, qc = detect_lidar_obstacles(
+                        roofs.planes,
+                        lidar.paths if lidar is not None else None,
+                        ocfg,
+                        # The LiDAR DSM still holds the clutter the refined
+                        # roof DSM smoothed away; it stands in where the
+                        # returns are sparse.
+                        dsm_path=terrain.bare_dsm,
+                        lidar_classes=(ocfg.lidar_classes if ocfg.lidar_classes is not None
+                                       else (lidar.classes if lidar is not None else None)),
+                        progress=True,
+                    )
+                    detections.append(lidar_obstacles)
+                    success(f"{len(lidar_obstacles)} obstacles; "
+                            f"{int(qc.needs_review.sum())} of {len(qc)} planes need review")
+            else:
+                qc = planes_qc_without_lidar(roofs.planes)
 
             # The SVF the roof detector was tuned with (docs/roof_inference.md).
             if ocfg.svf and terrain.svf and os.path.exists(terrain.svf):
-                svf_obstacles = detect_svf_obstacles(roofs.planes, terrain.svf, ocfg,
-                                                     progress=True)
-                detections.append(svf_obstacles)
-                info(f"Sky view factor: {len(svf_obstacles)} obstacles")
+                with indent("Sky view factor"):
+                    svf_obstacles = detect_svf_obstacles(roofs.planes, terrain.svf, ocfg,
+                                                         progress=True)
+                    detections.append(svf_obstacles)
+                    success(f"{len(svf_obstacles)} obstacles")
+
+            if ocfg.imagery:
+                ortho, roofs.coreg = self._coregister_orthophoto(aoi, terrain, roofs)
+                if roofs.coreg is not None:
+                    self._orthophoto_sun(ortho, terrain, roofs)
+                if ocfg.sam3 and roofs.coreg is not None:
+                    sam3_obstacles = self._sam3_obstacles(ortho, terrain, roofs)
+                    if sam3_obstacles is not None:
+                        detections.append(sam3_obstacles)
+                if ocfg.shadows and roofs.coreg is not None:
+                    # What stands on the roofs, by its shadow: vent pipes and
+                    # small chimneys neither the LiDAR nor SAM 3 has.
+                    with indent("Shadows"):
+                        shadows = detect_shadow_obstacles(roofs.planes, ortho, roofs.coreg,
+                                                          terrain.dsm, ocfg, progress=True)
+                        counts = shadows.groupby("part_id").size()
+                        roofs.coreg["n_shadows"] = [
+                            counts.get(p, 0) if use else None
+                            for p, use in zip(roofs.coreg.part_id, roofs.coreg.use_imagery)]
+                        detections.append(shadows)
+                        success(f"{len(shadows)} obstacles on {shadows.part_id.nunique()} roofs")
+
+            # Walkable terraces, balconies and patios: whole flat planes out.
+            if ocfg.terraces:
+                with indent("Terraces"):
+                    terraces = detect_terraces(
+                        roofs.planes, terrain.bare_dsm,
+                        ortho if roofs.coreg is not None else None,
+                        roofs.coreg, ocfg, progress=True)
+                    detections.append(terraces)
+                    qc = qc.merge(terraces.attrs["measures"], on=["part_id", "plane_id"],
+                                  how="left")
+                    qc["terrace"] = qc["terrace"].eq(True)
+                    tiled = int((terraces.method == "tiled").sum())
+                    success(f"{len(terraces)} planes, {terraces.area.sum():,.0f} m2 "
+                            f"({tiled} tiled, {len(terraces) - tiled} enclosed)")
 
             obstacles, usable = fuse_obstacles(
                 roofs.planes, detections, ocfg, planes_qc=qc,
                 modules=cfg.roof_pv_options.get("modules"))
             write_obstacle_layers(
                 path, obstacles=obstacles, usable_area=usable, planes_qc=qc,
-                detections=gpd.GeoDataFrame(pd.concat(detections, ignore_index=True),
-                                            geometry="geometry", crs=roofs.planes.crs))
+                detections=(gpd.GeoDataFrame(pd.concat(detections, ignore_index=True),
+                                             geometry="geometry", crs=roofs.planes.crs)
+                            if detections else None),
+                coreg_log=roofs.coreg)
             roofs.obstacles, roofs.usable, roofs.qc = obstacles, usable, qc
             roof_area = roofs.planes.area.sum() if "area" in roofs.planes else float("nan")
             success(f"{len(obstacles)} roof obstacles; usable area "
                     f"{usable.usable_area_m2.sum():,.0f} of {roof_area:,.0f} m2: {path}")
+            if ocfg.debug_pngs or ocfg.debug_part_ids:
+                self._roof_obstacle_pngs(roofs, ortho, _read_layer(path, "detections",
+                                                                   roofs.planes.crs))
+
+    def _roof_obstacle_pngs(self, roofs: RoofPlanes, ortho, detections):
+        from ..roof_obstacles_validation import debug_part_ids, write_debug_pngs
+        ocfg = self.config.roof_obstacles
+        out_dir = self.path("roof_obstacles_debug")
+        paths = write_debug_pngs(out_dir, debug_part_ids(roofs.planes, ocfg), roofs.planes,
+                                 ortho=ortho, coreg_log=roofs.coreg, detections=detections,
+                                 obstacles=roofs.obstacles, usable=roofs.usable, config=ocfg)
+        info(f"{len(paths)} roof debug figures: {out_dir}")
+
+    def _coregister_orthophoto(self, aoi, terrain: TerrainModels, roofs: RoofPlanes):
+        # Where the orthophoto shows each roof relative to the LiDAR, so that
+        # what is found on the image can be drawn back onto the planes.
+        ocfg = self.config.roof_obstacles
+        ortho = self.load_orthophoto(aoi, roofs.planes)
+        if ortho is None:
+            warning("Roof imagery asked for, but this pipeline has no orthophoto; "
+                    "LiDAR and sky view factor only")
+            return None, None
+        with indent(f"Orthophoto co-registration ({ortho.name})"):
+            lidar_date = self.acquisition_date(aoi)
+            log = coregister_orthophoto(roofs.planes, ortho, terrain.bare_dsm, ocfg,
+                                        lidar_date=lidar_date, progress=True)
+            used = log[log.use_imagery]
+            success(f"{len(used)} of {len(log)} roofs registered "
+                    f"({int((log.status == 'ok').sum())} on their own edges, "
+                    f"{int((log.status == 'consensus').sum())} by their neighbours); "
+                    f"median shift {used.shift_m.median():.2f} m")
+        return ortho, log
+
+    def _orthophoto_sun(self, ortho, terrain: TerrainModels, roofs: RoofPlanes):
+        # The sun the orthophoto was flown under, for its shadows: SAM 3's
+        # cast-shadow test and the shadow detector. Into roofs.coreg.
+        ocfg = self.config.roof_obstacles
+        if not ((ocfg.sam3 and ocfg.sam3_extensive_max_cast_shadow is not None)
+                or ocfg.shadows):
+            return
+        with indent("Orthophoto sun"):
+            # Trees shade roofs too: the DSM with them.
+            sun = orthophoto_suns(ortho, roofs.coreg, terrain.dsm, ocfg, progress=True) or {}
+            for k, column in enumerate(("sun_azimuth", "sun_altitude", "sun_correlation")):
+                roofs.coreg[column] = [sun.get(p, (np.nan,) * 3)[k] for p in roofs.coreg.part_id]
+            suns = {(round(a), round(h)) for a, h, _ in sun.values()
+                    if np.isfinite(a) and np.isfinite(h)}
+            if suns:
+                success(f"Azimuth / altitude: "
+                        f"{', '.join(f'{a} / {h} deg' for a, h in sorted(suns))}")
+            else:
+                warning(f"Orthophoto {ortho.name}: its sun could not be told from its shadows "
+                        "(set ObstacleConfig.sam3_sun); no cast-shadow test, no shadow obstacles")
+
+    def _sam3_obstacles(self, ortho, terrain: TerrainModels, roofs: RoofPlanes):
+        # SAM 3 on the registered orthophoto; its outputs are cached per
+        # window in sam3_cache/, so a rerun with other filters is cheap.
+        ocfg = self.config.roof_obstacles
+        cache_dir = self.path("sam3_cache")
+        with indent("SAM 3"):
+            try:
+                found = detect_sam3_obstacles(roofs.planes, ortho, roofs.coreg, ocfg,
+                                              cache_dir=cache_dir,
+                                              # Trees shade roofs too: the DSM with them.
+                                              dsm_path=terrain.dsm, progress=True)
+            except Sam3Unavailable as exc:
+                warning(f"{exc}; no SAM 3 obstacles")
+                return None
+            windows = found.attrs.get("sam3_windows", 0)
+            cached = windows - found.attrs.get("sam3_inferred", 0)
+            if cached:
+                info(f"Using existing SAM 3 outputs: {cached} of {windows} windows "
+                     f"in {cache_dir}")
+            counts = found.groupby("part_id").size()
+            roofs.coreg["n_sam3"] = [
+                counts.get(p, 0) if use else None
+                for p, use in zip(roofs.coreg.part_id, roofs.coreg.use_imagery)]
+            classes = ", ".join(f"{n} {c}" for c, n in found["class"].value_counts().items())
+            success(f"{len(found)} obstacles on {found.part_id.nunique()} roofs"
+                    f"{': ' + classes if classes else ''}")
+            if "sun" in found.attrs:
+                info(f"{found.attrs.get('sam3_cast_shadows', 0)} cast shadows taken for PV")
+        return found
 
     def _crop_rows(self, parcels, terrain: TerrainModels):
         # How each rural parcel is planted. On a woody crop the canopy height
@@ -589,13 +755,15 @@ class SolarPipeline:
                         qgis_temporal=False,
                         canopy=set_canopy,
                     )
-                    success(f"Generated {len(paths)} hillshades")
+                    success(f"{len(paths)} hillshades")
                     if cfg.daily_videos:
-                        info("Generating the hillshades video...")
+                        out_mp4 = os.path.join(day_dir, f"{key}.mp4")
+                        if not os.path.exists(out_mp4):
+                            info("Generating the hillshades video...")
                         generate_daily_shadow_mp4(
                             solar_df=solar["df"],
                             hillshade_dir=hillshade_dir,
-                            out_mp4=os.path.join(day_dir, f"{key}.mp4"),
+                            out_mp4=out_mp4,
                             fps=10,
                             duration_seconds=10,
                             zoom=4,
@@ -621,13 +789,15 @@ class SolarPipeline:
                         pattern="*.tif",
                         recursive=True,
                     )
-                    success(f"Applied elevation shadows to {len(elevated)} files")
+                    success(f"Elevation shadows on {len(elevated)} hillshades")
                     if cfg.daily_videos:
-                        info("Generating the hillshades video...")
+                        out_mp4 = os.path.join(day_dir, f"hillshades_dem{h}m.mp4")
+                        if not os.path.exists(out_mp4):
+                            info("Generating the hillshades video...")
                         generate_daily_shadow_mp4(
                             solar_df=solar["df"],
                             hillshade_dir=elevated_dir,
-                            out_mp4=os.path.join(day_dir, f"hillshades_dem{h}m.mp4"),
+                            out_mp4=out_mp4,
                             fps=10,
                             duration_seconds=10,
                             zoom=3,
@@ -686,7 +856,7 @@ class SolarPipeline:
             modes += [m for m in bare_modes if m not in modes]
 
         with indent("Generating annual hillshades"):
-            generate_multiple_hillshades_gdal(
+            paths = generate_multiple_hillshades_gdal(
                 raster_dir=os.path.join(year_dir, "hillshades"),
                 dsm_path=terrain.dsm,
                 azimuth_altitude=solar["azimuth_altitude_pairs"],
@@ -694,7 +864,7 @@ class SolarPipeline:
                 include_datetime_info=False,
                 canopy=canopy,
             )
-            success("Annual hillshades generation complete")
+            success(f"{len(paths)} annual hillshades")
 
         # The irradiation is the weather's: without it there is nothing to
         # weight the hillshades with.
@@ -713,7 +883,7 @@ class SolarPipeline:
                 canopy_leaf_type=cfg.vegetation_leaf_type if canopy is not None else None,
                 overwrite=cfg.recalculate_solar_exposure,
             )
-            success("Annual solar exposure rasters written")
+            success(f"Annual solar exposure: {', '.join(result.annual)}")
 
         if result.roofs is not None:
             self._roof_pv(aoi, result)
@@ -743,8 +913,8 @@ class SolarPipeline:
                     out_path=os.path.join(year_dir, "annual_solar_exposure_no_vegetation.tif"),
                     overwrite=cfg.recalculate_solar_exposure,
                 )
-                success(f"No-vegetation POA basis: {result.annual_no_vegetation['fourier_poa']}")
-                success("Vertical and tracking bases written")
+                success(f"No-vegetation annual solar exposure: "
+                        f"{', '.join(result.annual_no_vegetation)}")
         else:
             result.annual_no_vegetation = {m: result.annual[m] for m in bare_modes}
 
@@ -850,10 +1020,36 @@ class SolarPipeline:
                 error(f"Errors during cleanup: {len(errors)}")
 
 
+def _layers(path):
+    """The layer names of a GeoPackage."""
+    import pyogrio
+    return set(pyogrio.list_layers(path)[:, 0])
+
+
+def _imagery_log_matches(coreg, ocfg) -> bool:
+    """Whether a stored coreg_log had what ocfg asks of the imagery: SAM 3,
+    its cast-shadow test (the orthophoto's sun), the shadow detector."""
+    columns = set(coreg.columns)
+    if ocfg.sam3 and "n_sam3" not in columns:
+        return False
+    if ocfg.shadows and "n_shadows" not in columns:
+        return False
+    wants_sun = ocfg.shadows or (ocfg.sam3 and ocfg.sam3_extensive_max_cast_shadow is not None)
+    return not wants_sun or "sun_azimuth" in columns
+
+
+def _obstacle_qc_matches(qc, ocfg) -> bool:
+    """Whether a stored planes_qc was made with ocfg's terraces and LiDAR switches."""
+    if ocfg.terraces and "terrace" not in qc.columns:
+        return False
+    if "fit" not in qc.columns or qc.empty:
+        return False
+    return bool(ocfg.lidar) == bool((qc["fit"] != "off").any())
+
+
 def _read_layer(path, layer, crs):
     """A layer of a GeoPackage, or an empty frame when it was never written."""
-    import pyogrio
-    if layer not in pyogrio.list_layers(path)[:, 0]:
+    if layer not in _layers(path):
         return gpd.GeoDataFrame(geometry=[], crs=crs)
     return gpd.read_file(path, layer=layer)
 

@@ -8,6 +8,8 @@ disk; repeat calls are offline.
 |---|---|---|---|---|
 | Classified LiDAR (LAZ) | ICGC, territorial LiDAR | Catalonia | `icgc_tiles_from_geojson`, `icgc_download_from_geojson` | `laz_dir` |
 | LiDAR flight dates | ICGC metadata | Catalonia | `icgc_lidar_metadata`, `icgc_lidar_acquisition_date` | `laz_dir` |
+| Orthophoto, RGB 25 cm (roof imagery) | ICGC, territorial orthophoto | Catalonia | `icgc_orthophoto`, `icgc_orthophoto_sheets` | `orthophoto_dir` |
+| Orthophoto, any GDAL raster (e.g. PNOA) | at hand | any | `local_orthophoto` | none |
 | Municipal boundary, buildings | Spanish cadastre and INE census tracts, via `hypercadaster_ES` | Spain | `hc.download`, `hc.mergers.*` | `hypercadaster_dir` |
 | Agricultural parcels | SIGPAC recintos (FEGA) | Spain | `load_spanish_sigpac_parcels` | `{area}/rural_parcels` |
 | Protected areas | Natura 2000 and ENP (MITECO) | Spain | `load_spanish_preserved_regions` | `preserved_areas_dir` |
@@ -44,6 +46,30 @@ does not survive `fork()`. A forked worker that decodes LAZ after its parent
 did hangs. The tiled DSM builder therefore switches its workers to the
 serial `Lazrs` backend; any new fork-based worker that reads LAZ must do the
 same.
+
+### Orthophoto (`greenshadow.orthophoto`)
+
+For the roof obstacles ([roof_obstacles.md](roof_obstacles.md) §5). The ICGC
+territorial orthophoto (RGB, 25 cm, EPSG:25831, CC BY 4.0) is one
+GeoPackage per year for the whole of Catalonia, 2009 onwards, ~210 GB each,
+at `datacloud.icgc.cat/datacloud/orto-territorial/gpkg_unzip/`; the current
+edition is also under `vigent/`.
+
+* `icgc_orthophoto(footprints, out_dir, year=...)` reads only the 1 km tiles
+  within `buffer_m` of the footprints, through HTTP range requests (GDAL
+  `/vsicurl/`), and keeps them as GeoTIFFs (JPEG q90 with the coverage as a
+  mask, ~6 MB a tile) under `out_dir/ortofoto-rgb-25cm-{year}/`; tiles are
+  written beside and renamed, so a cache shared by several runs never holds
+  half a tile. Alpicat: 25 tiles in 44 s.
+* `icgc_orthophoto_sheets(cache_dir)`: flight window of every sheet,
+  published for the current edition only
+  (`metadades/ortofoto-25cm-v4r0-metadades.zip`). Older editions are dated
+  1 July of their year. `icgc_orthophoto_years()` lists the editions online;
+  `nearest_icgc_orthophoto_year(date)` picks the one closest to a LiDAR
+  flight.
+* Outside Catalonia, PNOA comes from the CNIG download centre, which has no
+  scriptable download: fetch the sheets and pass them to
+  `local_orthophoto(path_or_dir, date=...)`, in whatever CRS they are in.
 
 ## 2. Cadastre and census tracts (`hypercadaster_ES`)
 

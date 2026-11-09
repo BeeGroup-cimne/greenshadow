@@ -9,7 +9,7 @@ For detailed usage examples, see the README.md and example/get_solar_energy_from
 the whole chain runs in one call through greenshadow.pipelines.
 """
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 __author__ = "Jose Manuel Broto, Maite Sellart, Gerard Mor"
 __email__ = "gmor@cimne.upc.edu"
 
@@ -26,6 +26,8 @@ from . import buildings_infer
 from . import roofs_3d
 from . import dimensionate
 from . import roof_obstacles
+from . import orthophoto
+from . import roof_obstacles_validation
 from . import crop_rows
 from . import parcel_pv
 from . import pipelines
@@ -127,10 +129,36 @@ from .dimensionate import (
 
 from .roof_obstacles import (
     ObstacleConfig,
+    Sam3Unavailable,
+    coregister_orthophoto,
     detect_lidar_obstacles,
+    detect_sam3_obstacles,
+    detect_shadow_obstacles,
     detect_svf_obstacles,
+    detect_terraces,
+    estimate_orthophoto_sun,
     fuse_obstacles,
+    orthophoto_suns,
+    planes_qc_without_lidar,
+    sam3_segmenter,
     write_obstacle_layers
+)
+
+from .roof_obstacles_validation import (
+    obstacle_metrics,
+    plot_roof_obstacles,
+    pv_yield_by_variant,
+    sample_roofs_for_labelling,
+    validate_obstacles,
+    write_debug_pngs,
+    write_labelling_template
+)
+
+from .orthophoto import (
+    Orthophoto,
+    icgc_orthophoto,
+    local_orthophoto,
+    read_orthophoto
 )
 
 # Import weather module if it exists and dependencies are available

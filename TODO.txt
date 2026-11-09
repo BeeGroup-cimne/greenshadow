@@ -27,15 +27,20 @@
   the current defaults are literature values, not fitted.
 - Create the unary tests.
 - Roof obstacles (greenshadow.roof_obstacles; docs/roof_obstacles.md). Done: LiDAR residual detector,
-  plane QC, SVF source, fusion, setbacks, usable area into the PV planner. Next:
-  - Orthophoto loading (ICGC native tiles for Catalonia, PNOA from CNIG elsewhere; no WMS), reprojection,
-    flight date vs LiDAR date warning, per-building co-registration (gradient vs plane-boundary / nDSM
-    hillshade, phase correlation within +-5 m, shift + score into a coreg_log layer).
-  - SAM3 on the orthophoto crops (check the facebookresearch/sam3 API and licence first): text prompts,
-    score/area/in-roof filters, polygonize, undo the shift, cache per building, GPU with CPU fallback.
-  - Validation: hand-label obstacles with classes on several windows (the 48 digitised Alpicat obstacles,
-    real_roof_obstacles_9000_9500_4000_5000_Alpicat.gpkg, are lost); precision / recall / IoU per source
-    and fused; debug PNGs per building.
+  plane QC, SVF source, fusion, setbacks, usable area into the PV planner; orthophoto (ICGC tiles,
+  any local raster) and per-roof co-registration (coreg_log); SAM 3 detector (transformers port, own
+  venv over a pipe, per-window cache), run on all of Alpicat, existing PV arrays out of the usable
+  area; walkable terraces, balconies and patios out whole (guard from the DSM, tile colour);
+  validation module, provisional Alpicat labels (18 roofs), debug figures. Next:
+  - SAM 3: the PV filters (roof fraction 0.8, brightness 0.55) were set on Alpicat with little margin;
+    check them on another municipality's debug figures. Small vents stay below score 0.4; roof 977's
+    arrays mostly missed. The cache key hashes the pixels, so a cached rerun still reads every window.
+  - Labels: a human pass over the 38 provisional ones (/mnt/data/greenshadow_obstacles_test/Alpicat/
+    validation/roof_obstacle_labels_alpicat.gpkg) and more roofs, ideally with existing PV and skylights.
+  - PNOA has no scriptable CNIG download: sheets are fetched by hand (local_orthophoto).
+  - Co-registration is a translation per roof; a tall building's lean grows up its walls.
+  - Terraces: thresholds set by eye on Alpicat (no labels); walkable top roofs with glass or metal
+    railings are missed (the DSM barely sees them). Label some and measure.
 - Calibrate the parcel_pv defaults (capex, crop margins, SIGPAC_USE_MARGIN_EUR_HA, shade response) against
   regional data; add grid-connection cost by distance to substation
 - Derive leaf_type per tree (species layer or NDVI seasonality) instead of the

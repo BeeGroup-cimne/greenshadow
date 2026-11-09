@@ -324,8 +324,15 @@ def _plot_tiles_and_aoi(
     aoi_gdf = gpd.GeoDataFrame([1], geometry=[aoi_tiles_crs], crs=f"EPSG:{tiles_epsg}")
     aoi_buf_gdf = gpd.GeoDataFrame([1], geometry=[aoi_buffered], crs=f"EPSG:{tiles_epsg}")
     
-    # Create plot
-    fig, ax = plt.subplots(1, 1, figsize=(12, 10))
+    # Create plot. Only a plot to show goes through pyplot: its GUI backend
+    # (Tk on a desktop) leaves a Tcl interpreter behind that forked workers
+    # inherit, and that aborts the run when collected from another thread.
+    if show:
+        fig, ax = plt.subplots(1, 1, figsize=(12, 10))
+    else:
+        from matplotlib.figure import Figure
+        fig = Figure(figsize=(12, 10))
+        ax = fig.subplots(1, 1)
     
     # Plot tiles
     tiles_gdf.plot(ax=ax, facecolor='lightblue', edgecolor='blue', alpha=0.7, linewidth=1)
@@ -363,7 +370,7 @@ def _plot_tiles_and_aoi(
                    ha='center', va='center', fontsize=8, 
                    bbox=dict(boxstyle="round,pad=0.3", facecolor='white', alpha=0.8))
     
-    plt.tight_layout()
+    fig.tight_layout()
     
     # Save PDF if requested
     if pdf_path:
@@ -374,8 +381,6 @@ def _plot_tiles_and_aoi(
     # Show plot if requested
     if show:
         plt.show()
-    else:
-        plt.close(fig)
 
 
 def list_available_tiles(

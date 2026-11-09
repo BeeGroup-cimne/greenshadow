@@ -23,6 +23,7 @@ flowchart TD
     RF --> OB[Roof obstacles<br/>usable area]
     L --> OB
     SVF --> OB
+    ORT[Orthophoto] -. registered, SAM 3 .-> OB
     W --> SUN[Sun table<br/>positions + DNI/DHI]
     DM --> HS[Hillshades<br/>cast shadows]
     CAN --> HS
@@ -45,7 +46,8 @@ box above is also a public function that can be called on its own.
 | Document | Computation | Module |
 |---|---|---|
 | [pipelines.md](pipelines.md) | The chain in one call; adding a region | `greenshadow/pipelines/` |
-| [data_sources.md](data_sources.md) | ICGC LiDAR, cadastre, SIGPAC, protected areas, ERA5, satellite | `lidar`, `rural_parcels`, `weather`, `satellite` |
+| [example_run_alpicat.md](example_run_alpicat.md) | A full run on one municipality: execution time of each stage, outputs, disk use | `greenshadow/pipelines/` |
+| [data_sources.md](data_sources.md) | ICGC LiDAR and orthophoto, cadastre, SIGPAC, protected areas, ERA5, satellite | `lidar`, `orthophoto`, `rural_parcels`, `weather`, `satellite` |
 | [digital_models.md](digital_models.md) | DSM / DEM from LiDAR: classification correction, cranes, gap filling, smoothing, tiling | `dsm_dem_estimation` |
 | [hillshades_and_sky_view.md](hillshades_and_sky_view.md) | Sun tables, cast-shadow hillshades (CPU / CUDA), elevated shadows, videos, sky view factor | `shader` |
 | [vegetation_canopy.md](vegetation_canopy.md) | Trees as a semi-transparent medium, tree crowns, growth since the flight | `shader` |
@@ -53,7 +55,7 @@ box above is also a public function that can be called on its own.
 | [solar_energy.md](solar_energy.md) | Irradiation rasters: modes, units, the one-pass reader, the POA bases | `shader` |
 | [pv_tracking_irradiance_plan.md](pv_tracking_irradiance_plan.md) | Vertical and tracking bases, shading between rows, validation against pvlib | `shader`, `parcel_pv` |
 | [roof_inference.md](roof_inference.md) | Roof planes from LiDAR and regularized facets | `buildings_infer`, `roofs_3d` |
-| [roof_obstacles.md](roof_obstacles.md) | Chimneys, parapets, skylights ... from the LiDAR returns and the sky view factor; the usable area of each plane | `roof_obstacles` |
+| [roof_obstacles.md](roof_obstacles.md) | Chimneys, parapets, skylights, existing PV, walkable terraces ... from the LiDAR returns, the sky view factor and SAM 3 on the registered orthophoto; the usable area of each plane; validation against labels, debug figures | `roof_obstacles`, `orthophoto`, `sam3_worker`, `roof_obstacles_validation` |
 | [rooftop_pv.md](rooftop_pv.md) | Modules and strings on the roof planes, per-building scenarios | `dimensionate` |
 | [crop_rows.md](crop_rows.md) | Plantation rows and working axes of the rural parcels | `crop_rows` |
 | [parcel_pv.md](parcel_pv.md) | PV fields and agrivoltaics on the parcels, costed and ranked | `parcel_pv` |
@@ -91,7 +93,10 @@ All at the repository root, runnable as `python <script>`:
 | `test_crop_rows.py` | Crop-row detection on synthetic canopies |
 | `test_parcel_pv.py` | Parcel PV and agrivoltaic scenarios on a synthetic basis |
 | `test_pipelines.py` | The region-agnostic pipeline on a synthetic DEM, offline |
-| `test_roof_obstacles.py` | Residuals, clusters, raster and SVF detectors, fusion and setbacks, CRS round trip, PV planner on the usable area |
+| `test_roof_obstacles.py` | Residuals, clusters, raster and SVF detectors, fusion and setbacks, CRS round trip, PV planner on the usable area, walkable terraces |
+| `test_orthophoto.py` | Orthophoto reading and reprojection, co-registration on a synthetic village with a known offset, flight dates, pipeline stage (`--network`: one ICGC tile) |
+| `test_sam3.py` | SAM 3 windows, shift, filters, cache, fusion and pipeline stage with a stand-in segmenter; the worker protocol with a tiny random SAM 3 (`--sam3-python`; `--network`: gated checkpoint reported) |
+| `test_obstacle_validation.py` | Metrics on known polygons, per-detector table, roof types and sample, labelling template, debug figures |
 | `eval_irradiance_pvgis.py` | Beam/sky split against PVGIS-SARAH3 for any point and year |
 | `eval_crop_rows.py` | Detected crop rows against hand-drawn ones |
 | `diagnose_crane.py` | Why each thin tall object was removed or kept |

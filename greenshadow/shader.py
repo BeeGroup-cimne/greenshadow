@@ -222,6 +222,13 @@ CANOPY_RASTER_TAGS = {"GREENSHADOW_CANOPY": "path_lengths_m"}
 HILLSHADE_COMPRESSION = {"compress": "zstd", "zstd_level": 6, "predictor": 1}
 
 
+def _log_reused(what, n_reused, n_total, where):
+    # What a previous run left and this one keeps, the way the digital
+    # models say "Using existing DSM".
+    if n_reused:
+        info(f"Using existing {what}: {n_reused} of {n_total} in {where}")
+
+
 def geotiff_is_complete(path) -> bool:
     """
     Whether a GeoTIFF was written out in full: it opens, and every block has
@@ -1504,6 +1511,7 @@ def generate_multiple_hillshades_gdal(
         shading_dsm_path = render_tmp
 
     max_workers = min(max_workers, len(valid_positions), mp.cpu_count())
+    reused = []
 
     def process_single(args):
         i, az, alt, when = args
@@ -1514,6 +1522,7 @@ def generate_multiple_hillshades_gdal(
         out_path = os.path.join(raster_dir, f"{base}.tif")
 
         if not overwrite and geotiff_is_complete(out_path):
+            reused.append(out_path)
             return out_path
 
         try:
@@ -1602,6 +1611,7 @@ def generate_multiple_hillshades_gdal(
         if render_tmp and os.path.exists(render_tmp):
             os.remove(render_tmp)
 
+    _log_reused("hillshades", len(set(reused)), len(set(results)), raster_dir)
     return results
 
 
@@ -1849,6 +1859,7 @@ def _generate_hillshades_cuda(
         queued.add(out_path)
         jobs.append((out_path, float(az), float(alt)))
 
+    _log_reused("hillshades", len(set(results)) - len(jobs), len(set(results)), raster_dir)
     if not jobs:
         return results
 
@@ -2659,6 +2670,7 @@ def apply_height_shadow_to_hillshades(
             out_path.parent.mkdir(parents=True, exist_ok=True)
 
             if not overwrite and geotiff_is_complete(out_path):
+                reused.append(out_path)
                 return str(out_path)
 
             with rasterio.open(path) as src:
@@ -2690,13 +2702,14 @@ def apply_height_shadow_to_hillshades(
             failed.append(f"{path.name}: {e}")
             return None
 
-    failed = []
+    failed, reused = [], []
 
     if parallel:
         with ThreadPoolExecutor(max_workers=max_workers) as ex:
-            res = list(tqdm(ex.map(process, files), total=len(files)))
+            res = list(tqdm(ex.map(process, files), total=len(files), desc="Elevated shadows"))
     else:
-        res = [process(f) for f in tqdm(files)]
+        res = [process(f) for f in tqdm(files, desc="Elevated shadows")]
+    _log_reused("elevated-shadow hillshades", len(reused), len(files), out_dir)
 
     # A missing elevated hillshade would only surface later, in whatever
     # reads the set; say which ones and why here instead.
@@ -3356,6 +3369,9 @@ def compute_surface_solar_energies(
     out_path = str(out_path)
     paths = {m: out_path.replace(".tif", f"_{m}.tif") for m in modes}
     todo = [m for m in modes if overwrite or not geotiff_is_complete(paths[m])]
+    for m in modes:
+        if m not in todo:
+            info(f"Using existing {m} solar exposure: {paths[m]}")
     if not todo:
         return paths
 
@@ -4499,6 +4515,7 @@ def generate_daily_shadow_mp4(
     out_mp4 = Path(out_mp4)
 
     if out_mp4.exists() and not overwrite:
+        info(f"Using existing video: {out_mp4}")
         return
 
     # ----------------------------------------------------------

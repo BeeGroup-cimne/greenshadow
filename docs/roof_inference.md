@@ -85,6 +85,8 @@ triangulation of the returns. Binning instead leaves roughly half the pixels
 empty at this resolution and hands them to a gap filler that minimises
 curvature — which rounds off the very facets being looked for.
 
+![The same roofs in the 0.5 m LiDAR DSM and in the refined 0.2 m roof DSM the planes are fitted to (hillshades)](images/roof_inference_dsm_alpicat.png)
+
 ### 3.2 Which pixels are roof
 
 `buildings_mask = class in building_class_value AND (DSM − DEM) > min_height_m`.
@@ -160,6 +162,8 @@ SVF is back to its baseline. The detector therefore searches for the ring and
 recovers the object as what the ring encloses — a morphological closing at
 the radius of the largest object still called clutter, followed by a hole
 fill.
+
+![An Alpicat block in the 0.5 m DSM and its sky view factor: each chimney prints a dark ring; the SVF detections (cyan) of the roof obstacle stage](images/roof_inference_svf_alpicat.png)
 
 Two tests, and dropping either one costs precision in a different way:
 
@@ -329,6 +333,8 @@ flowchart LR
 Faces do not overlap by construction, and every ridge is one line shared by
 both sides.
 
+![Detected planes (left, pixel staircases) and the same planes regularized (right): straight edges, one shared line per ridge and hip](images/roof_inference_regularize_alpicat.png)
+
 ### 4.1b `method="intersections"`
 
 The same wireframe - same outline, same junction topology, same faces - with
@@ -455,6 +461,8 @@ rather than 0.3, ~11 vertices per facet instead of ~15).
 By facet size, current pipeline: **< 15 m²** 0.51 · **15-40 m²** 0.66 ·
 **> 40 m²** 0.78.
 
+![The east half of the test window: detected planes coloured by azimuth (saturation: tilt; grey: flat) over the refined DSM, the digitised planes dashed red](images/roof_inference_planes_alpicat.png)
+
 **What is left.** 128 facets for 112 real planes: the residual error is
 mostly *which pixels went to which plane*, not edge shape. Two known causes:
 
@@ -551,6 +559,8 @@ Alpicat's old town, one contiguous cluster, went from >40 GB to 10 GB.
 |---|---|
 | detection | 13,627 planes on 2,386 roofs, 24 min, 6 workers, peak 10 GB per tile |
 | regularization | 13,585 facets, 45 s, 1.6 GB; 124 -> 9.5 vertices per facet |
+
+![Alpicat's roofs coloured by the 1 km tile that detected them: a roof crossing a tile edge goes whole to the tile holding its centre](images/roof_inference_tiles_alpicat.png)
 
 **Precision.** The LiDAR coordinates used to be cast to float32, which
 rounds a UTM northing near 4.6e6 m to 0.5 m - rows 2.5 refined pixels apart

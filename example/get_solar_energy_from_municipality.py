@@ -52,6 +52,17 @@ config = gs.CataloniaConfig(
     recalculate_solar_exposure=False,
     # Interactive 3D page of the segmented roofs, to check the detection.
     render_roof_3d_view=False,
+    # Roof obstacles and the usable area of each roof plane. With imagery the
+    # ICGC orthophoto is registered on the roofs and segmented by SAM 3
+    # (chimneys, skylights, existing PV ...), run in an interpreter with
+    # torch and transformers; see docs/roof_obstacles.md. lidar=True also
+    # looks for them in the LiDAR returns. None skips the stage.
+    roof_obstacles=gs.ObstacleConfig(
+        imagery=True,
+        sam3=True,
+        sam3_python="/home/gmor/PyVenvs/sam3/bin/python",
+        lidar=False,
+    ),
     # Assumptions of the parcel scenarios: prices, discount rate, life ...
     economics=gs.Economics(),
     criterion="npv",  # or "irr", "roi", "lcoe", "payback", "energy", "ler"

@@ -4,7 +4,7 @@ from setuptools import find_packages, setup
 
 HERE = pathlib.Path(__file__).parent
 
-VERSION = '1.0.0'
+VERSION = '1.1.0'
 PACKAGE_NAME = 'greenshadow'
 AUTHOR = 'Jose Manuel Broto, Gerard Mor, Maite Sellart'
 AUTHOR_EMAIL = 'jmbroto@cimne.upc.edu'

@@ -35,6 +35,8 @@ from ..dsm_dem_estimation import build_digital_model_from_lidar_tiled
 from ..lidar import (icgc_download_from_geojson, icgc_lidar_acquisition_date,
                      icgc_tiles_from_geojson)
 from ..logging_utils import indent, info, section_context, success, warning
+from ..orthophoto import icgc_orthophoto, nearest_icgc_orthophoto_year
+from ..roof_obstacles import ObstacleConfig
 from ..roofs_3d import roof_planes_3d
 from ..rural_parcels import (load_spanish_preserved_regions,
                              load_spanish_sigpac_parcels,
@@ -58,6 +60,11 @@ class CataloniaConfig(PipelineConfig):
     hypercadaster_dir: Optional[str] = None     # default: {wd}/hypercadaster_ES
     laz_dir: Optional[str] = None               # default: {wd}/icgc, shared by municipalities
     preserved_areas_dir: Optional[str] = None   # default: {wd}/preserved_areas
+    orthophoto_dir: Optional[str] = None        # default: {wd}/icgc_orthophoto, shared
+    # ICGC orthophoto edition for the roof imagery (ObstacleConfig.imagery):
+    # a year, "current", or None for the one closest to the LiDAR flight -
+    # the same roofs, at the cost of missing what was built since.
+    orthophoto_year: Union[int, str, None] = None
     rural_parcels_year: int = 2025
     # Flag the parcels inside Natura 2000 / ENP areas (they stay in, flagged).
     tag_preserved_areas: bool = False
@@ -75,6 +82,8 @@ class CataloniaConfig(PipelineConfig):
             self.laz_dir = os.path.join(self.wd, "icgc")
         if self.preserved_areas_dir is None:
             self.preserved_areas_dir = os.path.join(self.wd, "preserved_areas")
+        if self.orthophoto_dir is None:
+            self.orthophoto_dir = os.path.join(self.wd, "icgc_orthophoto")
 
 
 class CataloniaMunicipalityPipeline(SolarPipeline):
@@ -347,6 +356,16 @@ class CataloniaMunicipalityPipeline(SolarPipeline):
     def roof_lidar(self, aoi) -> Optional[RoofLidar]:
         return RoofLidar(paths=self.laz_paths, classes=ROOF_OBSTACLE_CLASSES)
 
+    def load_orthophoto(self, aoi, planes):
+        # The ICGC 25 cm orthophoto, read tile by tile where there are roofs.
+        cfg = self.config
+        year = cfg.orthophoto_year
+        if year is None:
+            flown = self.acquisition_date(aoi)
+            year = nearest_icgc_orthophoto_year(flown) if flown is not None else "current"
+        return icgc_orthophoto(planes, cfg.orthophoto_dir, year=year,
+                               workers=cfg.download_workers, progress=True)
+
     def roof_detection_options(self, aoi, terrain: TerrainModels, output_path) -> dict:
         """
         Arguments of ``detect_roof_planes_tiled``, tuned on the digitised
@@ -508,6 +527,21 @@ def main(argv=None, prog=None):
     parser.add_argument("--no-roof-obstacles", action="store_true",
                         help="skip the roof obstacle stage; the PV planner then uses "
                              "its own setback and DSM residual cut")
+    parser.add_argument("--lidar-obstacles", action="store_true",
+                        help="also find roof obstacles in the LiDAR returns' residuals "
+                             "to the planes (off by default)")
+    parser.add_argument("--roof-imagery", action="store_true",
+                        help="read the ICGC orthophoto and register it on the roofs "
+                             "(coreg_log in roof_obstacles.gpkg)")
+    parser.add_argument("--no-sam3", action="store_true",
+                        help="with --roof-imagery, register the orthophoto but do not "
+                             "segment it with SAM 3")
+    parser.add_argument("--sam3-python", default=os.environ.get("GREENSHADOW_SAM3_PYTHON"),
+                        help="interpreter with torch and transformers to run SAM 3 in "
+                             "(default: $GREENSHADOW_SAM3_PYTHON, else this one)")
+    parser.add_argument("--orthophoto-year",
+                        help="orthophoto edition, a year or 'current' (default: the "
+                             "one closest to the LiDAR flight)")
     parser.add_argument("--no-parcels", action="store_true")
     parser.add_argument("--no-weather", action="store_true")
     parser.add_argument("--no-videos", action="store_true")
@@ -518,6 +552,22 @@ def main(argv=None, prog=None):
 
     if args.name and len(args.name) != len(args.codes):
         parser.error("give one --name per code, or none")
+    if args.roof_imagery and args.no_roof_obstacles:
+        parser.error("--roof-imagery needs the roof obstacle stage")
+    if args.no_sam3 and not args.roof_imagery:
+        parser.error("--no-sam3 goes with --roof-imagery")
+    if args.lidar_obstacles and args.no_roof_obstacles:
+        parser.error("--lidar-obstacles needs the roof obstacle stage")
+    obstacles = ({"roof_obstacles": None} if args.no_roof_obstacles else
+                 {"roof_obstacles": ObstacleConfig(lidar=args.lidar_obstacles, imagery=True,
+                                                   sam3=not args.no_sam3,
+                                                   sam3_python=args.sam3_python)}
+                 if args.roof_imagery else
+                 {"roof_obstacles": ObstacleConfig(lidar=True)} if args.lidar_obstacles
+                 else {})
+    if args.orthophoto_year is not None:
+        obstacles["orthophoto_year"] = (args.orthophoto_year if args.orthophoto_year == "current"
+                                        else int(args.orthophoto_year))
     municipalities = (dict(zip(args.name, args.codes)) if args.name else args.codes)
     run_catalonia_municipalities(
         municipalities,
@@ -525,7 +575,7 @@ def main(argv=None, prog=None):
         year=args.year,
         days=args.day,
         roofs=not args.no_roofs,
-        **({"roof_obstacles": None} if args.no_roof_obstacles else {}),
+        **obstacles,
         parcels=not args.no_parcels,
         include_weather=not args.no_weather,
         daily_videos=not args.no_videos,

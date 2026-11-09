@@ -26,7 +26,9 @@ python -m greenshadow.pipelines catalonia 25023 --name Alpicat \
     --wd /mnt/data/greenshadow --year 2023 --day 2023-12-22
 ```
 
-`--no-roofs`, `--no-roof-obstacles`, `--no-parcels`, `--no-weather`, `--no-videos`,
+`--no-roofs`, `--no-roof-obstacles`, `--lidar-obstacles`, `--roof-imagery`, `--no-sam3`,
+`--sam3-python` (default `$GREENSHADOW_SAM3_PYTHON`), `--orthophoto-year`,
+`--no-parcels`, `--no-weather`, `--no-videos`,
 `--opaque-vegetation`, `--recalculate-digital-models` and
 `--recalculate-solar-exposure` switch the corresponding parts off or force
 them; everything else is a field of the configuration below.
@@ -48,7 +50,8 @@ A region subclasses `SolarPipeline` and implements its hooks:
 | `build_terrain(aoi)` | `TerrainModels` (paths of the rasters) | required |
 | `load_parcels(aoi)` | parcels for PV fields and agrivoltaics | None |
 | `detect_roofs(aoi, terrain)` | `RoofPlanes` (facets + their DSM) | None |
-| `roof_lidar(aoi)` | `RoofLidar` (LAZ paths + classes) for the roof obstacles | None (DSM residual and SVF only) |
+| `roof_lidar(aoi)` | `RoofLidar` (LAZ paths + classes) for the roof obstacles, read when `ObstacleConfig.lidar` | None (DSM residual and SVF only) |
+| `load_orthophoto(aoi, planes)` | `Orthophoto` over the roofs, read when `ObstacleConfig.imagery` | None (no imagery) |
 | `acquisition_date(aoi)` | survey date, to age the canopy | None |
 | `svf_options(class_path)` | extra `calculate_sky_view_factor` arguments | `{}` |
 | `load_weather(aoi)` | hourly weather (GHI, DHI, DNI ...) | ERA5-Land + ERA5 `fdir` at the centroid |
@@ -70,8 +73,14 @@ A region subclasses `SolarPipeline` and implements its hooks:
    difference).
 6. **Roof planes** (`roofs`), then the **roof obstacles** and the usable
    area of each plane (`roof_obstacles`, [roof_obstacles.md](roof_obstacles.md)):
-   from the LAZ files of `roof_lidar()`, the LiDAR DSM where the returns are
-   sparse, and the sky view factor.
+   from the sky view factor and, with `lidar` (off by default), the LAZ
+   files of `roof_lidar()` and the LiDAR DSM where the returns are sparse;
+   with `imagery`, the orthophoto of
+   `load_orthophoto()` registered on the LiDAR roof by roof and segmented by
+   SAM 3 (`sam3`, when it can load; existing PV arrays included), and
+   searched for shadows of what stands on the roofs (`shadows`); walkable
+   terraces, balconies and patios out whole (`terraces`); `debug_pngs`
+   draws roofs to `roof_obstacles_debug/`.
 7. **Canopy**, when `semitransparent_vegetation` and the terrain carries a
    class raster and a surface without vegetation; aged from
    `acquisition_date()` to the simulated year when
@@ -123,7 +132,9 @@ A terrain without a separate surface without vegetation (a bare DEM in both
 `CataloniaConfig` adds `hypercadaster_dir` (`{wd}/hypercadaster_ES`),
 `laz_dir` (`{wd}/icgc`, shared by municipalities), `preserved_areas_dir`,
 `rural_parcels_year` (2025), `tag_preserved_areas` (False), `epsg` (25831),
-`download_workers` (8) and `render_roof_3d_view` (False).
+`download_workers` (8), `render_roof_3d_view` (False), `orthophoto_dir`
+(`{wd}/icgc_orthophoto`, shared) and `orthophoto_year` (None: the edition
+closest to the LiDAR flight; a year, or `"current"`).
 
 ## 4. Outputs
 
@@ -140,7 +151,8 @@ Under `{wd}/{name}/`:
 | `rural_parcels/` | SIGPAC download cache |
 | `crop_rows.gpkg` | Layers `crop_rows` and `crop_row_parcels` |
 | `roofs_rasterised.gpkg`, `roofs_3d.html` | Roof facets; optional 3D view |
-| `roof_obstacles.gpkg` | Layers `obstacles`, `usable_area`, `planes_qc`, `detections` |
+| `roof_obstacles.gpkg` | Layers `obstacles`, `usable_area`, `planes_qc`, `detections`; `coreg_log` with imagery |
+| `sam3_cache/`, `roof_obstacles_debug/` | SAM 3 outputs per window; debug figures per roof (`debug_pngs`) |
 | `YYYYMMDD/hillshades*/`, `YYYYMMDD/*.mp4` | Daily hillshades and videos |
 | `YYYYMMDD/daily_solar_energy_total.tif` | Daily irradiation |
 | `YYYY/hillshades/`, `YYYY/hillshades_no_vegetation/` | Annual hillshades |

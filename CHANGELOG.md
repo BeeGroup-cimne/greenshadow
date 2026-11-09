@@ -1,10 +1,136 @@
 # Changelog
 
 What changed in greenshadow, newest first. Dates are those of the commits;
-"Unreleased" is the working tree on top of the last one. The documents in
-[docs/](docs/README.md) describe the current behaviour in detail.
+"Unreleased", when present, is the working tree on top of the last one. The
+documents in [docs/](docs/README.md) describe the current behaviour in
+detail.
 
-## Unreleased (2026-10-27)
+## 1.1.0 - 2026-11-09 - Roof imagery: orthophoto, SAM 3, shadows and terraces
+
+### Changed
+- **LiDAR roof obstacle detector off by default** (`ObstacleConfig.lidar`,
+  `--lidar-obstacles` to turn it on): the roof obstacles come from the sky
+  view factor, SAM 3 and the terraces; `planes_qc` then has no fit measures
+  (`planes_qc_without_lidar`: `fit`/`method` "off", `needs_review` False).
+  A `roof_obstacles.gpkg` made with the other setting is recomputed.
+- **Cast shadows are no PV; little ones are obstacles**
+  (`roof_obstacles.estimate_orthophoto_sun`, `detect_sam3_obstacles(...,
+  dsm_path=)`): the sun of the orthophoto is estimated from its shadows per
+  flight date (Alpicat 2022: 168 / 56 deg), the shade the DSM casts under it
+  predicted, and a PV mask more than half in it is a shadow (8 of the 253
+  Alpicat arrays: eave, parapet and dome shadows; no real array lost). A
+  little compact shadow cast from the roof itself, or a little dark mask the
+  DSM does not explain, becomes a `"shadow"` obstacle widened toward the sun
+  over its caster; others are dropped. Dark masks of the other prompts are
+  no longer dropped when little. `sun_*` columns in `coreg_log`; a
+  `roof_obstacles.gpkg` without them is recomputed.
+  ([docs/roof_obstacles.md](docs/roof_obstacles.md) §6)
+- **Usable area keeps its corners**: the opening that removes what is
+  narrower than a module runs on the pieces simplified by
+  `ObstacleConfig.fragment_simplify_m` (0.2 m). On the pixel outlines of the
+  planes it acted as an axis-aligned square and cut a triangle out of every
+  corner of a roof turned against the grid. Alpicat: +2.5% usable area.
+  ([docs/roof_obstacles.md](docs/roof_obstacles.md) §4)
+- **SAM 3 prompts**: "roof hatch", "solar PV" (an extensive, array prompt
+  with "solar panel(s)"), "HVAC system" and "antenna" added; the SAM 3
+  window cache is keyed on the prompts, so every window is inferred again
+  once.
+- **Log of what is reused**: hillshades, elevated-shadow hillshades,
+  videos, solar exposure rasters and SAM 3 windows kept from a previous run
+  are logged as `Using existing ...`, with their path or the count kept,
+  like the digital models. The roof obstacle detectors log one indented
+  block each, and the transformers notes, the weight-loading bar and a
+  stray rasterio warning no longer break the SAM 3 output.
+  [docs/example_run_alpicat.md](docs/example_run_alpicat.md) times a rerun
+  on what is on disk (25 min) and the roof obstacles (12.5 min from scratch).
+
+### Added
+- **Roof obstacles by their shadows** (`detect_shadow_obstacles`,
+  `ObstacleConfig.shadows`, on with imagery): dark compact patches on each
+  plane of the registered orthophoto, measured against the plane's own
+  brightness (the darkest plane's along a seam), not cast from off the roof
+  by the DSM, become `"shadow"` obstacles widened toward the sun over their
+  casters, with the caster's height read from the shadow's length. Vent
+  pipes and small chimneys that neither the LiDAR nor SAM 3 found. The sun
+  is estimated once for SAM 3 and the shadows (`orthophoto_suns`).
+  Alpicat: 6,659 shadows on 1,042 roofs in 10 s, −4.4% usable area.
+  `n_shadows` in `coreg_log`; a `roof_obstacles.gpkg` without it is
+  recomputed. ([docs/roof_obstacles.md](docs/roof_obstacles.md) §7)
+- **Orthophotos** (`greenshadow.orthophoto`): the ICGC 25 cm RGB
+  orthophoto of any edition read tile by tile from the territory-wide
+  GeoPackages (HTTP range requests, no WMS) into a shared local cache, with
+  the flight window of each sheet of the current edition
+  (`icgc_orthophoto`, `icgc_orthophoto_sheets`,
+  `nearest_icgc_orthophoto_year`); any other GDAL raster, e.g. PNOA sheets,
+  through `local_orthophoto`; `read_orthophoto` crops onto the LiDAR's grid
+  and CRS, undoing a displacement. ([docs/data_sources.md](docs/data_sources.md))
+- **Orthophoto co-registration** (`roof_obstacles.coregister_orthophoto`):
+  per roof, the normalised cross-correlation of the orthophoto's edges with
+  the LiDAR's (DSM slope and plane boundaries) within +-5 m, steered by the
+  consensus of the neighbouring roofs; `coreg_log` layer with the shift,
+  score, status and the orthophoto and LiDAR dates (warning past
+  `max_date_gap_years`). Pipeline: `ObstacleConfig(imagery=True)`,
+  `--roof-imagery`, hook `SolarPipeline.load_orthophoto(aoi, planes)`;
+  Catalonia reads the edition closest to the LiDAR flight
+  (`CataloniaConfig.orthophoto_year`, `orthophoto_dir`,
+  `--orthophoto-year`). ([docs/roof_obstacles.md](docs/roof_obstacles.md) §5)
+- **SAM 3 on the orthophoto** (`roof_obstacles.detect_sam3_obstacles`,
+  `greenshadow.sam3_worker`): text-prompted segmentation of each registered
+  roof (chimney, skylight, roof window, solar panel, AC unit, vent, dormer)
+  through the transformers port of Meta's SAM 3, in windows of the model's
+  input upsampled 3x; score, area, on-roof, whole-roof and shadow filters,
+  duplicates across prompts merged; outputs cached per window. Runs
+  in-process or in another interpreter over a pipe
+  (`ObstacleConfig.sam3_python`, `--sam3-python`), since torch's CUDA wheels
+  would downgrade the CUDA 13 libraries numba-cuda uses. Without torch or
+  the gated checkpoint the stage warns and continues on the LiDAR and SVF.
+  `class` and `score` in `detections`, `classes` and `score` in `obstacles`,
+  `n_sam3` in `coreg_log`. `--no-sam3`.
+  ([docs/roof_obstacles.md](docs/roof_obstacles.md) §6)
+- **Existing PV out of the usable area**: SAM 3 asks for "solar panel" and
+  "solar panels" (the plural outlines whole arrays); their masks skip the
+  area and shadow limits but must cover at most 0.8 of the roof and be dark
+  (25th percentile of brightness <= 0.55), and are closed over 1 m gaps
+  into one array per group (`sam3_extensive_prompts`,
+  `sam3_extensive_max_roof_fraction`, `sam3_extensive_max_brightness`,
+  `sam3_array_close_m`). First real SAM 3 run on all of Alpicat: 254 PV
+  arrays, 8,510 m² on 150 roofs, 29 of 32 checked by eye correct.
+- **Walkable terraces, balconies and patios out of the usable area**
+  (`roof_obstacles.detect_terraces`, `ObstacleConfig.terraces`): a flat
+  plane walled in by parapets, railings or higher floors (guard measured on
+  the DSM without vegetation) is a terrace when enclosed (guard >= 0.75,
+  <= 60 m²) or, with the registered orthophoto, tiled (guard >= 0.5 and
+  half of it ceramic tile, garden or pool water). The whole plane comes
+  out; `planes_qc` gains `terrace_guard`, `terrace_finish`, `terrace`.
+  Alpicat: 1,605 planes, 31,700 m²; -4.2% modules, -2.7% energy (112,847
+  modules, 60.52 GWh/year). ([docs/roof_obstacles.md](docs/roof_obstacles.md) §8)
+- **Validation and debug figures** (`greenshadow.roof_obstacles_validation`):
+  stratified labelling samples and a QGIS template, object precision/recall
+  (IoU or distance matching), hit and area metrics per detector and fused,
+  usable area and PV yield per variant, per-roof figures (orthophoto as
+  published and registered, detections by source, labels, usable area);
+  `ObstacleConfig.debug_pngs` / `debug_part_ids` in the pipeline. First
+  Alpicat check against 38 provisional labels on 18 roofs: fused (LiDAR,
+  SVF, SAM 3) recall 0.63, precision 0.29 (a lower bound: step walls and
+  parapets count against it), yield within 4% of the labels'; SAM 3 alone
+  0.80 / 0.21. (§8, §12)
+- Tests: `test_orthophoto.py`, `test_sam3.py`, `test_obstacle_validation.py`.
+
+### Changed
+- `ObstacleConfig.obstacle_setback_m` and `edge_setback_m` 0.3 -> 0.1 m:
+  +11% modules on Alpicat (117,819 modules, 62.23 GWh/year with SAM 3).
+
+### Fixed
+- Orthophoto reads over HTTP had no timeout: a stalled range request hung
+  its tile download for good (seen on the current ICGC edition). GDAL now
+  gives up after 120 s (30 s to connect) and retries.
+- The ICGC tile map (`tiles.pdf`) was drawn through pyplot's GUI backend;
+  on a desktop the Tcl interpreter it left behind was inherited by the
+  forked roof-obstacle workers and aborted the run ("Tcl_AsyncDelete: async
+  handler deleted by the wrong thread") on a municipality's first run. It
+  is now drawn on a bare matplotlib Figure.
+
+## 2026-10-27 - Roof obstacles: LiDAR residual detector, fusion and usable area (`01090ae`)
 
 ### Added
 - **Roof obstacles** (`greenshadow.roof_obstacles`): chimneys, vents, AC

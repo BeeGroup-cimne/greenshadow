@@ -73,7 +73,8 @@ One document per computation, in [docs/](docs/README.md):
 | | |
 |---|---|
 | [Pipelines](docs/pipelines.md) | The chain in one call; configuration, outputs, adding a region |
-| [Data sources](docs/data_sources.md) | ICGC LiDAR, cadastre, SIGPAC, protected areas, ERA5, satellite |
+| [Example run: Alpicat](docs/example_run_alpicat.md) | Execution time of each stage on one municipality, outputs, disk use |
+| [Data sources](docs/data_sources.md) | ICGC LiDAR and orthophoto, cadastre, SIGPAC, protected areas, ERA5, satellite |
 | [Digital models](docs/digital_models.md) | DSM / DEM: classes, correction, cranes, gap filling, smoothing, tiling |
 | [Hillshades and sky view](docs/hillshades_and_sky_view.md) | Sun tables, cast shadows (CPU / CUDA), elevated shadows, videos, SVF |
 | [Vegetation canopy](docs/vegetation_canopy.md) | Semi-transparent trees, crowns, leaves, growth |
@@ -81,7 +82,7 @@ One document per computation, in [docs/](docs/README.md):
 | [Irradiation rasters](docs/solar_energy.md) | Modes, units, POA bases, the one-pass reader |
 | [Trackers and vertical PV](docs/pv_tracking_irradiance_plan.md) | Vertical and tracking bases, shading between rows, pvlib validation |
 | [Roof inference](docs/roof_inference.md) | Roof planes from LiDAR, regularization, accuracy |
-| [Roof obstacles](docs/roof_obstacles.md) | Chimneys, parapets, skylights; the usable area of each roof plane |
+| [Roof obstacles](docs/roof_obstacles.md) | Chimneys, parapets, skylights (LiDAR, sky view factor, SAM 3 on the orthophoto); the usable area of each roof plane; validation |
 | [Rooftop PV](docs/rooftop_pv.md) | Modules and strings on the roofs |
 | [Crop rows](docs/crop_rows.md) | Plantation geometry of the parcels |
 | [Parcel PV and agrivoltaics](docs/parcel_pv.md) | Scenarios, crops, economics, ranking |
@@ -100,7 +101,10 @@ One document per computation, in [docs/](docs/README.md):
 | `weather` | `load_ERA5Land`, `load_ERA5Land_with_direct_radiation`, `load_ERA5_radiation` |
 | `buildings_infer` | `detect_roof_planes`, `detect_roof_planes_tiled`, `filter_roof_planes_by_aoi`, `regularize_roof_planes` |
 | `roofs_3d` | `roof_planes_3d` (WebGL view of the planes over the LiDAR) |
-| `roof_obstacles` | `detect_lidar_obstacles`, `detect_svf_obstacles`, `fuse_obstacles`, `write_obstacle_layers`, `ObstacleConfig` |
+| `roof_obstacles` | `detect_lidar_obstacles`, `planes_qc_without_lidar`, `detect_svf_obstacles`, `coregister_orthophoto`, `detect_sam3_obstacles`, `detect_shadow_obstacles`, `fuse_obstacles`, `write_obstacle_layers`, `ObstacleConfig` |
+| `sam3_worker` | `Sam3Segmenter` (in-process), `Sam3Client` (another interpreter over a pipe) |
+| `roof_obstacles_validation` | `sample_roofs_for_labelling`, `obstacle_metrics`, `validate_obstacles`, `pv_yield_by_variant`, `plot_roof_obstacles`, `write_debug_pngs` |
+| `orthophoto` | `icgc_orthophoto`, `local_orthophoto`, `read_orthophoto`, `Orthophoto` |
 | `dimensionate` | `plan_pv_strings_in_buildings`, `PVModuleSpec`, `DEFAULT_MODULES` |
 | `rural_parcels` | `load_spanish_sigpac_parcels`, `filter_agricultural_parcels`, `sigpac_parcel_id`, `load_spanish_preserved_regions`, `tag_parcels_with_preserved_areas` |
 | `crop_rows` | `detect_crop_rows` |
@@ -177,17 +181,26 @@ If you use greenshadow in your research, please cite:
 
 This project is licensed under the **EUPL v1.2**. See the [license](https://joinup.ec.europa.eu/collection/eupl/eupl-text-eupl-12) for details.
 
-## Authors
+## 👥 Authors & Contributors
 
-- **Jose Manuel Broto** - Lead Developer - jmbroto@cimne.upc.edu
-- **Gerard Mor** - Co-developer - gmor@cimne.upc.edu  
-- **Maite Sellart** - Co-developer - tsellart@cimne.upc.edu
+**Main Authors:**
+- **Jose Manuel Broto Vispe** - jmbrotovispe@gmail.com
+- **Gerard Mor** - gmor@cimne.upc.edu
 
-*BeeGroup - Centre Internacional de Mètodes Numèrics en Enginyeria (CIMNE)*
+**Co-authors:**
+- **David Blanco** - dblanco@cimne.upc.edu
+- **Gerard Laguna** - glaguna@cimne.upc.edu
+- **Nadiya Mehraj** - nmehraj@cimne.upc.edu
+- **Maite Sellart** - tsellart@cimne.upc.edu
+
+**Institutional Affiliations:**
+- **CIMNE** - Centre Internacional de Mètodes Numèrics en Enginyeria, Building Energy and Environment (BEE) group
+- **Universitat Politècnica de Catalunya (UPC)** - Technical University of Catalonia
 
 ## Acknowledgments
 
 - **ICGC** for providing open access to high-quality LiDAR data
 - **Copernicus Climate Change Service** for ERA5Land weather data
-- **BeeGroup-CIMNE** for supporting this research
+- **CIMNE** for supporting this research
+- This project uses the Segment Anything Model 3 (SAM 3) foundation model developed and released by Meta AI. We are grateful to the Meta Superintelligence Labs team for making this technology available to the AI community.
 - The open-source geospatial community
